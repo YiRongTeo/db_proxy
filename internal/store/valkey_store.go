@@ -31,6 +31,11 @@ func NewValkeyStore(ctx context.Context, addr, password string, db int) (*Valkey
 
 func (s *ValkeyStore) Close() { s.client.Close() }
 
+// Ping checks Valkey connectivity (used by the health endpoint).
+func (s *ValkeyStore) Ping(ctx context.Context) error {
+	return s.client.Do(ctx, s.client.B().Ping().Build()).Error()
+}
+
 // SetToken stores a token payload with a TTL (single-use semantics enforced
 // by the caller using GetDeleteToken).
 func (s *ValkeyStore) SetToken(ctx context.Context, token string, p models.TokenPayload, ttl time.Duration) error {
