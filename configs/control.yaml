@@ -1,0 +1,32 @@
+http:
+  addr: ":8080"
+  static_dir: "./web/dist/project-d/browser"
+api:
+  api_key: ""                 # empty → external /api/token disabled; set via ZT_API_KEY
+  token_ttl_seconds: 300
+  data_plane_host: "127.0.0.1"
+  data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL)
+auth:
+  username: "admin"
+  password: "admin123"        # override via ZT_AUTH_PASSWORD
+  session_ttl_hours: 8
+db_presets:
+  - name: "MySQL read-only"
+    db_type: "mysql"
+    db_user: "ro_user"
+    db_ip: "127.0.0.1"
+    db_port: "3307"
+  - name: "MySQL read-write"
+    db_type: "mysql"
+    db_user: "rw_user"
+    db_ip: "127.0.0.1"
+    db_port: "3307"
+  - name: "PostgreSQL read-only"
+    db_type: "postgres"
+    db_user: "ro_user"
+    db_ip: "127.0.0.1"
+    db_port: "5433"
+valkey:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0

@@ -1,0 +1,14 @@
+listen:
+  addr: ":3306"            # shared port for MySQL + PostgreSQL (protocol detected)
+  detect_delay_ms: 200     # grace period before assuming MySQL (server-first protocol)
+valkey:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+credentials:                  # Data Plane owns DB credentials (zero-trust)
+  - key: "127.0.0.1:3307:ro_user"
+    password: "ro_pw"
+  - key: "127.0.0.1:3307:rw_user"
+    password: "rw_pw"
+  - key: "127.0.0.1:5433:ro_user"
+    password: "ro_pw"
