@@ -78,6 +78,11 @@ export class ApiService {
     return this.http.post('/api/logout', null, { withCredentials: true });
   }
 
+  /** GET /api/me — validates the session cookie and returns the session user (Task 5.7). */
+  me(): Observable<LoginResponse> {
+    return this.http.get<LoginResponse>('/api/me', { withCredentials: true });
+  }
+
   dbPresets(): Observable<DbPreset[]> {
     return this.http.get<DbPreset[]>('/api/db-presets', { withCredentials: true });
   }

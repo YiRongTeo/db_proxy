@@ -1,0 +1,54 @@
+/* Top navigation (Task 5.7) — dark zinc bar with sky accent, house style. */
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 52px;
+  padding: 0 20px;
+  background: #111827;
+  border-bottom: 1px solid #1f2937;
+
+  .topnav-links {
+    display: flex;
+    gap: 4px;
+
+    a {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 14px;
+      padding: 6px 14px;
+      border-radius: 6px;
+
+      &:hover {
+        color: #e2e8f0;
+        background: #1f2937;
+      }
+
+      &.active {
+        color: #0ea5e9;
+        background: rgba(14, 165, 233, 0.12);
+      }
+    }
+  }
+
+  .topnav-user {
+    margin-left: auto;
+    color: #94a3b8;
+    font-size: 13px;
+  }
+
+  .topnav-logout {
+    background: transparent;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-size: 13px;
+    padding: 5px 12px;
+    cursor: pointer;
+
+    &:hover {
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+  }
+}

@@ -1,9 +1,18 @@
 import { TestBed } from '@angular/core/testing';
-import { provideRouter, Router } from '@angular/router';
+import { ActivatedRoute, provideRouter, Router } from '@angular/router';
 import { of, throwError } from 'rxjs';
 import { ApiService } from '../../core/api.service';
 import { AuthService } from '../../core/auth.service';
 import { LoginComponent } from './login.component';
+
+/** ActivatedRoute stub exposing a fixed returnUrl query param. */
+function routeWithReturnUrl(returnUrl: string | null): unknown {
+  return {
+    snapshot: {
+      queryParamMap: { get: (k: string) => (k === 'returnUrl' ? returnUrl : null) },
+    },
+  };
+}
 
 describe('LoginComponent', () => {
   let api: { login: ReturnType<typeof vi.fn>; logout: ReturnType<typeof vi.fn> };
@@ -38,6 +47,21 @@ describe('LoginComponent', () => {
     expect(api.login).toHaveBeenCalledWith('alice', 's3cret');
     expect(comp.error()).toBeNull();
     expect(nav).toHaveBeenCalledWith(['/maker']);
+  });
+
+  it('navigates to returnUrl after login when the authGuard redirected here', async () => {
+    TestBed.overrideProvider(ActivatedRoute, { useValue: routeWithReturnUrl('/checker') });
+    const nav = navigateSpy();
+    const fixture = TestBed.createComponent(LoginComponent);
+    const comp = fixture.componentInstance;
+    fixture.detectChanges();
+
+    comp.username.set('alice');
+    comp.password.set('s3cret');
+    comp.submit();
+    await fixture.whenStable();
+
+    expect(nav).toHaveBeenCalledWith(['/checker']);
   });
 
   it('rejects empty fields without calling the API', () => {
@@ -92,6 +116,30 @@ describe('LoginComponent', () => {
     const nav = navigateSpy();
     const auth = TestBed.inject(AuthService);
     auth.login('alice', 's3cret').subscribe(); // sets the user signal
+
+    const fixture = TestBed.createComponent(LoginComponent);
+    fixture.detectChanges();
+
+    expect(nav).toHaveBeenCalledWith(['/maker']);
+  });
+
+  it('redirects to returnUrl on init when a session already exists', async () => {
+    TestBed.overrideProvider(ActivatedRoute, { useValue: routeWithReturnUrl('/checker') });
+    const nav = navigateSpy();
+    const auth = TestBed.inject(AuthService);
+    auth.login('alice', 's3cret').subscribe(); // sets the user signal
+
+    const fixture = TestBed.createComponent(LoginComponent);
+    fixture.detectChanges();
+
+    expect(nav).toHaveBeenCalledWith(['/checker']);
+  });
+
+  it('falls back to /maker for scheme-relative returnUrl values', async () => {
+    TestBed.overrideProvider(ActivatedRoute, { useValue: routeWithReturnUrl('//evil.example') });
+    const nav = navigateSpy();
+    const auth = TestBed.inject(AuthService);
+    auth.login('alice', 's3cret').subscribe();
 
     const fixture = TestBed.createComponent(LoginComponent);
     fixture.detectChanges();

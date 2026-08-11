@@ -1,1 +1,11 @@
+@if (auth.isLoggedIn()) {
+  <header class="topnav">
+    <nav class="topnav-links">
+      <a routerLink="/maker" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">Maker</a>
+      <a routerLink="/checker" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">Checker</a>
+    </nav>
+    <span class="topnav-user">{{ auth.user() }}</span>
+    <button type="button" class="topnav-logout" (click)="logout()">Logout</button>
+  </header>
+}
 <router-outlet />

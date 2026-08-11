@@ -1,6 +1,6 @@
 import { Component, inject, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { NzAlertModule } from 'ng-zorro-antd/alert';
 import { NzButtonModule } from 'ng-zorro-antd/button';
 import { NzCardModule } from 'ng-zorro-antd/card';
@@ -12,7 +12,8 @@ import { AuthService } from '../../core/auth.service';
  * Sign-in form (Task 2.8, replaces the placeholder). Submits credentials to
  * POST /api/login via AuthService; the HttpOnly `zt_session` cookie carries
  * the session from there on. Already-logged-in visitors bounce straight to
- * /maker.
+ * their `returnUrl` (or /maker). After a successful login the visitor is sent
+ * to `returnUrl` when the authGuard redirected here with one (Task 5.7).
  */
 @Component({
   selector: 'app-login',
@@ -31,6 +32,7 @@ import { AuthService } from '../../core/auth.service';
 export class LoginComponent implements OnInit {
   private readonly auth = inject(AuthService);
   private readonly router = inject(Router);
+  private readonly route = inject(ActivatedRoute);
 
   readonly username = signal('');
   readonly password = signal('');
@@ -39,8 +41,18 @@ export class LoginComponent implements OnInit {
 
   ngOnInit(): void {
     if (this.auth.isLoggedIn()) {
-      this.router.navigate(['/maker']);
+      void this.router.navigate([this.returnUrl() ?? '/maker']);
     }
+  }
+
+  /**
+   * returnUrl from the query string, only when it is a safe same-origin path
+   * (leading '/', but not '//' which would be scheme-relative and open-redirect
+   * bait).
+   */
+  private returnUrl(): string | null {
+    const ru = this.route.snapshot.queryParamMap.get('returnUrl');
+    return ru && ru.startsWith('/') && !ru.startsWith('//') ? ru : null;
   }
 
   submit(): void {
@@ -53,7 +65,7 @@ export class LoginComponent implements OnInit {
     this.auth.login(this.username().trim(), this.password()).subscribe({
       next: () => {
         this.submitting.set(false);
-        this.router.navigate(['/maker']);
+        void this.router.navigate([this.returnUrl() ?? '/maker']);
       },
       error: (err) => {
         this.submitting.set(false);

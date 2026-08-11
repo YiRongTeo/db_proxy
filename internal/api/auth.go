@@ -80,6 +80,18 @@ func (a *authMiddleware) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"username": req.Username})
 }
 
+// handleMe reports the session-authenticated caller's username (Task 5.7).
+// requireSession already rejected unauthenticated requests with 401, so this
+// handler only reads the session placed on the request context.
+func (a *authMiddleware) handleMe(w http.ResponseWriter, r *http.Request) {
+	sess := sessionFrom(r)
+	if sess == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"username": sess.Username})
+}
+
 func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		_ = a.vs.DeleteSession(r.Context(), c.Value)
