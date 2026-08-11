@@ -59,9 +59,9 @@ Checker dashboard (maker–checker principle).
 
 ## Tech stack
 
-Go 1.24 (stdlib `net/http`, `log/slog` JSON, viper `ZT_` env config) · `valkey-io/valkey-go` v1 ·
+Go 1.25 (stdlib `net/http`, `log/slog` JSON, viper `ZT_` env config) · `valkey-io/valkey-go` v1 ·
 `go-mysql` v1 (backend MySQL auth) · `pgx` v5 + `pgproto3` v2 (backend PG auth + relay) ·
-`coder/websocket` v2 · Angular 21 standalone/zoneless/signals + NG-ZORRO v21. All deps Apache-2.0/MIT.
+`coder/websocket` v1.8.15 · Angular 21 standalone (zone-based) SPA with signals + NG-ZORRO v21. All deps Apache-2.0/MIT.
 
 ## Repo layout
 

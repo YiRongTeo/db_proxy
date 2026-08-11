@@ -14,7 +14,7 @@ containers already exist (assumed up from Phase 0). The two `go run` boots + fir
 | Requirement | Check |
 |---|---|
 | Docker Desktop running | `docker info --format '{{.ServerVersion}}'` prints a version |
-| Go toolchain (1.24+) | `go version` |
+| Go toolchain (1.25+) | `go version` |
 | git-bash (or WSL) on Windows | this guide's commands are bash-flavored |
 | Optional: PM2 (`npm i -g pm2`) | `pm2 --version` — only needed for the PM2 path (§5) |
 
@@ -146,7 +146,7 @@ connection. **One token = one connection** — get a fresh token per connect.
 
 ```bash
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
-  -H "X-Api-Key: $ZT_API_API_KEY" \
+  -H "X-Api-Key: dev-key-change-me" \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
@@ -268,7 +268,7 @@ PID=$(netstat -ano | grep -E ':3306\s.*LISTEN' | awk '{print $NF}' | head -1)
 |---|---|
 | `invalid or expired token` on first connect | Token reused (single-use) or > 300 s old — issue a fresh one |
 | MySQL connect hangs ~200 ms then works | Expected — protocol-detection grace on the shared port |
-| `token not valid for this listener/protocol` | Token `db_type` doesn't match the client (mysql token + psql, or vice versa) |
+| `token not valid for this protocol` | Token `db_type` doesn't match the client (mysql token + psql, or vice versa) |
 | `backend unavailable` | Backend container down, or credentials missing in `configs/data.yaml` for that `db_ip:db_port:db_user` key |
 | Control Plane exits at boot | Valkey not up (`valkey-cli ping` fails); port 8080 already bound |
 | UI 404 / blank | Angular not built — see §2.1 |
