@@ -11,6 +11,14 @@ export const routes: Routes = [
     canActivate: [authGuard],
   },
   {
+    path: 'checker',
+    loadComponent: () =>
+      import('./features/checker-dashboard/checker-dashboard.component').then(
+        (m) => m.CheckerDashboardComponent,
+      ),
+    canActivate: [authGuard],
+  },
+  {
     path: 'login',
     loadComponent: () =>
       import('./features/login/login.component').then((m) => m.LoginComponent),

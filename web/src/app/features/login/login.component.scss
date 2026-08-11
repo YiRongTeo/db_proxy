@@ -1,26 +1,14 @@
-.login-placeholder {
-  max-width: 400px;
+.login-card {
+  max-width: 420px;
   margin: 96px auto;
-  padding: 32px;
-  text-align: center;
-  border-radius: 12px;
-  background: var(--nz-component-background, #111827);
-  border: 1px solid var(--nz-border-color, #1f2937);
+}
 
-  h2 {
-    margin: 0 0 8px;
-  }
+.login-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 
-  p {
-    color: var(--nz-text-color-secondary, #94a3b8);
-  }
-
-  a {
-    color: var(--nz-link-color, #0ea5e9);
-    text-decoration: none;
-
-    &:hover {
-      text-decoration: underline;
-    }
-  }
+.login-alert {
+  margin-bottom: 8px;
 }

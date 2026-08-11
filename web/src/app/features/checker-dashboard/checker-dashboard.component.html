@@ -1,0 +1,82 @@
+<nz-card class="checker-card" nzTitle="Checker Dashboard" nzExtra="Live query feed">
+  <div class="checker-controls">
+    <div class="channel-row">
+      <span class="channel-label">Channel</span>
+      <nz-input-group nzCompact class="channel-group">
+        <input
+          id="channel"
+          name="channel"
+          nz-input
+          class="channel-input"
+          placeholder="* or username"
+          [ngModel]="channel()"
+          (ngModelChange)="channel.set($event)"
+          [disabled]="connected()"
+          (keydown.enter)="connect()"
+        />
+        @if (connected()) {
+          <button nz-button nzDanger (click)="stop()">Stop</button>
+        } @else {
+          <button nz-button nzType="primary" (click)="connect()">Connect</button>
+        }
+      </nz-input-group>
+    </div>
+
+    <nz-tag [nzColor]="connected() ? 'success' : 'error'">
+      {{ connected() ? 'live' : 'disconnected' }}
+    </nz-tag>
+
+    <div class="autoscroll-row">
+      <span class="channel-label">Auto-scroll</span>
+      <nz-switch
+        [ngModel]="autoScroll()"
+        (ngModelChange)="autoScroll.set($event)"
+        [nzCheckedChildren]="'on'"
+        [nzUnCheckedChildren]="'off'"
+      />
+    </div>
+  </div>
+
+  <div #scrollHost class="table-scroll-host">
+    <nz-table
+      class="checker-table"
+      [nzData]="events()"
+      [nzFrontPagination]="false"
+      [nzShowPagination]="false"
+      [nzSize]="'small'"
+    >
+      <thead>
+        <tr>
+          <th nzWidth="160px">Ts</th>
+          <th nzWidth="90px">Kind</th>
+          <th nzWidth="120px">Username</th>
+          <th nzWidth="80px">DB</th>
+          <th nzWidth="180px">Target</th>
+          <th nzWidth="130px">Ticket</th>
+          <th>SQL</th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (ev of events(); track ev.id) {
+          <tr>
+            <td class="cell-ts">{{ ev.ts }}</td>
+            <td>
+              <nz-tag [nzColor]="kindColor(ev.kind)">{{ ev.kind }}</nz-tag>
+            </td>
+            <td>{{ ev.username }}</td>
+            <td>{{ ev.db_type }}</td>
+            <td class="cell-mono">{{ target(ev) }}</td>
+            <td>{{ ev.ticket_id || '—' }}</td>
+            <td class="cell-sql">{{ ev.sql }}</td>
+          </tr>
+        } @empty {
+          <tr>
+            <td colspan="7" class="cell-empty">
+              No events yet — connect to a channel to watch queries live.
+            </td>
+          </tr>
+        }
+      </tbody>
+    </nz-table>
+  </div>
+</nz-card>

@@ -1,0 +1,73 @@
+.checker-card {
+  max-width: 1440px;
+  margin: 24px auto;
+}
+
+.checker-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.channel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 340px;
+}
+
+.channel-label {
+  color: var(--nz-text-color-secondary, #94a3b8);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.channel-group {
+  display: flex;
+  max-width: 420px;
+}
+
+.channel-input {
+  min-width: 220px;
+}
+
+.autoscroll-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.table-scroll-host {
+  height: 55vh;
+  overflow: auto;
+  border: 1px solid var(--nz-border-color, #1f2937);
+  border-radius: 8px;
+}
+
+.cell-mono {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12px;
+}
+
+.cell-sql {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 560px;
+}
+
+.cell-ts {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.cell-empty {
+  padding: 24px 0;
+  text-align: center;
+  color: var(--nz-text-color-secondary, #94a3b8);
+}

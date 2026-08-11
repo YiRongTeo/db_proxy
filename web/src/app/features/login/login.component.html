@@ -1,5 +1,55 @@
-<div class="login-placeholder">
-  <h2>Sign in</h2>
-  <p>Login coming in Task 2.8.</p>
-  <a routerLink="/maker">Back to maker portal</a>
-</div>
+<nz-card class="login-card" nzTitle="Sign in" nzExtra="Zero-trust DB access gateway">
+  <div class="login-body">
+    @if (error(); as err) {
+      <nz-alert class="login-alert" nzType="error" [nzShowIcon]="true" [nzMessage]="err" />
+    }
+
+    <form nz-form (ngSubmit)="submit()">
+      <nz-form-item>
+        <nz-form-label nzFor="username" [nzRequired]="true">Username</nz-form-label>
+        <nz-form-control>
+          <input
+            id="username"
+            name="username"
+            nz-input
+            placeholder="e.g. alice"
+            autocomplete="username"
+            [ngModel]="username()"
+            (ngModelChange)="username.set($event)"
+            [disabled]="submitting()"
+          />
+        </nz-form-control>
+      </nz-form-item>
+
+      <nz-form-item>
+        <nz-form-label nzFor="password" [nzRequired]="true">Password</nz-form-label>
+        <nz-form-control>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            nz-input
+            autocomplete="current-password"
+            [ngModel]="password()"
+            (ngModelChange)="password.set($event)"
+            [disabled]="submitting()"
+          />
+        </nz-form-control>
+      </nz-form-item>
+
+      <nz-form-item>
+        <nz-form-control>
+          <button
+            nz-button
+            nzType="primary"
+            [nzBlock]="true"
+            [disabled]="submitting()"
+            [nzLoading]="submitting()"
+          >
+            Sign in
+          </button>
+        </nz-form-control>
+      </nz-form-item>
+    </form>
+  </div>
+</nz-card>
