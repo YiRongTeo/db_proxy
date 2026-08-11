@@ -1,6 +1,6 @@
 http:
   addr: ":8080"
-  static_dir: "./web/dist/project-d/browser"
+  static_dir: "./web/dist/web/browser"
 api:
   api_key: ""                 # empty → external /api/token disabled; set via ZT_API_KEY
   token_ttl_seconds: 300

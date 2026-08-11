@@ -5,6 +5,9 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/store"
@@ -32,6 +35,29 @@ func (a *api) Routes() http.Handler {
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireSession(a.handleDBPresets))
 	mux.HandleFunc("POST /api/token", a.handleToken)                     // auth inside (key OR session)
 	mux.HandleFunc("GET /ws/checker", a.auth.requireSession(a.handleWS)) // Task 2.4
-	// Task 2.9: mux.Handle("/", http.FileServer(http.Dir(a.cfg.StaticDir)))
+	// Task 2.9: SPA static serving — registered LAST so /api/* and /ws/* win.
+	if _, err := os.Stat(a.cfg.StaticDir); err != nil {
+		a.log.Warn("static dir missing; SPA will not be served", "static_dir", a.cfg.StaticDir)
+	}
+	mux.Handle("/", spaHandler{staticDir: a.cfg.StaticDir})
 	return mux
+}
+
+// spaHandler serves the built Angular SPA from disk with a single-page-app
+// fallback: any path that is not a real file (e.g. /maker, /checker, /login)
+// gets index.html so client-side routing works. /api and /ws never reach it —
+// Routes() registers those patterns before "/".
+type spaHandler struct {
+	staticDir string
+}
+
+func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fs := http.Dir(h.staticDir)
+	if f, err := fs.Open(path.Clean(r.URL.Path)); err != nil {
+		http.ServeFile(w, r, filepath.Join(h.staticDir, "index.html")) // SPA fallback
+		return
+	} else {
+		f.Close()
+	}
+	http.FileServer(fs).ServeHTTP(w, r)
 }
