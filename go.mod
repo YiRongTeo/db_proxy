@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/go-mysql-org/go-mysql v1.16.0
+	github.com/jackc/pgproto3/v2 v2.3.3
 	github.com/spf13/viper v1.21.0
 	github.com/valkey-io/valkey-go v1.0.76
 )
@@ -15,6 +16,8 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/chunkreader/v2 v2.0.0 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 // indirect

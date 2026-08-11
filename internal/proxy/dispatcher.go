@@ -10,16 +10,6 @@ import (
 	"time"
 )
 
-// PGProxy is the PostgreSQL proxy. Phase 4 (Task 4.4) defines the real
-// implementation in pg_proxy.go (handshake, SCRAM, relay) with the same
-// handleConn contract. This placeholder keeps the Dispatcher compiling until
-// then; DELETE it (and this no-op method) when pg_proxy.go lands.
-type PGProxy struct{}
-
-// handleConn is a placeholder no-op matching the Phase 4 contract
-// (ctx context.Context, client net.Conn, br *bufio.Reader).
-func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Reader) {}
-
 // Dispatcher owns ONE TCP listener and routes each connection to the MySQL or
 // PostgreSQL proxy based on which side speaks first:
 //   - PostgreSQL is client-first: the client sends StartupMessage/SSLRequest
