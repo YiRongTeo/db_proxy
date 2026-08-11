@@ -1,12 +1,9 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -21,29 +18,11 @@ import (
 // sequential sessions and returns the listener plus a channel closed when all
 // sessions have ended. The test acts as the Dispatcher: accept + bufio.Reader
 // + handleConn (real TCP — the 10s handshake deadline and 'N' write need a
-// real conn, not net.Pipe).
+// real conn, not net.Pipe). No backend credentials — sessions that pass the
+// auth handshake hit the FATAL backend-unavailable path.
 func startTestPGProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, n int) (net.Listener, <-chan struct{}) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewPGProxy(logger, vs, map[string]string{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < n; i++ {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			br := bufio.NewReader(conn)
-			p.handleConn(context.Background(), conn, br)
-		}
-	}()
-	return ln, done
+	return startTestPGProxyWithCreds(t, vs, logBuf, map[string]string{}, n)
 }
 
 // pgTestToken registers a token directly in Valkey (single-use semantics live
@@ -68,35 +47,11 @@ func pgTestToken(t *testing.T, vs *store.ValkeyStore, dbType string) string {
 // pgDial connects to the listener and wraps the conn in a pgproto3.Frontend
 // (raw PG wire protocol). If sslFirst, an SSLRequest is sent first and the
 // single-byte response is asserted to be exactly 'N' (0x4E) — the proxy never
-// advertises SSL (spec D10). Then a StartupMessage with user = token is sent.
+// advertises SSL (spec D10). Then a StartupMessage with user = token (and
+// database appdb) is sent.
 func pgDial(t *testing.T, ln net.Listener, token string, sslFirst bool) *pgproto3.Frontend {
 	t.Helper()
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second)) // no hanging tests
-	front := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
-	if sslFirst {
-		if err := front.Send(&pgproto3.SSLRequest{}); err != nil {
-			t.Fatalf("send SSLRequest: %v", err)
-		}
-		buf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			t.Fatalf("read SSL response: %v", err)
-		}
-		if buf[0] != 'N' {
-			t.Fatalf("SSLRequest response: got %q (0x%02x), want exactly 'N' (0x4e)", buf[0], buf[0])
-		}
-	}
-	if err := front.Send(&pgproto3.StartupMessage{
-		ProtocolVersion: pgproto3.ProtocolVersionNumber,
-		Parameters:      map[string]string{"user": token, "database": "appdb"},
-	}); err != nil {
-		t.Fatalf("send StartupMessage: %v", err)
-	}
-	return front
+	return pgDialDB(t, ln, token, sslFirst, "appdb")
 }
 
 // pgReadUntilReady consumes backend messages until ReadyForQuery and reports

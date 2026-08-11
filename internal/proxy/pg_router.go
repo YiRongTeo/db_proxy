@@ -17,13 +17,25 @@ type pgFrontend struct {
 	f    *pgproto3.Frontend
 }
 
+// defaultPGDatabase is the database used when the client's StartupMessage
+// carries no database. PG clients normally always send one; the fallback
+// keeps the 4.2-era default for bare clients.
+const defaultPGDatabase = "appdb"
+
 // connectPostgresBackend authenticates to the real PostgreSQL backend with
 // Data-Plane-owned credentials (keyed by backendKey, shared with the MySQL
 // side), then hijacks the connection and hands back the raw byte stream for
-// the byte-exact relay (Task 4.3). pgx performs the FULL auth handshake
+// the relay (Task 4.3). pgx performs the FULL auth handshake
 // (SCRAM-SHA-256 etc.) so the proxy never re-implements PG auth; after the
 // handshake the backend session is idle and its stream is clean for relaying
 // subsequent client traffic verbatim.
+//
+// dbName is the database the CLIENT requested in its StartupMessage,
+// forwarded so the session gets the right default schema (PG clients send
+// the db in the startup message, mirroring MySQL's CONNECT_WITH_DB flow);
+// an empty value falls back to defaultPGDatabase. It is applied via the
+// parsed config (not DSN interpolation) so arbitrary database names cannot
+// inject DSN parameters.
 //
 // Hijack leftover-bytes finding (pgx v5.10.0, verified against source):
 //   - PgConn.Hijack() returns (*HijackedConn, error) — NOT (net.Conn,
@@ -41,26 +53,25 @@ type pgFrontend struct {
 //     guard against any future read-ahead. The live round-trip test below
 //     proves the raw stream carries a clean client→server exchange.
 //
-// dbname: hardcoded to "appdb" per the brief. Task 4.3 must forward the
-// CLIENT-requested database from its STARTUP message instead (mirroring the
-// MySQL side, which forwards the client's COM_INIT_DB database), so sessions
-// get the right default schema.
-//
 // connect_timeout=10 bounds the whole connect+auth (dial AND handshake):
 // pgx's default is unbounded, and a backend that accepts but never speaks
 // would pin the session goroutine, the client connection and the consumed
 // token forever — same failure mode Task 3.8 bounded on the MySQL side.
-func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string) (*pgFrontend, error) {
+func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string, dbName string) (*pgFrontend, error) {
 	pw, ok := creds[backendKey(t)]
 	if !ok {
 		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
 	}
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=appdb sslmode=disable connect_timeout=10",
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable connect_timeout=10",
 		t.DBIP, t.DBPort, t.DBUser, pw)
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
+	if dbName == "" {
+		dbName = defaultPGDatabase
+	}
+	cfg.Database = dbName
 	pgconn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("backend pg connect: %w", err)

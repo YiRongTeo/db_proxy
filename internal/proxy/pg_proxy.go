@@ -15,8 +15,10 @@ import (
 // client-facing auth flow: SSLRequest → 'N' (spec D10 — no SSL advertised),
 // token-as-username, single-use GETDEL validation, then the welcome sequence
 // (AuthenticationOk + ParameterStatus + BackendKeyData + ReadyForQuery).
-// The backend session (Task 4.2) and the byte-exact relay with SQL sniffing
-// (Task 4.3) land later; for now the session ends right after ReadyForQuery.
+// Task 4.2 added the backend session (connectPostgresBackend + pgx Hijack);
+// Task 4.3 completes the session with a bidirectional message-level relay
+// and passive SQL sniffing, forwarding the CLIENT-requested database from
+// its StartupMessage to the backend.
 //
 // NOTE (D11 redesign): like MySQLProxy, the Dispatcher owns the accept loop
 // and connection limiting — one handleConn per accepted connection.
@@ -89,9 +91,36 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	_ = be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: 4242})
 	_ = be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	_ = client.SetDeadline(time.Time{}) // handshake done — relay phase is deadline-free
-	p.log.Info("pg session established (relay in 4.3)", "username", tok.Username,
-		"db_user", tok.DBUser, "client", clientAddr)
-	// The backend session (Task 4.2) and the bidirectional relay with SQL
-	// sniffing (Task 4.3) replace this return; for now the auth handshake is
-	// the whole session.
+
+	// 4. backend session with the CLIENT-requested database (PG clients send
+	// it in the STARTUP message — mirror of the MySQL CONNECT_WITH_DB flow);
+	// an empty/missing value falls back to the default backend database.
+	front, err := connectPostgresBackend(ctx, tok, p.creds, sm.Parameters["database"])
+	if err != nil {
+		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
+		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
+			Message: "backend unavailable"})
+		return
+	}
+	defer front.Close()
+
+	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
+		"db_type", tok.DBType, "client", clientAddr)
+
+	// 5. bidirectional relay with passive SQL sniffing. Whichever direction
+	// ends first (client quit, backend close, network error) tears down both
+	// sides; the second done-slot is buffered so the survivor never blocks.
+	done := make(chan struct{}, 2)
+	go func() {
+		p.pipePGClientToBackend(be, front, tok, clientAddr)
+		done <- struct{}{}
+	}()
+	go func() {
+		p.pipePGBackendToClient(front, be)
+		done <- struct{}{}
+	}()
+	<-done
+	client.Close()
+	front.Close()
+	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }

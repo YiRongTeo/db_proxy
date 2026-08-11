@@ -19,7 +19,7 @@ import (
 
 func TestConnectPostgresBackendMissingCreds(t *testing.T) {
 	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
-	_, err := connectPostgresBackend(context.Background(), tok, map[string]string{})
+	_, err := connectPostgresBackend(context.Background(), tok, map[string]string{}, "appdb")
 	if err == nil {
 		t.Fatal("expected error for missing credential key")
 	}
@@ -39,7 +39,7 @@ func TestConnectPostgresBackendLiveRoundTrip(t *testing.T) {
 	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
 	creds := map[string]string{"127.0.0.1:5433:ro_user": "ro_pw"}
 
-	f, err := connectPostgresBackend(context.Background(), tok, creds)
+	f, err := connectPostgresBackend(context.Background(), tok, creds, "appdb")
 	if err != nil {
 		t.Fatalf("connectPostgresBackend: %v", err)
 	}
@@ -65,10 +65,8 @@ func TestConnectPostgresBackendLiveRoundTrip(t *testing.T) {
 		t.Fatalf("SELECT 1 response missing ReadyForQuery: %+v", resp)
 	}
 
-	// Raw wire round-trip #2: prove the forwarded database. Task 4.2
-	// hardcodes dbname=appdb (Task 4.3 forwards the client-requested
-	// database from the STARTUP message instead); current_database() must
-	// report appdb.
+	// Raw wire round-trip #2: the caller-supplied database (here "appdb")
+	// reached the backend — current_database() must report it.
 	writePGQuery(t, f.conn, "SELECT current_database()")
 	resp2 := readPGQueryResponse(t, f.conn)
 	if resp2.errMsg != "" {
@@ -82,10 +80,37 @@ func TestConnectPostgresBackendLiveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestConnectPostgresBackendForwardsDatabase proves the CLIENT-requested
+// database is forwarded to the backend connection (Task 4.3 — the interim
+// 4.2 hardcode is gone): connecting with dbName "postgres" must yield a
+// session whose current_database() is "postgres", not appdb.
+func TestConnectPostgresBackendForwardsDatabase(t *testing.T) {
+	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
+	creds := map[string]string{"127.0.0.1:5433:ro_user": "ro_pw"}
+
+	f, err := connectPostgresBackend(context.Background(), tok, creds, "postgres")
+	if err != nil {
+		t.Fatalf("connectPostgresBackend: %v", err)
+	}
+	defer f.Close()
+
+	writePGQuery(t, f.conn, "SELECT current_database()")
+	resp := readPGQueryResponse(t, f.conn)
+	if resp.errMsg != "" {
+		t.Fatalf("backend error: %s", resp.errMsg)
+	}
+	if !resp.dataRow || !bytes.Contains(resp.dataRowPayload, []byte("postgres")) {
+		t.Errorf("current_database() DataRow %q does not contain %q (client db not forwarded)", resp.dataRowPayload, "postgres")
+	}
+	if !resp.ready {
+		t.Fatalf("current_database() response missing ReadyForQuery: %+v", resp)
+	}
+}
+
 func TestConnectPostgresBackendWrongPassword(t *testing.T) {
 	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
 	creds := map[string]string{"127.0.0.1:5433:ro_user": "definitely-wrong-pw"}
-	if _, err := connectPostgresBackend(context.Background(), tok, creds); err == nil {
+	if _, err := connectPostgresBackend(context.Background(), tok, creds, "appdb"); err == nil {
 		t.Fatal("expected auth error for wrong password")
 	}
 }
