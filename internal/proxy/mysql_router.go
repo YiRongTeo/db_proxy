@@ -39,7 +39,24 @@ func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[
 	if !ok {
 		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
 	}
-	conn, err := client.ConnectWithContext(ctx, fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, dbName, 10*time.Second,
+	// Bounded handshake (Task 3.8): go-mysql's timeout parameter covers the
+	// TCP dial only — the initial-handshake read is otherwise unbounded, so a
+	// backend that accepts but never speaks (dead/black-holed) would pin the
+	// session goroutine, the client connection and the consumed token forever.
+	// The custom dialer sets a deadline on the raw conn before go-mysql starts
+	// the handshake; it is cleared once Connect returns so the byte-exact
+	// relay stays deadline-free (long-running queries must never trip a stale
+	// deadline).
+	conn, err := client.ConnectWithDialer(ctx, "tcp",
+		fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, dbName,
+		func(ctx context.Context, network, address string) (net.Conn, error) {
+			c, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			return c, nil
+		},
 		func(c *client.Conn) error {
 			c.UnsetCapability(mysql.CLIENT_QUERY_ATTRIBUTES)
 			c.UnsetCapability(mysql.CLIENT_DEPRECATE_EOF)
@@ -48,5 +65,6 @@ func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[
 	if err != nil {
 		return nil, fmt.Errorf("backend mysql connect: %w", err)
 	}
-	return conn.Conn, nil
+	_ = conn.SetDeadline(time.Time{}) // relay must be deadline-free
+	return conn, nil
 }

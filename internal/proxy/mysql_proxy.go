@@ -63,6 +63,11 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err != nil {
 		return
 	}
+	// The client has spoken — the handshake deadline has done its job. Clear it
+	// now so the backend connect (which can take up to its own bounded timeout)
+	// can still report ERR to the client afterwards; the relay phase is
+	// deadline-free by design (long-running queries must never trip a deadline).
+	_ = client.SetDeadline(time.Time{})
 
 	// 3. single-use token validation (GETDEL — atomic read+delete)
 	tok, err := p.vs.GetDeleteToken(ctx, token)
@@ -94,7 +99,6 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err := writeMySQLPacket(client, 2, okPacket()); err != nil {
 		return
 	}
-	_ = client.SetDeadline(time.Time{})
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
 		"db_type", tok.DBType, "client", clientAddr)
 
