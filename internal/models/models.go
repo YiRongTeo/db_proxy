@@ -35,6 +35,14 @@ type QueryEvent struct {
 	DBType     string    `json:"db_type"` // mysql | postgres
 	SQL        string    `json:"sql"`
 	ClientAddr string    `json:"client_addr"`
+	// Phase 6 enhancement fields — all omitempty for wire backward compatibility.
+	StmtType  string     `json:"stmt_type,omitempty"`  // select|insert|update|delete|other
+	SessionID string     `json:"session_id,omitempty"` // data-plane session id (kill target; NOT the token)
+	Status    string     `json:"status,omitempty"`     // ok|error (from DB response)
+	Error     string     `json:"error,omitempty"`
+	Columns   []string   `json:"columns,omitempty"`
+	Rows      [][]string `json:"rows,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
 }
 
 // Session is the UI session payload (stored at sess:ui:<id>).
