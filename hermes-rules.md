@@ -11,7 +11,7 @@
 - Data Plane NEVER makes HTTP calls to the Control Plane. All coupling via Valkey.
 
 ## Backend Standards (Go)
-- Go 1.24 (local toolchain; spec targets 1.27). stdlib `net/http` + ServeMux.
+- Go 1.25.0 (local toolchain per go.mod; spec targets 1.27). stdlib `net/http` + ServeMux.
 - `log/slog` (JSON) for all logging; `context.Context` for cancellation; no global state.
 - `valkey-io/valkey-go` v1 for Valkey: tokens via `SET … EX` / `GETDEL` (atomic single-use); Pub/Sub via `Subscribe`/`PSubscribe`.
 - `spf13/viper` for config: env prefix `ZT_`, dots → underscores; dev defaults committed in `configs/`.
@@ -31,7 +31,7 @@
 - QueryEvent published to `queries:<username>` AND `queries:ticket:<ticket_id>` (when present).
 
 ## Frontend Standards (Angular 21)
-- Standalone components only (NO NgModules); zoneless; Signals for local state.
+- Standalone components only (NO NgModules); zoneless (Angular 21 default: no zone.js dep/polyfill, no provideZoneChangeDetection in app.config.ts); Signals for local state.
 - NG-ZORRO v21 components (`nz-table`, `nz-form`, `nz-card`, `nz-tag`, `nz-select`); enterprise look.
 - `rxjs/webSocket` for the live feed; `toSignal` bridge; `complete()` on destroy (no leaks).
 - `ngx-clipboard` for token copy; lazy standalone routes; route guards require session.

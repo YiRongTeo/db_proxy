@@ -70,7 +70,7 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
 ## 4. Components
 
 ### 4.1 Control Plane (Go, :8080)
-- Serves the built Angular SPA from `web/dist/`
+- Serves the built Angular SPA from `web/dist/web/browser` (Angular 21 application-builder output layout)
 - `POST /api/token` — issues a single-use token (TTL 300 s) into Valkey; secured by `X-Api-Key` OR UI session cookie
 - `POST /api/login` / `POST /api/logout` — single admin account (`control.yaml`), session stored in Valkey (TTL 8 h)
 - `GET /api/db-presets` — allowlisted DB targets for the Maker UI (zero-trust: UI can only issue tokens against known targets)
@@ -148,9 +148,9 @@ On accept, the Data Plane waits up to `listen.detect_delay_ms` (default 200 ms) 
 
 | Layer | Choice |
 |---|---|
-| Language | Go 1.24 local toolchain (spec targets Go 1.27) |
+| Language | Go 1.25.0 local toolchain (spec targets Go 1.27) |
 | HTTP | stdlib `net/http` ServeMux (method+path patterns) |
-| WebSocket | `coder/websocket` v2 |
+| WebSocket | `coder/websocket` v1.8.15 (installed version; non-/v2 import path) |
 | Store/Bus | `valkey-io/valkey-go` v1 (official Valkey client) |
 | Config | `spf13/viper` (env prefix `ZT_`) |
 | Logging | `log/slog` (JSON) |
