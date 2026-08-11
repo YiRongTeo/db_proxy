@@ -1,0 +1,95 @@
+<nz-card class="maker-card" nzTitle="Maker Portal" nzExtra="Issue a single-use database token">
+  <div class="maker-body">
+    @if (presetsError(); as err) {
+      <nz-alert class="maker-alert" nzType="error" [nzShowIcon]="true" [nzMessage]="err" />
+    }
+    @if (submitError(); as err) {
+      <nz-alert class="maker-alert" nzType="error" [nzShowIcon]="true" [nzMessage]="err" />
+    }
+
+    <nz-spin [nzSpinning]="presetsLoading()">
+      <form nz-form (ngSubmit)="submit()">
+        <nz-form-item>
+          <nz-form-label nzFor="preset" [nzRequired]="true">Database preset</nz-form-label>
+          <nz-form-control>
+            <nz-select
+              id="preset"
+              name="preset"
+              nzPlaceHolder="Select a database preset"
+              [nzLoading]="presetsLoading()"
+              [disabled]="presetsLoading() || submitting()"
+              [ngModel]="selectedPreset()"
+              (ngModelChange)="onPresetChange($event)"
+            >
+              @for (preset of presets(); track preset.name) {
+                <nz-option [nzValue]="preset.name" [nzLabel]="preset.name" />
+              }
+            </nz-select>
+          </nz-form-control>
+        </nz-form-item>
+
+        <nz-form-item>
+          <nz-form-label nzFor="ticket">Ticket id (optional)</nz-form-label>
+          <nz-form-control>
+            <nz-input-group>
+              <input
+                id="ticket"
+                name="ticket"
+                nz-input
+                placeholder="e.g. OPS-1234"
+                [ngModel]="ticketId()"
+                (ngModelChange)="ticketId.set($event)"
+                [disabled]="submitting()"
+              />
+            </nz-input-group>
+          </nz-form-control>
+        </nz-form-item>
+
+        <!-- Hidden payload fields filled from the selected preset -->
+        <input type="hidden" name="db_type" [ngModel]="dbType()" />
+        <input type="hidden" name="db_user" [ngModel]="dbUser()" />
+        <input type="hidden" name="db_ip" [ngModel]="dbIp()" />
+        <input type="hidden" name="db_port" [ngModel]="dbPort()" />
+
+        <nz-form-item>
+          <nz-form-control>
+            <button
+              nz-button
+              nzType="primary"
+              [nzBlock]="true"
+              [disabled]="!selectedPreset() || submitting()"
+              [nzLoading]="submitting()"
+            >
+              Issue token
+            </button>
+          </nz-form-control>
+        </nz-form-item>
+      </form>
+    </nz-spin>
+
+    @if (result(); as res) {
+      <nz-card class="result-card" nzTitle="Token issued">
+        <nz-alert
+          class="maker-alert"
+          nzType="success"
+          [nzShowIcon]="true"
+          nzMessage="Use this token as the MySQL/PostgreSQL username within the expiry window."
+        />
+        <div class="token-row">
+          <input nz-input readonly [value]="res.token" class="token-input" />
+          <button nz-button [cdkCopyToClipboard]="res.token" (cdkCopyToClipboardCopied)="onCopy()">
+            Copy
+          </button>
+          @if (copied()) {
+            <span class="copy-hint">Copied</span>
+          }
+        </div>
+        <nz-descriptions nzTitle="Connection details" [nzColumn]="1" [nzBordered]="true">
+          <nz-descriptions-item nzTitle="Host">{{ res.host }}</nz-descriptions-item>
+          <nz-descriptions-item nzTitle="Port">{{ res.port }}</nz-descriptions-item>
+          <nz-descriptions-item nzTitle="Expires in">{{ res.expires_in }} s</nz-descriptions-item>
+        </nz-descriptions>
+      </nz-card>
+    }
+  </div>
+</nz-card>

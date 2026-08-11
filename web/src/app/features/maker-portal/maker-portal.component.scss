@@ -1,0 +1,36 @@
+.maker-card {
+  max-width: 640px;
+  margin: 48px auto;
+}
+
+.maker-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.maker-alert {
+  margin-bottom: 8px;
+}
+
+.token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.token-input {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  flex: 1;
+}
+
+.copy-hint {
+  color: var(--nz-success-color);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.result-card {
+  margin-top: 16px;
+}
