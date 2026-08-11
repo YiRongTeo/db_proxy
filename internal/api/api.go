@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/store"
@@ -45,13 +46,21 @@ func (a *api) Routes() http.Handler {
 
 // spaHandler serves the built Angular SPA from disk with a single-page-app
 // fallback: any path that is not a real file (e.g. /maker, /checker, /login)
-// gets index.html so client-side routing works. /api and /ws never reach it —
-// Routes() registers those patterns before "/".
+// gets index.html so client-side routing works. The /api/ and /ws/ prefixes
+// are guarded here (404) so unregistered API/WS paths never receive HTML —
+// the guard makes the fallback self-contained instead of relying solely on
+// mux registration order.
 type spaHandler struct {
 	staticDir string
 }
 
 func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /api/* and /ws/* are API/WS territory; unknown paths under them must
+	// 404 (JSON/WS clients would otherwise get index.html, masking bugs).
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws/") {
+		http.NotFound(w, r)
+		return
+	}
 	fs := http.Dir(h.staticDir)
 	if f, err := fs.Open(path.Clean(r.URL.Path)); err != nil {
 		http.ServeFile(w, r, filepath.Join(h.staticDir, "index.html")) // SPA fallback
