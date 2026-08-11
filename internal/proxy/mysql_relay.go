@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"zerotrust-proxy/internal/models"
@@ -42,6 +43,18 @@ func (p *MySQLProxy) pipeBackendToClient(backend, client net.Conn) {
 	}
 }
 
+// trimSniffedSQL strips the NUL terminator that real clients append to
+// COM_QUERY/COM_INIT_DB/COM_STMT_PREPARE payloads (plus any whitespace after
+// it) from the SNIFFED copy only. The relayed payload bytes are never touched
+// — the relay is byte-exact; this affects solely the published event text.
+func trimSniffedSQL(body []byte) string {
+	s := string(body)
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimRight(s, " 	\r\n")
+}
+
 // sniffCommand extracts SQL text from command payloads and publishes a
 // QueryEvent to queries:<username> and queries:ticket:<ticket>. Publishing is
 // best-effort: failures are logged by the caller of Publish, never fatal.
@@ -49,11 +62,11 @@ func (p *MySQLProxy) sniffCommand(cmd byte, body []byte, tok *models.TokenPayloa
 	var kind, sql string
 	switch cmd {
 	case cmdQuery:
-		kind, sql = "query", string(body)
+		kind, sql = "query", trimSniffedSQL(body)
 	case cmdInitDB:
-		kind, sql = "use", "USE "+string(body)
+		kind, sql = "use", "USE "+trimSniffedSQL(body)
 	case cmdPrepare:
-		kind, sql = "prepare", string(body)
+		kind, sql = "prepare", trimSniffedSQL(body)
 	case cmdExecute:
 		kind = "execute"
 		if len(body) >= 4 {

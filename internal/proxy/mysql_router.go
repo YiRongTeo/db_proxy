@@ -18,6 +18,9 @@ func backendKey(t *models.TokenPayload) string {
 
 // connectMySQLBackend authenticates to the real MySQL with Data-Plane-owned
 // credentials, then hands back the raw net.Conn for byte-exact relay.
+// dbName is the database the CLIENT requested in its handshake response
+// (forwarded to the backend so the session has the right default schema);
+// empty means no default database.
 //
 // API note (go-mysql v1.16.0): client.Connect's signature is
 // Connect(addr, user, password, dbName string, options ...Option) — not
@@ -31,12 +34,12 @@ func backendKey(t *models.TokenPayload) string {
 // result-set framing (OK instead of EOF terminators). The proxy's own
 // handshake (advertisedCaps) does not offer either flag to clients, so the
 // backend connection must match — hence the explicit unsets below.
-func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string) (net.Conn, error) {
+func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string, dbName string) (net.Conn, error) {
 	pw, ok := creds[backendKey(t)]
 	if !ok {
 		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
 	}
-	conn, err := client.ConnectWithContext(ctx, fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, "", 10*time.Second,
+	conn, err := client.ConnectWithContext(ctx, fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, dbName, 10*time.Second,
 		func(c *client.Conn) error {
 			c.UnsetCapability(mysql.CLIENT_QUERY_ATTRIBUTES)
 			c.UnsetCapability(mysql.CLIENT_DEPRECATE_EOF)

@@ -59,7 +59,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if len(payload) > 0 && payload[0] == 0xff {
 		return // client refused
 	}
-	token, _, err := parseHandshakeResponse(payload)
+	token, database, err := parseHandshakeResponse(payload)
 	if err != nil {
 		return
 	}
@@ -81,8 +81,8 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		return
 	}
 
-	// 4. backend connection (real credentials)
-	backend, err := connectMySQLBackend(ctx, tok, p.creds)
+	// 4. backend connection (real credentials, client-requested database)
+	backend, err := connectMySQLBackend(ctx, tok, p.creds, database)
 	if err != nil {
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
 		_ = writeMySQLPacket(client, 2, errPacket(1045, "42000", "backend unavailable"))

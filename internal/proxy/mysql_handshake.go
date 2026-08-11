@@ -26,7 +26,7 @@ const (
 )
 
 var advertisedCaps = capLongPassword | capProtocol41 | capTransactions |
-	capSecureConnection | capPluginAuth | capPluginAuthData
+	capSecureConnection | capPluginAuth | capPluginAuthData | capConnectWithDB
 
 // buildHandshakeV10 builds the server's initial handshake payload.
 // authData must be exactly 20 bytes (8-byte part1 + 12-byte part2).

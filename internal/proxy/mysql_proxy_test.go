@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -89,13 +90,20 @@ func buildTestHandshakeResponse(token string) []byte {
 // bufio.Reader + handleConn.
 func startTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer) (net.Listener, <-chan struct{}) {
 	t.Helper()
+	return startTestProxyWithCreds(t, vs, logBuf, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"})
+}
+
+// startTestProxyWithCreds is startTestProxy with a caller-supplied credential
+// map (used by tests that point the backend at a fake listener).
+func startTestProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, creds map[string]string) (net.Listener, <-chan struct{}) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewMySQLProxy(logger, vs, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"})
+	p := NewMySQLProxy(logger, vs, creds)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -139,8 +147,13 @@ func TestSniffCommandPublishesQueryEvents(t *testing.T) {
 		sql  string
 	}{
 		{cmdQuery, []byte("SELECT * FROM users"), "query", "SELECT * FROM users"},
+		// Real clients NUL-terminate command payloads — the sniffed copy must
+		// be trimmed (Task 3.7 deferred fix); the relayed bytes are untouched.
+		{cmdQuery, []byte("SELECT * FROM users\x00"), "query", "SELECT * FROM users"},
 		{cmdInitDB, []byte("appdb"), "use", "USE appdb"},
+		{cmdInitDB, []byte("appdb\x00"), "use", "USE appdb"},
 		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?"), "prepare", "SELECT id FROM t WHERE id = ?"},
+		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?\x00"), "prepare", "SELECT id FROM t WHERE id = ?"},
 		{cmdExecute, []byte{42, 0, 0, 0, 1, 2, 3}, "execute", "EXECUTE stmt_id=42"},
 		{cmdExecute, []byte{1, 2}, "execute", "EXECUTE stmt_id=?"}, // truncated stmt id
 	}
@@ -353,5 +366,225 @@ func TestMySQLSessionTokenRejection(t *testing.T) {
 				t.Errorf("ERR packet missing %q: % x", tc.wantMsg, resp)
 			}
 		})
+	}
+}
+
+// --- Task 3.7: sniffed-SQL NUL trim ----------------------------------------
+
+// TestSniffCommandTrimsTrailingNUL: real COM_QUERY/COM_INIT_DB/COM_STMT_PREPARE
+// payloads are NUL-terminated; the published event SQL must carry neither the
+// NUL nor any whitespace after it, while a payload without a NUL is unchanged.
+func TestSniffCommandTrimsTrailingNUL(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan []byte, 8)
+	acked := make(chan struct{}, 1)
+	subCtx := valkey.WithOnSubscriptionHook(ctx, func(valkey.PubSubSubscription) {
+		select {
+		case acked <- struct{}{}:
+		default:
+		}
+	})
+	go vs.Subscribe(subCtx, "queries:test-user", false, out)
+	waitSubAck(t, acked)
+
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil)
+	tok := &models.TokenPayload{Username: "test-user", DBUser: "ro_user"}
+
+	cases := []struct {
+		name string
+		cmd  byte
+		body []byte
+		want string
+	}{
+		{"query-nul", cmdQuery, []byte("SELECT 1\x00"), "SELECT 1"},
+		{"query-nul-spaces", cmdQuery, []byte("SELECT 1\x00  "), "SELECT 1"},
+		{"query-nul-tab", cmdQuery, []byte("SELECT 1\x00	"), "SELECT 1"},
+		{"query-no-nul", cmdQuery, []byte("SELECT 1"), "SELECT 1"},
+		{"query-trailing-space-before-nul", cmdQuery, []byte("SELECT 1 \x00"), "SELECT 1"},
+		{"initdb-nul", cmdInitDB, []byte("appdb\x00"), "USE appdb"},
+		{"prepare-nul", cmdPrepare, []byte("SELECT ?\x00"), "SELECT ?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p.sniffCommand(tc.cmd, tc.body, tok, "127.0.0.1:55555")
+			var ev models.QueryEvent
+			if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
+				t.Fatalf("unmarshal event: %v", err)
+			}
+			if ev.SQL != tc.want {
+				t.Errorf("sql=%q, want %q (no trailing NUL)", ev.SQL, tc.want)
+			}
+			if strings.ContainsRune(ev.SQL, 0) {
+				t.Errorf("sql=%q still contains a NUL byte", ev.SQL)
+			}
+		})
+	}
+}
+
+// --- Task 3.7: byte/seq-exact relay assertion -------------------------------
+
+// startFakeBackend speaks just enough server-side MySQL for connectMySQLBackend
+// (go-mysql client) to complete auth, then records every subsequent packet it
+// receives — raw 4-byte header + payload — on recv and answers each client
+// command with an OK packet so the relay round-trips.
+func startFakeBackend(t *testing.T) (addr string, recv chan []byte) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fake backend listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	recv = make(chan []byte, 16)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		authData, err := randomAuthData()
+		if err != nil {
+			return
+		}
+		hs, err := buildHandshakeV10("8.4.0-fake", 1, authData)
+		if err != nil {
+			return
+		}
+		if err := writeMySQLPacket(conn, 0, hs); err != nil {
+			return
+		}
+		if _, _, err := readMySQLPacket(conn); err != nil { // client handshake response
+			return
+		}
+		if err := writeMySQLPacket(conn, 2, okPacket()); err != nil {
+			return
+		}
+		for {
+			hdr := make([]byte, 4)
+			if _, err := io.ReadFull(conn, hdr); err != nil {
+				return
+			}
+			length := int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16
+			payload := make([]byte, length)
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				return
+			}
+			recv <- append(append([]byte{}, hdr...), payload...)
+			// Answer with an OK packet (client commands restart at seq 0).
+			if err := writeMySQLPacket(conn, hdr[3]+1, okPacket()); err != nil {
+				return
+			}
+		}
+	}()
+	return ln.Addr().String(), recv
+}
+
+func recvBackendPacket(t *testing.T, recv <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case p := <-recv:
+		return p
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for packet captured by the backend")
+		return nil
+	}
+}
+
+// TestMySQLSessionRelayByteExactToBackend proves the client→backend relay is
+// byte-exact: the raw header bytes (3-byte LE length + sequence id) the test
+// client writes are replayed unchanged to the backend — sniffing must never
+// alter the stream. The COM_QUERY payload intentionally ends with a NUL byte
+// (as real clients send); the backend must receive it untouched, and a second
+// command at seq 1 proves the original sequence id passes through (no
+// renumbering). Session lifecycle + single-use gate are re-asserted here too.
+func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+
+	backendAddr, backendRecv := startFakeBackend(t)
+	_, port, err := net.SplitHostPort(backendAddr)
+	if err != nil {
+		t.Fatalf("split backend addr: %v", err)
+	}
+
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	tok := models.TokenPayload{Username: "test-user", DBUser: "ro_user",
+		DBIP: "127.0.0.1", DBPort: port, DBType: "mysql"}
+	if err := vs.SetToken(ctx, token, tok, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	creds := map[string]string{fmt.Sprintf("127.0.0.1:%s:ro_user", port): "ro_pw"}
+	ln, proxyDone := startTestProxyWithCreds(t, vs, &logBuf, creds)
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Handshake + auth (steps 1-5).
+	if _, _, err := readMySQLPacket(client); err != nil {
+		t.Fatalf("read handshake: %v", err)
+	}
+	if err := writeMySQLPacket(client, 1, buildTestHandshakeResponse(token)); err != nil {
+		t.Fatalf("write handshake response: %v", err)
+	}
+	seq, resp, err := readMySQLPacket(client)
+	if err != nil {
+		t.Fatalf("read OK: %v", err)
+	}
+	if seq != 2 || len(resp) == 0 || resp[0] != 0x00 {
+		t.Fatalf("expected OK seq 2, got seq=%d resp=% x", seq, resp)
+	}
+
+	// Two client commands: COM_QUERY at seq 0 (NUL-terminated payload, as a
+	// real client sends it) and COM_PING at seq 1 (empty payload).
+	query := append([]byte{cmdQuery}, "SELECT 99\x00"...)
+	if err := writeMySQLPacket(client, 0, query); err != nil {
+		t.Fatalf("write COM_QUERY: %v", err)
+	}
+	if err := writeMySQLPacket(client, 1, []byte{cmdPing}); err != nil {
+		t.Fatalf("write COM_PING: %v", err)
+	}
+
+	// Exact wire bytes the client wrote: 3-byte LE length + seq + payload.
+	want := func(seq byte, payload []byte) []byte {
+		return append([]byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}, payload...)
+	}
+	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(0, query)) {
+		t.Errorf("backend received % x\nwant byte-exact % x (seq 0, trailing NUL preserved)", got, want(0, query))
+	}
+	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(1, []byte{cmdPing})) {
+		t.Errorf("backend received % x\nwant byte-exact % x (seq 1 passed through, not renumbered)", got, want(1, []byte{cmdPing}))
+	}
+
+	// Both OK replies come back to the client through the relay.
+	for i := 0; i < 2; i++ {
+		if _, pkt, err := readMySQLPacket(client); err != nil || len(pkt) == 0 || pkt[0] != 0x00 {
+			t.Fatalf("expected OK reply %d, got % x err=%v", i, pkt, err)
+		}
+	}
+
+	// Teardown: client close must unblock both pipes; handleConn returns.
+	client.Close()
+	select {
+	case <-proxyDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleConn did not return within 5s of client close")
+	}
+
+	// Single-use gate: the token was consumed by GETDEL during the session.
+	if got, err := vs.GetDeleteToken(ctx, token); err != nil || got != nil {
+		t.Fatalf("token not consumed: got=%v err=%v", got, err)
+	}
+	// No token value in the logs.
+	if logs := logBuf.String(); strings.Contains(logs, token) {
+		t.Errorf("logs must never contain the token value:\n%s", logs)
 	}
 }
