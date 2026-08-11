@@ -245,7 +245,8 @@ type ValkeyStore struct {
 }
 
 func NewValkeyStore(ctx context.Context, addr, password string, db int) (*ValkeyStore, error) {
-	client, err := valkey.NewClient(valkey.ClientOption{Addr: addr, Password: password, SelectDB: db})
+	// valkey-go v1: ClientOption uses InitAddress ([]string) — there is no Addr field.
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, Password: password, SelectDB: db})
 	if err != nil {
 		return nil, fmt.Errorf("valkey client: %w", err)
 	}
@@ -358,7 +359,7 @@ func NewToken() (string, error) {
 
 ### Task 1.3: Valkey Pub/Sub
 **Files:** Create `internal/store/pubsub.go` + `internal/store/pubsub_test.go`.
-Complete code (valkey-go v1 API; verify with `go doc github.com/valkey-io/valkey-go` if a signature drifted — the SUBSCRIBE result handle exposes `Channel() <-chan valkey.PubSubMessage` and `Close()`):
+Complete code (valkey-go v1.0.76 — VERIFIED: the handle-based `ps.Receive(ctx)` pattern does NOT exist in this version; the correct API is the callback form `Client.Receive(ctx, cmd, fn)` which registers the subscription and invokes fn per message until ctx is cancelled):
 ```go
 package store
 
@@ -375,7 +376,9 @@ func (s *ValkeyStore) Publish(ctx context.Context, channel string, message []byt
 }
 
 // Subscribe streams messages from a channel (or pattern when pattern=true,
-// e.g. "queries:*"). It blocks until ctx is cancelled.
+// e.g. "queries:*"). It blocks until ctx is cancelled or the connection
+// fails, forwarding each message to out. It returns an error if the
+// subscription itself fails; on ctx cancellation it returns ctx.Err().
 func (s *ValkeyStore) Subscribe(ctx context.Context, channel string, pattern bool, out chan<- []byte) error {
 	var cmd valkey.Completed
 	if pattern {
@@ -383,24 +386,19 @@ func (s *ValkeyStore) Subscribe(ctx context.Context, channel string, pattern boo
 	} else {
 		cmd = s.client.B().Subscribe().Channel(channel).Build()
 	}
-	ps, err := s.client.Do(ctx, cmd).Receive()
+	// Receive registers the subscription and invokes fn for every message
+	// until ctx is cancelled (it then returns ctx.Err()). The send must also
+	// unblock on ctx.Done() so a full out channel cannot deadlock cancel.
+	err := s.client.Receive(ctx, cmd, func(msg valkey.PubSubMessage) {
+		select {
+		case out <- []byte(msg.Message):
+		case <-ctx.Done():
+		}
+	})
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", channel, err)
 	}
-	defer ps.Close()
-	for {
-		msg, err := ps.Receive(ctx)
-		if err != nil {
-			return err
-		}
-		if m, ok := msg.(valkey.PubSubMessage); ok {
-			select {
-			case out <- []byte(m.Message):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
+	return nil
 }
 ```
 **Tests:** subscriber goroutine on `queries:test` + pattern `queries:*`; publish 2 messages; assert both received with matching content; cancel ctx → subscriber returns.
@@ -515,13 +513,13 @@ package main
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"zerotrust-proxy/internal/api"
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/logging"
 	"zerotrust-proxy/internal/store"
@@ -537,23 +535,34 @@ func main() {
 	if err != nil { log.Error("valkey", "err", err); os.Exit(1) }
 	defer vs.Close()
 
-	api := NewAPI(log, cfg, vs) // Task 2.2/2.3
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.Routes()}
+	apiSrv := api.NewAPI(log, cfg, vs) // Task 2.2/2.3
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: apiSrv.Routes()}
 
 	go func() {
 		log.Info("control plane listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "err", err)
-			cancel()
+			cancel() // unblocks the shutdown path via the stop channel below
 		}
 	}()
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	log.Info("shutting down")
-	shCtx, shCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shCancel()
-	_ = srv.Shutdown(shCtx)
+	// Fail fast on fatal server errors (e.g. port already bound): the goroutine
+	// above cannot be the only unblocker — cancel() alone would hang the wait.
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.ListenAndServe() }()
+	select {
+	case err := <-srvErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http", "err", err)
+			os.Exit(1)
+		}
+	case sig := <-stop:
+		log.Info("shutting down", "signal", sig.String())
+		shCtx, shCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shCancel()
+		_ = srv.Shutdown(shCtx)
+	}
 }
 ```
 **Verify:** builds; `go run ./cmd/control` starts and logs a JSON line; Ctrl-C (or `process kill`) shuts down cleanly. (Static dir will 404 until Phase 2.9 — fine.)
@@ -670,7 +679,7 @@ mux.Handle("/", http.FileServer(http.Dir(cfg.StaticDir))) // Task 2.9
 Complete code:
 ```go
 func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
-	if !a.auth.validAPIKey(r) && sessionFrom(r) == nil {
+	if !a.auth.validAPIKey(r) && a.auth.sessionFromCookie(r) == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -686,7 +695,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 		return
 	}
-	if sess := sessionFrom(r); sess != nil && req.Username == "" {
+	if sess := a.auth.sessionFromCookie(r); sess != nil && req.Username == "" {
 		req.Username = sess.Username
 	}
 	if req.Username == "" || req.DBUser == "" || req.DBIP == "" || req.DBPort == "" {
@@ -717,11 +726,12 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, models.TokenResponse{
 		Token:     token,
 		Host:      a.cfg.DataPlaneHost,
-		Port:      a.cfg.DataPlanePort[req.DBType],
+		Port:      a.cfg.DataPlanePort, // single shared Data Plane port (spec amendment 8)
 		ExpiresIn: a.cfg.TokenTTL,
 	})
 }
 ```
+> VERIFIED DEVIATIONS (2026-08-11, Task 2.3): (1) `/api/token` is registered WITHOUT `requireSession`, so the context-based `sessionFrom()` is ALWAYS nil here — add `sessionFromCookie(r) *models.Session` to auth.go (read `zt_session` cookie → `GetSession` → return or nil); (2) `DataPlanePort` is a single string (shared port), not a map; (3) the env override for `api.api_key` is `ZT_API_API_KEY` (viper: dots→underscores + ZT_ prefix) — NOT `ZT_API_KEY`.
 **Verify (curl):**
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/token -H 'Content-Type: application/json' -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}'
