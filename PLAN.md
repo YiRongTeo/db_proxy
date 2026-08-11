@@ -1814,3 +1814,270 @@ Recipe (house pattern from B/C — two-browser-hybrid verification):
 - [ ] Two-browser Maker/Checker demo verified and screenshotted
 - [ ] RUN.md reproducible from clean state
 - [ ] Compliance table R1–R7 filled from verified behavior
+
+
+# Phase 6: Checker enhancements (user directive 2026-08-11)
+
+Amendment 9 in hermes-agent-spec.md. Supersedes: amendment 4 (kill only — checker stays monitor-only for approvals).
+Design notes: capture is PASSIVE (relayed bytes byte-exact); one pending command per session; events publish on response completion (session close flushes pending with status=error); kill via Valkey `ctl:kill` channel — no HTTP between planes.
+
+## Task 6.1: QueryEvent extension (models)
+`internal/models/models.go` — ADD fields (all omitempty, backward-compatible; round-trip tests for old + new payloads):
+```go
+	StmtType  string     `json:"stmt_type,omitempty"`  // select|insert|update|delete|other
+	SessionID string     `json:"session_id,omitempty"` // data-plane session id (kill target; NOT the token)
+	Status    string     `json:"status,omitempty"`     // ok|error (from DB response)
+	Error     string     `json:"error,omitempty"`
+	Columns   []string   `json:"columns,omitempty"`
+	Rows      [][]string `json:"rows,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
+```
+TS side (Task 6.7): same fields optional in `QueryEvent` interface (web/src/app/core/api.service.ts).
+
+## Task 6.2: Statement classification + MySQL response capture
+`internal/proxy/mysql_relay.go` — new file `internal/proxy/capture.go` (shared MySQL + classification):
+
+```go
+package proxy
+
+import "strings"
+
+// classifyStmt returns select|insert|update|delete|other from the leading keyword.
+func classifyStmt(sql string) string {
+	s := strings.TrimSpace(sql)
+	for strings.HasPrefix(s, "--") || strings.HasPrefix(s, "/*") || strings.HasPrefix(s, "#") {
+		if i := strings.IndexByte(s, '\n'); i >= 0 { s = strings.TrimSpace(s[i+1:]) } else { return "other" }
+	}
+	kw := s
+	if i := strings.IndexAny(kw, " \t\r\n("); i >= 0 { kw = kw[:i] }
+	switch strings.ToUpper(kw) {
+	case "SELECT": return "select"
+	case "INSERT": return "insert"
+	case "UPDATE": return "update"
+	case "DELETE": return "delete"
+	default: return "other"
+	}
+}
+```
+
+Capture (complete code — protocol-critical, use verbatim):
+```go
+const (
+	capMaxRows  = 100
+	capMaxCell  = 512
+	capMaxEvent = 64 << 10
+)
+
+// resultCapture is a passive state machine over backend→client packets.
+// feed() is called AFTER readMySQLPacket, BEFORE the relay write — bytes are
+// only inspected, never modified.
+type resultCapture struct {
+	status    string // "", "ok", "error"
+	errorMsg  string
+	columns   []string
+	rows      [][]string
+	truncated bool
+	bytes     int
+	colCount  int
+	stage     int // 0=column-count, 1=column-defs, 2=rows
+	doneFlag  bool
+}
+
+func (c *resultCapture) done() bool  { return c == nil || c.doneFlag }
+func (c *resultCapture) ok() bool    { return c != nil && c.status == "ok" }
+
+func (c *resultCapture) feed(payload []byte) {
+	if c.done() || len(payload) == 0 { return }
+	b := payload[0]
+	switch {
+	case b == 0xff: // ERR packet
+		c.status, c.errorMsg = "error", mysqlErrMessage(payload)
+		c.doneFlag = true
+		return
+	case b == 0x00 && len(payload) >= 7: // OK packet
+		c.finish()
+		return
+	case b == 0xfb: // LOCAL INFILE — not captured
+		return
+	case b == 0xfe && len(payload) < 9: // EOF: ends col defs (stage1) or rows (stage2)
+		if c.stage == 1 { c.stage = 2; return }
+		if c.stage == 2 { c.finish(); return }
+		return
+	}
+	switch c.stage {
+	case 0: // column-count packet (lenenc int)
+		n, _, ok := readLenencInt(payload, 0)
+		if !ok || n == 0 { c.finish(); return }
+		c.colCount = int(n)
+		c.stage = 1
+	case 1: // column definition
+		if name, ok := mysqlColumnName(payload); ok {
+			c.columns = append(c.columns, name)
+		}
+		if len(c.columns) >= c.colCount { c.stage = 2 }
+	case 2: // data row
+		row, consumed := parseMySQLRow(payload)
+		if consumed > 0 {
+			if len(c.rows) < capMaxRows && c.bytes+len(payload) <= capMaxEvent {
+				c.rows = append(c.rows, row)
+				c.bytes += len(payload)
+			} else {
+				c.truncated = true
+			}
+		}
+	}
+}
+
+func (c *resultCapture) finish() { if c.status == "" { c.status = "ok" }; c.doneFlag = true }
+
+func mysqlErrMessage(p []byte) string {
+	if len(p) < 9 { return "" }
+	m := string(p[9:])
+	if len(m) > 300 { m = m[:300] }
+	return m
+}
+
+// mysqlColumnName extracts the column NAME from a COLUMN_DEFINITION packet
+// (lenenc walk: catalog schema table org_table NAME org_name + fixed 0x0c header).
+func mysqlColumnName(p []byte) (string, bool) {
+	off := 0
+	for i := 0; i < 4; i++ { // catalog, schema, table, org_table
+		start, n, ok := readLenencString(p, off)
+		if !ok { return "", false }
+		off = start + n
+	}
+	start, n, ok := readLenencString(p, off) // NAME
+	if !ok { return "", false }
+	return string(p[start : start+n]), true
+}
+
+func readLenencInt(p []byte, off int) (uint64, int, bool) {
+	if off >= len(p) { return 0, 0, false }
+	switch b := p[off]; {
+	case b < 0xfb:
+		return uint64(b), 1, true
+	case b == 0xfb: // NULL
+		return 0, 1, false
+	case b == 0xfc:
+		if off+3 > len(p) { return 0, 0, false }
+		return uint64(p[off+1]) | uint64(p[off+2])<<8, 3, true
+	case b == 0xfd:
+		if off+4 > len(p) { return 0, 0, false }
+		return uint64(p[off+1]) | uint64(p[off+2])<<8 | uint64(p[off+3])<<16, 4, true
+	default: // 0xfe — 8-byte
+		if off+9 > len(p) { return 0, 0, false }
+		var v uint64
+		for i := 1; i <= 8; i++ { v |= uint64(p[off+i]) << (8 * (i - 1)) }
+		return v, 9, true
+	}
+}
+
+func readLenencString(p []byte, off int) (int, int, bool) {
+	n, sz, ok := readLenencInt(p, off)
+	if !ok || n > 1<<20 { return 0, 0, false }
+	start := off + sz
+	if start+int(n) > len(p) { return 0, 0, false }
+	return start, int(n), true
+}
+
+// parseMySQLRow decodes a DataRow packet into cells; returns (nil,0) on malformed.
+func parseMySQLRow(p []byte) ([]string, int) {
+	n, sz, ok := readLenencInt(p, 0)
+	if !ok || n == 0 || n > 1024 { return nil, 0 }
+	off := sz
+	row := make([]string, 0, n)
+	for i := uint64(0); i < n; i++ {
+		if off < len(p) && p[off] == 0xfb { row = append(row, ""); off++; continue }
+		start, ln, ok := readLenencString(p, off)
+		if !ok { return nil, 0 }
+		cell := string(p[start : start+ln])
+		if len(cell) > capMaxCell { cell = cell[:capMaxCell] + "…" }
+		row = append(row, cell)
+		off = start + ln
+	}
+	return row, off
+}
+```
+
+Wiring (mysql_relay.go + mysql_proxy.go):
+1. `mysqlSession` struct (mysql_proxy.go): `{ id string; mu sync.Mutex; pending *models.QueryEvent; capture *resultCapture }` — created at handshake OK (`id = "sid-" + newEventID()`), stored in a `map[string]*mysqlSession` on MySQLProxy (with mutex; also serves the kill registry — see 6.4).
+2. `sniffCommand` (client→backend): set `ev.StmtType = classifyStmt(sql)`; do NOT publish yet — stash `s.pending = ev; s.capture = &resultCapture{}`.
+3. `pipeBackendToClient`: after `readMySQLPacket`, `s.mu.Lock(); s.capture.feed(payload); done := s.capture.done(); s.mu.Unlock()`; after the relay write, if `done && s.pending != nil` → attach columns/rows/status/error/truncated → publish to `queries:<user>` + `queries:ticket:<t>` → clear pending. If `pending != nil && capture == nil` (non-query commands like PING): publish immediately after OK/ERR seen — i.e. a capture with no result-set still ends via OK/ERR feed.
+4. On session close (both exits): if `s.pending != nil` → set `status="error", error="connection closed before response"` → publish → clear. Unregister session.
+5. Session close also flushes — so `defer` in handleConn calls `s.flushPendingOnClose()`.
+
+## Task 6.3 (folded into Task 4.3): PG relay + capture
+PG relay uses RAW message framing (type byte + int32 length) — pgproto3 is used for the auth phase only (already committed). Capture by type byte on backend→client:
+- 'T' RowDescription → column names (int16 count; per field: cstring name, then skip int32+int16+int32+int16+int32+int16)
+- 'D' DataRow → cells (int16 count; per cell int32 len + bytes; NULL = len -1; caps as MySQL)
+- 'C' CommandComplete → status ok (publish point when a query is pending)
+- 'E' ErrorResponse → status error + message (walk fields: byte tag + cstring; take 'M')
+- 'I' EmptyQueryResponse → ok
+- 'Z' ReadyForQuery → also a publish point if pending (safety)
+Client→backend: 'Q' SimpleQuery (sql), 'P' Parse (stmt name + sql — maintain per-session map stmtName→sql), 'E' Execute (kind execute; look up sql by portal/stmt name when possible), 'X' Terminate (session close). Same pending/flush semantics as MySQL.
+
+## Task 6.4: Kill-switch (data plane)
+1. `sessionRegistry` in proxy package: `register(id, closer func()) / unregister(id) / KillSession(id string) bool` (mutex + map). MySQLProxy + PGProxy each embed one; handleConn registers after auth OK (closer = close client + backend conns), defers unregister + flush.
+2. cmd/data/main.go: after dispatcher start, subscribe `ctl:kill` (exact channel):
+```go
+killCh := make(chan []byte, 16)
+go func() {
+	if err := vs.Subscribe(ctx, "ctl:kill", false, killCh); err != nil && !errors.Is(err, context.Canceled) {
+		log.Error("kill subscriber", "err", err)
+	}
+}()
+go func() {
+	for msg := range killCh {
+		var k struct{ SessionID string `json:"session_id"` }
+		if json.Unmarshal(msg, &k) != nil || k.SessionID == "" { continue }
+		if d.KillSession(k.SessionID) { log.Info("session killed", "session_id", k.SessionID) } else { log.Warn("kill: unknown session", "session_id", k.SessionID) }
+	}
+}()
+```
+(d = Dispatcher or a combined killer passed in — implement `KillSession` on a small struct holding both proxies' registries, or expose registry on each proxy and call both.)
+
+## Task 6.5: Control plane — ticket required + POST /api/kill
+1. `handlers.go handleToken`: after required-field checks, `if req.TicketID == "" { writeJSON(w, 400, map[string]string{"error": "ticket_id required"}); return }` (spec amendment 9b). Update curl tests (old 200-without-ticket → 400).
+2. `handlers.go handleKill`:
+```go
+func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
+	var req struct{ SessionID string `json:"session_id"` }
+	if err := decodeJSON(w, r, &req); err != nil || req.SessionID == "" {
+		writeJSON(w, 400, map[string]string{"error": "session_id required"}); return
+	}
+	b, err := json.Marshal(map[string]string{"session_id": req.SessionID})
+	if err != nil { writeJSON(w, 500, map[string]string{"error": "internal"}); return }
+	if err := a.vs.Publish(r.Context(), "ctl:kill", b); err != nil {
+		writeJSON(w, 502, map[string]string{"error": "kill dispatch failed"}); return
+	}
+	writeJSON(w, 202, map[string]string{"killed": "queued"})
+}
+```
+3. api.go: `mux.HandleFunc("POST /api/kill", a.auth.requireSession(a.handleKill))`.
+4. Verify: curl with cookie + `{"session_id":"sid-x"}` → 202; no cookie → 401; bad body → 400. And a live kill E2E is Task 6.8.
+
+## Task 6.6: Maker portal — ticket required
+`web/src/app/features/maker-portal/`: ticket input gets `nzRequired` (label asterisk), submit button `[disabled]="!selectedPreset() || !ticketId()?.trim() || submitting()"`, and the submit() guard returns early with an error if ticket empty. Spec text "Ticket id (optional)" → "Ticket id".
+
+## Task 6.7: Checker dashboard — stmt tags, status, output table, kill button
+`web/src/app/features/checker-dashboard/`:
+1. Kind column: render wire kind tag + stmt_type tag when present (SELECT=blue, INSERT=green, UPDATE=orange, DELETE=red, other=default; wire kinds keep existing colors).
+2. New "Status" column: nz-tag ok=green/success, error=red (title = error message; tooltip nzTooltipTitle).
+3. New "Output" column: nz-button "view" (disabled when no rows/columns) → expandable row (nzExpand) rendering a READ-ONLY nested nz-table: `[nzData]="row.cells"` with dynamic `[nzColumns]` from event.columns, cells as plain text (no inputs — read-only by construction). Truncated flag → nz-alert "results truncated".
+4. New "Kill" column: nz-button danger "kill" (nz-popconfirm) → `ApiService.killSession(sessionId)` → POST /api/kill; on 202 → mark row killed (tag "killed"), disable button; on error → nz-message error. sessionId from `event.session_id` (button hidden when absent).
+5. `ApiService.killSession(sessionId: string): Observable<{killed: string}>` → POST /api/kill.
+6. Tests: update/extend checker-dashboard spec — stmt tag mapping, status tag, kill button calls service with session_id, output table renders columns/cells read-only (no input elements), truncated alert.
+
+## Task 6.8: Enhancement integration gate
+Full matrix (both planes up, containers up):
+1. Ticket required: POST /api/token without ticket_id → 400; with → 200.
+2. SELECT through proxy (mysql client): event arrives with stmt_type=select, status=ok, columns=[id,name], rows=[[1,alpha],[2,bravo],[3,charlie]], truncated=false; checker WS receives it.
+3. INSERT through proxy (rw_user token): event status=ok, stmt_type=insert, no rows; row actually inserted (verify via direct container query).
+4. Deliberate error (e.g. SELECT * FROM nonexistent): event status=error with message containing "doesn't exist"; query still relayed byte-exact.
+5. UPDATE: stmt_type=update, status=ok.
+6. PG side: psql SELECT through :3306 → event stmt_type=select, status=ok, columns/rows captured.
+7. KILL E2E (the money shot): maker connects (mysql client, long sleep query or just open session) → checker clicks kill (API call with event's session_id) → maker's client sees connection closed/ERROR 2013; data plane logs "session killed"; backend conn verified closed (no orphaned process in container: `docker exec mysql-test mysqladmin -uroot -proot_pw processlist` shows no ro_user conn).
+8. Teardown: both planes down, ports free; full Go suite + ng test + build green; commit.
+
+## Phase 6 gate
+Full suite (Go + Angular) green; ledger updated; amendment 9 verified end-to-end; security matrix gains kill-switch row.

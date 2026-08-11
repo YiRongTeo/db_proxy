@@ -185,6 +185,12 @@ All dependencies Apache-2.0 or MIT — no GPL.
 6. **Response `port` = Data Plane public listener** for the requested `db_type` (not the backend port).
 7. **UI auth**: single admin account from `control.yaml`; sessions in Valkey (TTL 8 h).
 8. **Single shared Data Plane port** (`:3306`) for both protocols, with per-connection detection (`detect_delay_ms`, default 200 ms); `data_plane_ports` → single `data_plane_port` (2026-08-11, plan review).
+9. **Checker enhancements (2026-08-11, user directive)**:
+   a. **`stmt_type`** on `QueryEvent` — statement classification `select|insert|update|delete|other` (from SQL text); checker renders it alongside the wire `kind`.
+   b. **Ticket required**: `POST /api/token` returns 400 when `ticket_id` is missing (maker form gates submit).
+   c. **Query output capture**: Data Plane passively captures backend→client responses — result-set `columns` + up to 100 `rows` (cell ≤ 512 chars, event ≤ 64 KB, `truncated` flag) — published on `QueryEvent`; checker renders an expandable READ-ONLY nz-table. Capture is passive: relayed bytes stay byte-exact.
+   d. **Run status**: `QueryEvent.status = ok|error` + `error` message from OK/ERR packets (MySQL) and CommandComplete/ErrorResponse (PG).
+   e. **Kill-switch (supersedes amendment 4's v1 exclusion for KILL only)**: checker button → `POST /api/kill {session_id}` (session-authed) → Control Plane publishes to Valkey channel `ctl:kill` (JSON `{session_id}`) → Data Plane session registry force-closes the maker's client + backend connections. Decoupling invariant preserved: **no HTTP between planes**; Valkey is the only coupling. `QueryEvent.session_id` is the kill target (public audit id, NOT the secret token). Amendment 4 remains: checker is monitor-only for approvals; the kill capability is added per directive.
 
 ---
 
