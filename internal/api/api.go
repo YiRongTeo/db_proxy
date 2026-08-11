@@ -30,8 +30,8 @@ func (a *api) Routes() http.Handler {
 	mux.HandleFunc("POST /api/login", a.auth.handleLogin)
 	mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireSession(a.handleDBPresets))
-	mux.HandleFunc("POST /api/token", a.handleToken) // auth inside (key OR session)
-	// Task 2.4: mux.HandleFunc("GET /ws/checker", a.auth.requireSession(a.handleWS))
+	mux.HandleFunc("POST /api/token", a.handleToken)                     // auth inside (key OR session)
+	mux.HandleFunc("GET /ws/checker", a.auth.requireSession(a.handleWS)) // Task 2.4
 	// Task 2.9: mux.Handle("/", http.FileServer(http.Dir(a.cfg.StaticDir)))
 	return mux
 }

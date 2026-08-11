@@ -3,6 +3,7 @@ module zerotrust-proxy
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/spf13/viper v1.21.0
 	github.com/valkey-io/valkey-go v1.0.76
 )
