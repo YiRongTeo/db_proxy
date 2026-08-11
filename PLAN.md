@@ -86,9 +86,9 @@ docker exec pg-test psql -U app_user -d appdb -c "
 CREATE ROLE ro_user LOGIN PASSWORD 'ro_pw';
 GRANT CONNECT ON DATABASE appdb TO ro_user;
 GRANT USAGE ON SCHEMA public TO ro_user;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ro_user;
 CREATE TABLE IF NOT EXISTS demo_items (id SERIAL PRIMARY KEY, name TEXT);
-INSERT INTO demo_items (name) VALUES ('alpha'),('bravo'),('charlie') ON CONFLICT DO NOTHING;"
+INSERT INTO demo_items (name) VALUES ('alpha'),('bravo'),('charlie') ON CONFLICT DO NOTHING;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ro_user;"   # NOTE: GRANT AFTER CREATE TABLE — otherwise a fresh seed grants on zero tables (fixed 2026-08-11, 4.3 gate)
 ```
 **Verify:** `docker exec pg-test psql -U app_user -d appdb -tAc "SELECT COUNT(*) FROM demo_items;"` → 3.
 
@@ -1105,19 +1105,28 @@ func backendKey(t *models.TokenPayload) string {
 
 // connectMySQLBackend authenticates to the real MySQL with Data-Plane-owned
 // credentials, then hands back the raw net.Conn for byte-exact relay.
+// VERIFIED (v1.16.0, 2026-08-11): go-mysql negotiates CLIENT_QUERY_ATTRIBUTES
+// and CLIENT_DEPRECATE_EOF by default — MySQL 8.4 then rejects naked COM_QUERY
+// (ERR 1835 "Malformed communication packet") and EOF-less result-set framing
+// mismatches classic clients. Both MUST be unset before Connect so the backend
+// negotiates classic framing, matching what the relayed client produces.
 func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string) (net.Conn, error) {
 	pw, ok := creds[backendKey(t)]
 	if !ok {
 		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
 	}
-	conn, err := client.Connect(ctx, fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, "")
+	conn, err := client.ConnectWithContext(ctx, fmt.Sprintf("%s:%s", t.DBIP, t.DBPort), t.DBUser, pw, "",
+		func(c *client.Conn) {
+			c.UnsetCapability(client.CLIENT_QUERY_ATTRIBUTES)
+			c.UnsetCapability(client.CLIENT_DEPRECATE_EOF)
+		})
 	if err != nil {
 		return nil, fmt.Errorf("backend mysql connect: %w", err)
 	}
 	return conn.Conn, nil
 }
 ```
-(Check `client.Connect` signature via `go doc github.com/go-mysql-org/go-mysql/client Connect` — it accepts an optional context first arg in recent versions; if not, use the no-context variant. `conn.Conn` is the exported raw net.Conn.)
+(Verified against v1.16.0: `ConnectWithContext(ctx, addr, user, password, dbName, opts...)` — the plain `Connect` has no ctx arg. `conn.Conn` is the exported raw net.Conn. The UnsetCapability opts are LOAD-BEARING — do not remove them.)
 **Verify:** unit test with `creds` map: unknown key → error; known key → no error *before* dial (use a fake: skip dial test here — covered in 3.6 integration).
 
 ### Task 3.4: MySQL proxy session
@@ -1494,7 +1503,9 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	clientAddr := client.RemoteAddr().String()
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
 
-	be := pgproto3.NewBackend(br, nil) // nil = no SSL support; br carries peeked bytes
+	// VERIFIED v2.3.3: NewBackend needs BOTH args — (ChunkReader, writer); nil writer panics on Send.
+	// br carries the dispatcher's peeked bytes; client is the write side.
+	be := pgproto3.NewBackend(pgproto3.NewChunkReader(br), client) // no SSL support
 	startupMsg, err := be.ReceiveStartupMessage()
 	if err != nil {
 		return
@@ -1599,18 +1610,21 @@ func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, creds m
 	if err != nil {
 		return nil, fmt.Errorf("backend pg connect: %w", err)
 	}
-	raw, err := pgconn.PgConn().Hijack()
+	// VERIFIED v5.10.0: Hijack() returns (*HijackedConn, error) — use hc.Conn as the raw net.Conn.
+	// pgx consumes the FULL backend handshake (ReadyForQuery); hijacked stream is byte-clean
+	// (bgReader stopped, chunkreader drained — verified against pgx source; proven by live test).
+	hc, err := pgconn.PgConn().Hijack()
 	if err != nil {
 		return nil, fmt.Errorf("pg hijack: %w", err)
 	}
-	return &pgFrontend{conn: raw.Conn, f: pgproto3.NewFrontend(raw.Conn, nil)}, nil
+	return &pgFrontend{conn: hc.Conn, f: pgproto3.NewFrontend(pgproto3.NewChunkReader(hc.Conn), hc.Conn)}, nil
 }
 
 func (f *pgFrontend) Send(msg pgproto3.BackendMessage) error { return f.f.Send(msg) } // see note
 func (f *pgFrontend) Receive() (pgproto3.FrontendMessage, error) { return f.f.Receive() }
 func (f *pgFrontend) Close() { _ = f.conn.Close() }
 ```
-> Note: `pgproto3.Frontend.Send` accepts `FrontendMessage` (client→server messages) and `Receive` returns `BackendMessage` (server→client). Adjust the wrapper method signatures accordingly — the relay in Task 4.3 sends `pgproto3.FrontendMessage`s to the backend and `pgproto3.BackendMessage`s to the client. If `pgconn.PgConn().Hijack()` differs in the installed pgx v5 version, check `go doc github.com/jackc/pgx/v5/pgconn PgConn.Hijack` and adapt (it returns `(net.Conn, *HijackedConn, error)`).
+> Note: `pgproto3.Frontend.Send` accepts `FrontendMessage` (client→server messages) and `Receive` returns `BackendMessage` (server→client). Adjust the wrapper method signatures accordingly — the relay in Task 4.3 sends `pgproto3.FrontendMessage`s to the backend and `pgproto3.BackendMessage`s to the client. VERIFIED v5.10.0: `Hijack()` returns `(*HijackedConn, error)` (use `hc.Conn`); `NewFrontend(cr ChunkReader, w io.Writer)` — nil writer panics on Send, so pass `hc.Conn` as both. Also: set `cfg.Password = pw` AFTER `ParseConfig` (raw interpolation breaks passwords with space/quote/backslash).
 
 ### Task 4.3: PG relay + SQL extraction
 **Files:** `internal/proxy/pg_relay.go`:
