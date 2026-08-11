@@ -233,15 +233,39 @@ func decodeLenencString(b []byte) (string, bool) {
 	return "", false
 }
 
-// proxyGoroutines counts goroutines whose stack includes proxy-package frames
-// — the handler/pipe/accept goroutines the edge tests must prove are torn
-// down. Persistent client internals (valkey-go pipe loops, go-mysql, net
-// pollers) are deliberately excluded: they are library background loops that
-// spawn lazily on first use, not leaks.
+// proxyGoroutines counts goroutines whose stack includes proxy-package
+// function frames — the handler/pipe/accept goroutines the edge tests must
+// prove are torn down. Persistent client internals (valkey-go pipe loops,
+// go-mysql, net pollers) are deliberately excluded: they are library
+// background loops that spawn lazily on first use, not leaks.
+//
+// Matching is on FUNCTION-NAME lines only, at most once per goroutine.
+// runtime.Stack emits each stack as column-0 function lines
+// ("zerotrust-proxy/internal/proxy.mysqlProxy.handleConn(...)") followed by
+// tab-prefixed file lines ("	D:/AI/hermes/.../mysql_proxy.go:123"). The old
+// pattern "	zerotrust-proxy/internal/proxy." matched NOTHING (function
+// lines carry no leading tab) — the leak check was a guaranteed no-op.
+// Counting bare "internal/proxy." occurrences would over-count: absolute
+// file paths appear in every stack, and "created by" trailer lines are also
+// column-0. This must never regress to a no-op (see
+// TestProxyGoroutinesNonVacuous).
 func proxyGoroutines() int {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
-	return strings.Count(string(buf[:n]), "	zerotrust-proxy/internal/proxy.")
+	count := 0
+	inGoroutine := false
+	for _, line := range strings.Split(string(buf[:n]), "\n") {
+		switch {
+		case strings.HasPrefix(line, "goroutine "):
+			inGoroutine = true
+		case inGoroutine && !strings.HasPrefix(line, "	") &&
+			!strings.HasPrefix(line, "created by ") &&
+			strings.Contains(line, "internal/proxy."):
+			count++
+			inGoroutine = false // count this goroutine at most once
+		}
+	}
+	return count
 }
 
 // assertNoGoroutineLeak polls until the proxy goroutine count settles back to
@@ -584,9 +608,16 @@ func TestEdgeConcurrentLiveSessions(t *testing.T) {
 				errs <- fmt.Errorf("session %d: result set: %w", i, err)
 				return
 			}
-			got, ok := decodeLenencString(rows[0])
-			if len(rows) != 1 || !ok || got != values[i] {
+			if len(rows) != 1 {
+				// Length check BEFORE indexing rows[0]: an empty result set must
+				// fail with the clean assertion message, not panic the session
+				// goroutine.
 				errs <- fmt.Errorf("session %d: rows=%q, want exactly [%q] (own result, no cross-talk)", i, rows, values[i])
+				return
+			}
+			got, ok := decodeLenencString(rows[0])
+			if !ok || got != values[i] {
+				errs <- fmt.Errorf("session %d: decode rows[0]: ok=%v got=%q want %q (own result, no cross-talk)", i, ok, got, values[i])
 				return
 			}
 		}(i)
@@ -605,4 +636,42 @@ func TestEdgeConcurrentLiveSessions(t *testing.T) {
 	}
 
 	assertNoGoroutineLeak(t, baseline)
+}
+
+// TestProxyGoroutinesNonVacuous guards proxyGoroutines() against regressing
+// to a no-op: it spawns a goroutine parked inside a proxy-package closure and
+// requires the observed count to increase by exactly 1. Before the fix,
+// proxyGoroutines() matched "	zerotrust-proxy/internal/proxy." — a pattern
+// that never occurs in runtime.Stack output (function-name lines carry NO
+// leading tab; file lines are tab-prefixed absolute paths) — so it always
+// returned 0 and every assertNoGoroutineLeak was a guaranteed no-op. This
+// test fails against that implementation (base+1 is never reached), proving
+// the leak check is non-vacuous.
+func TestProxyGoroutinesNonVacuous(t *testing.T) {
+	// Baseline BEFORE spawning: this test's own goroutine is always counted
+	// (it is executing proxy-package test code), and no other proxy
+	// goroutines exist here — the suite is sequential and every edge test
+	// already asserted its own goroutines returned to baseline.
+	base := proxyGoroutines()
+	release := make(chan struct{})
+	done := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(started)
+		<-release // park inside a proxy-package goroutine
+	}()
+	<-started
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if n := proxyGoroutines(); n == base+1 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("proxyGoroutines() did not observe the parked goroutine: base=%d, got=%d — leak check is vacuous or broken", base, n)
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	close(release)
+	<-done
 }
