@@ -1080,7 +1080,7 @@ func errPacket(code uint16, sqlState, msg string) []byte {
 **Tests:**
 1. `buildHandshakeV10` output: first byte 0x0a; contains "mysql_native_password"; plugin data length byte == 21 at the right offset; length equals expected layout.
 2. `parseHandshakeResponse` on a constructed 4.1 response: caps + username "sess_abc" + db "appdb" + 20-byte auth; and an error case (truncated, no 4.1).
-3. `errPacket(1045, "42000", "invalid or expired token")` starts `[0xff, 0x0d, 0x04, '#', '4', '2', '0', '0', '0']`.
+3. `errPacket(1045, "42000", "invalid or expired token")` starts `[0xff, 0x15, 0x04, '#', '4', '2', '0', '0', '0']` (1045 = 0x0415, little-endian 0x15 0x04 — corrected from an earlier typo 0x0d).
 **Verify:** `go test ./internal/proxy/ -run Handshake -v` → PASS.
 
 ### Task 3.3: Backend connect + credential resolution
