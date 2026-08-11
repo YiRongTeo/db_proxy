@@ -126,6 +126,9 @@ func TestLoadData(t *testing.T) {
 	if got := cfg.DetectDelayMS; got != 200 {
 		t.Errorf("DetectDelayMS = %d, want 200", got)
 	}
+	if got := cfg.MaxConns; got != 100 {
+		t.Errorf("MaxConns = %d, want 100", got)
+	}
 	if got := cfg.ValkeyAddr; got != "127.0.0.1:6379" {
 		t.Errorf("ValkeyAddr = %q, want %q", got, "127.0.0.1:6379")
 	}

@@ -87,6 +87,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 type DataConfig struct {
 	ListenAddr     string
 	DetectDelayMS  int
+	MaxConns       int
 	ValkeyAddr     string
 	ValkeyPassword string
 	ValkeyDB       int
@@ -100,13 +101,15 @@ func LoadData(path string) (*DataConfig, error) {
 	v := viper.New()
 	if err := load(v, path, map[string]any{
 		"listen.addr": ":3306", "listen.detect_delay_ms": 200,
-		"valkey.addr": "127.0.0.1:6379",
+		"listen.max_conns": 100,
+		"valkey.addr":      "127.0.0.1:6379",
 	}); err != nil {
 		return nil, err
 	}
 	cfg := &DataConfig{
 		ListenAddr:     v.GetString("listen.addr"),
 		DetectDelayMS:  v.GetInt("listen.detect_delay_ms"),
+		MaxConns:       v.GetInt("listen.max_conns"),
 		ValkeyAddr:     v.GetString("valkey.addr"),
 		ValkeyPassword: v.GetString("valkey.password"),
 		ValkeyDB:       v.GetInt("valkey.db"),
