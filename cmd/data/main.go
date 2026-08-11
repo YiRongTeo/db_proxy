@@ -33,12 +33,12 @@ func main() {
 	}
 	defer vs.Close()
 
-	// PG proxy is plugged in Phase 4 (Task 4.4); until then pass nil and let
-	// the Dispatcher drop detected PG clients explicitly (it nil-guards).
+	// Both proxies share one listener: the Dispatcher detects the protocol per
+	// connection (PG client-first, MySQL server-first) and routes accordingly.
 	d := proxy.NewDispatcher(
 		log,
 		proxy.NewMySQLProxy(log, vs, cfg.Credentials),
-		nil,
+		proxy.NewPGProxy(log, vs, cfg.Credentials),
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
