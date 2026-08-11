@@ -15,7 +15,7 @@
 - `log/slog` (JSON) for all logging; `context.Context` for cancellation; no global state.
 - `valkey-io/valkey-go` v1 for Valkey: tokens via `SET … EX` / `GETDEL` (atomic single-use); Pub/Sub via `Subscribe`/`PSubscribe`.
 - `spf13/viper` for config: env prefix `ZT_`, dots → underscores; dev defaults committed in `configs/`.
-- `coder/websocket` v2 for `/ws/checker`.
+- `coder/websocket` v1.8.15 for `/ws/checker` (installed version; brief code imports the non-/v2 path).
 - `go-mysql-org/go-mysql` v1 for backend MySQL auth ONLY (then raw relay over `conn.Conn`).
 - `jackc/pgx/v5` for backend PG auth (SCRAM), then `Hijack()` + `jackc/pgproto3/v2` for relay.
 - Tokens: `crypto/rand`, `sess_` prefix; never log token values.
