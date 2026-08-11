@@ -35,7 +35,16 @@ export class LiveQueryService implements OnDestroy {
     }
     this.socket = webSocket<QueryEvent>(config);
     this.socket.subscribe({
-      next: (e) => this.events.update((a) => [...a.slice(-this.limit + 1), e]),
+      // Dedupe by event.id: the data plane dual-publishes each QueryEvent
+      // (queries:<username> AND queries:ticket:<ticket_id>), so channel=*
+      // (pattern `queries:*`) delivers every event twice with identical ids.
+      // Keep the FIRST occurrence (the copies are identical); the ring cap
+      // still applies below. Linear scan is fine — the buffer is ≤500.
+      next: (e) =>
+        this.events.update((a) => {
+          if (a.some((x) => x.id === e.id)) return a;
+          return [...a.slice(-this.limit + 1), e];
+        }),
       error: () => this.connected.set(false),
       complete: () => this.connected.set(false),
     });

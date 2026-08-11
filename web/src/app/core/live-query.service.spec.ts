@@ -88,6 +88,43 @@ describe('LiveQueryService', () => {
     expect(service.connected()).toBe(true);
   });
 
+  it('dedupes duplicate event ids (dual-publish on channel=*) and keeps the first copy', () => {
+    service.connect('alice');
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+
+    const dup = event('dup-1');
+    fake.emit(dup);
+    fake.emit(dup); // identical id — second copy must be dropped
+
+    const other = event('other-1');
+    fake.emit(other); // different id still appends
+
+    const events = service.events();
+    expect(events.length).toBe(2);
+    expect(events.map((e) => e.id)).toEqual(['dup-1', 'other-1']);
+    expect(events[0].sql).toBe('SELECT dup-1'); // first occurrence kept, fields intact
+  });
+
+  it('ring cap (500) still holds when duplicates are interleaved: 505 emits, 5 dupes → 500 unique', () => {
+    service.connect('alice');
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+
+    for (let i = 1; i <= 500; i++) {
+      fake.emit(event(`e${i}`));
+    }
+    for (let i = 1; i <= 5; i++) {
+      fake.emit(event(`e${i}`)); // 5 duplicate re-deliveries → 505 total emits
+    }
+
+    const events = service.events();
+    expect(events.length).toBe(500); // ring-buffer cap still holds
+    expect(new Set(events.map((e) => e.id)).size).toBe(500); // no duplicate ids
+    expect(events[0].id).toBe('e1'); // nothing evicted — all 500 unique
+    expect(events[499].id).toBe('e500');
+  });
+
   it('disconnect() completes the socket (no leak) and reconnect opens a fresh one', () => {
     service.connect('alice');
     const first = FakeWebSocket.instances[0];
