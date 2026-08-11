@@ -152,7 +152,10 @@ func TestParseHandshakeResponse(t *testing.T) {
 	for i := range auth {
 		auth[i] = byte(i + 1)
 	}
-	caps := uint32(capProtocol41 | capSecureConnection | capConnectWithDB)
+	// Raw capability bits, pinned deliberately: CLIENT_CONNECT_WITH_DB is 0x08
+	// per the MySQL protocol. Do NOT substitute the capConnectWithDB constant —
+	// a regression there (e.g. back to 0x10 = CLIENT_NO_SCHEMA) must fail this test.
+	caps := uint32(capProtocol41 | capSecureConnection | 0x08)
 	payload := binary.LittleEndian.AppendUint32(nil, caps)
 	payload = binary.LittleEndian.AppendUint32(payload, 1<<24) // max packet size
 	payload = append(payload, 33)                              // charset

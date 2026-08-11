@@ -968,7 +968,7 @@ import (
 
 const (
 	capLongPassword     = 1 << 0
-	capConnectWithDB    = 1 << 4
+	capConnectWithDB    = 1 << 3  // CLIENT_CONNECT_WITH_DB 0x08 (NOT 0x10 = CLIENT_NO_SCHEMA)
 	capProtocol41       = 1 << 9
 	capTransactions     = 1 << 13
 	capSecureConnection = 1 << 15
