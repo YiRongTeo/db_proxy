@@ -43,6 +43,9 @@ type QueryEvent struct {
 	Columns   []string   `json:"columns,omitempty"`
 	Rows      [][]string `json:"rows,omitempty"`
 	Truncated bool       `json:"truncated,omitempty"`
+	// Phase 8 enhancement fields — all omitempty for wire backward compatibility.
+	Action string `json:"action,omitempty"` // started|ended — session lifecycle events
+	DB     string `json:"db,omitempty"`     // client-requested target database
 }
 
 // Session is the UI session payload (stored at sess:ui:<id>).

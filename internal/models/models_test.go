@@ -140,6 +140,68 @@ func TestQueryEventBackwardCompatNoNewKeys(t *testing.T) {
 	}
 }
 
+func TestQueryEventSessionRoundTrip(t *testing.T) {
+	// An event with ALL fields populated — legacy, Phase 6 enhancement, and
+	// Phase 8 session fields (action, db) — must round-trip exactly through JSON.
+	roundTrip(t, QueryEvent{
+		ID:         "evt_01",
+		Ts:         time.Date(2026, 8, 11, 9, 30, 15, 0, time.UTC),
+		Kind:       "session",
+		Username:   "alice.ad",
+		TicketID:   "TCKT-1042",
+		DBUser:     "app_ro",
+		DBIP:       "10.0.0.5",
+		DBPort:     "3306",
+		DBType:     "mysql",
+		SQL:        "SELECT 1",
+		ClientAddr: "192.168.1.20:51234",
+		StmtType:   "select",
+		SessionID:  "sess_dp_9f2c1a7b",
+		Status:     "ok",
+		Columns:    []string{"id"},
+		Rows:       [][]string{{"42"}},
+		Truncated:  false,
+		Action:     "started",
+		DB:         "appdb",
+	})
+}
+
+func TestQueryEventSessionBackwardCompatNoNewKeys(t *testing.T) {
+	// An event produced WITHOUT the Phase 8 session fields must marshal to the
+	// old wire shape: every legacy key present, none of the new keys.
+	ev := QueryEvent{
+		ID:         "evt_01",
+		Ts:         time.Date(2026, 8, 11, 9, 30, 15, 0, time.UTC),
+		Kind:       "query",
+		Username:   "alice.ad",
+		TicketID:   "TCKT-1042",
+		DBUser:     "app_ro",
+		DBIP:       "10.0.0.5",
+		DBPort:     "3306",
+		DBType:     "mysql",
+		SQL:        "SELECT 1",
+		ClientAddr: "192.168.1.20:51234",
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		t.Fatalf("unmarshal into key map: %v", err)
+	}
+	for _, k := range []string{"id", "ts", "kind", "username", "ticket_id", "db_user", "db_ip", "db_port", "db_type", "sql", "client_addr"} {
+		if _, ok := keys[k]; !ok {
+			t.Errorf("backward compat: legacy key %q missing from JSON: %s", k, data)
+		}
+	}
+	for _, k := range []string{"stmt_type", "session_id", "status", "error", "columns", "rows", "truncated", "action", "db"} {
+		if _, ok := keys[k]; ok {
+			t.Errorf("backward compat: unexpected new key %q present in JSON: %s", k, data)
+		}
+	}
+}
+
 func TestSessionRoundTrip(t *testing.T) {
 	roundTrip(t, Session{
 		Username: "bob.ad",
