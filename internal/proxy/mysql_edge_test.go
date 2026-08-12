@@ -208,6 +208,42 @@ func readTextResultSet(r io.Reader) ([][]byte, error) {
 	}
 }
 
+// readResultSetErr reads a text-protocol result set that terminates in an
+// ERR packet — an aborted query: the column count + defs + EOF arrive
+// first, then the ERR arrives in place of the row (e.g. KILL QUERY lands
+// while the result set is streaming). Returns the ERR payload. Also handles
+// the ERR arriving before any result-set framing.
+func readResultSetErr(r io.Reader) ([]byte, error) {
+	_, pkt, err := readMySQLPacket(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(pkt) > 0 && pkt[0] == 0xff {
+		return pkt, nil // ERR before any result-set framing
+	}
+	for { // column definitions until first EOF
+		_, pkt, err := readMySQLPacket(r)
+		if err != nil {
+			return nil, err
+		}
+		if len(pkt) > 0 && pkt[0] == 0xfe {
+			break
+		}
+		if len(pkt) > 0 && pkt[0] == 0xff {
+			return pkt, nil
+		}
+	}
+	for { // rows until the ERR that terminates the aborted query
+		_, pkt, err := readMySQLPacket(r)
+		if err != nil {
+			return nil, err
+		}
+		if len(pkt) > 0 && pkt[0] == 0xff {
+			return pkt, nil
+		}
+	}
+}
+
 // decodeLenencString decodes a length-encoded string (text result format)
 // from the start of b.
 func decodeLenencString(b []byte) (string, bool) {

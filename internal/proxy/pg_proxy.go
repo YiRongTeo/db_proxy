@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -27,10 +28,11 @@ type pgSession struct {
 	capture *pgResultCapture
 	closer  func()
 
-	db        string    // client-requested database (raw startup value, may be "")
-	threadID  int64     // backend pg_backend_pid(); 0 = capture failed
-	startedAt time.Time // session establishment (UTC)
-	lastSeen  time.Time // last activity — heartbeat stamp (UTC)
+	db        string               // client-requested database (raw startup value, may be "")
+	threadID  int64                // backend pg_backend_pid(); 0 = capture failed
+	startedAt time.Time            // session establishment (UTC)
+	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
+	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 }
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the
@@ -95,6 +97,77 @@ func (p *PGProxy) KillSession(id string) bool {
 		s.closer()
 	}
 	return true
+}
+
+// KillQuery aborts the session's in-flight query only, leaving the session
+// (its client and FIRST backend conns) untouched (Task 8.3 two-level kill,
+// PG mirror of MySQLProxy.KillQuery). A SECOND backend connection with the
+// SAME credentials runs "SELECT pg_cancel_backend(<pid>)" (PostgreSQL
+// permits same-role cancel); the 't'/'f' result row is read and the second
+// conn closed. The first conn — the maker's live session — is never
+// touched: the backend aborts the query and the client sees an
+// ErrorResponse (57014 "canceling statement due to user request"), then the
+// session keeps working.
+//
+// Returns false (with the specific reason logged) when the session is
+// unknown, its pid was never captured (threadID == 0 — Task 8.2 degrade
+// rule), the credential context is missing, the second backend exchange
+// fails, or pg_cancel_backend answered 'f' (backend already gone). The
+// ctl:kill subscriber logs "kill: unknown session" for the false case; the
+// proxy log carries the detail.
+func (p *PGProxy) KillQuery(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	if s.threadID == 0 {
+		p.log.Warn("kill query: no thread id", "session_id", id)
+		return false
+	}
+	if s.tok == nil {
+		p.log.Warn("kill query: no token context", "session_id", id)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
+	defer cancel()
+	front, err := connectPostgresBackend(ctx, s.tok, p.creds, s.db)
+	if err != nil {
+		p.log.Warn("kill query: backend connect failed", "session_id", id, "err", err)
+		return false
+	}
+	defer front.Close()
+	// Bound the exchange: a dead backend must not pin the ctl:kill
+	// subscriber (pgproto3 Receive is a blocking conn read, not ctx-aware).
+	_ = front.conn.SetDeadline(time.Now().Add(killQueryTimeout))
+	if err := front.Send(&pgproto3.Query{String: fmt.Sprintf("SELECT pg_cancel_backend(%d)", s.threadID)}); err != nil {
+		p.log.Warn("kill query: send failed", "session_id", id, "err", err)
+		return false
+	}
+	canceled := false
+	for {
+		msg, err := front.Receive()
+		if err != nil {
+			p.log.Warn("kill query: receive failed", "session_id", id, "err", err)
+			return false
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			if len(m.Values) == 1 {
+				canceled = string(m.Values[0]) == "t"
+			}
+		case *pgproto3.ErrorResponse:
+			p.log.Warn("kill query: backend error", "session_id", id, "pid", s.threadID, "err", m.Message)
+			return false
+		case *pgproto3.ReadyForQuery:
+			if canceled {
+				return true
+			}
+			p.log.Warn("kill query: pg_cancel_backend returned false", "session_id", id, "pid", s.threadID)
+			return false
+		}
+	}
 }
 
 // handleConn runs one PostgreSQL session. The Dispatcher owns the accept loop;
@@ -219,6 +292,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		threadID:  capturePGThreadID(front, p.log),
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
+		tok:       tok,
 		closer:    func() { client.Close(); front.Close() },
 	}
 	p.registerSession(s)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -113,12 +112,17 @@ func main() {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- d.Serve(l, ctx) }()
 
-	// Kill switch (Task 6.4): subscribe to the ctl:kill channel — the ONLY
-	// coupling between planes (no HTTP). Each message carries
-	// {"session_id": "..."}; the combined killer force-closes that session on
-	// whichever plane holds it. Subscribe blocks until ctx cancellation (it
-	// then returns ctx.Err(), which is not an error here), so the channel is
-	// closed on the way out and the consumer loop below exits with it.
+	// Kill switch (Task 6.4 + Task 8.3 two-level kill): subscribe to the
+	// ctl:kill channel — the ONLY coupling between planes (no HTTP). Each
+	// message carries {"session_id": "...", "mode": "query"|"connection"}
+	// (mode absent = connection, Task 6.4 backward compat); the combined
+	// killer fans out to whichever plane holds the session. HandleKill
+	// returns the outcome log line ("session killed" / "query killed" /
+	// "kill: unknown session" / "kill: unknown mode") plus the session id;
+	// a malformed payload returns ("", "") and is dropped silently.
+	// Subscribe blocks until ctx cancellation (it then returns ctx.Err(),
+	// which is not an error here), so the channel is closed on the way out
+	// and the consumer loop below exits with it.
 	killCh := make(chan []byte, 16)
 	go func() {
 		defer close(killCh)
@@ -128,16 +132,15 @@ func main() {
 	}()
 	go func() {
 		for msg := range killCh {
-			var k struct {
-				SessionID string `json:"session_id"`
-			}
-			if json.Unmarshal(msg, &k) != nil || k.SessionID == "" {
+			line, sid := killer.HandleKill(msg)
+			if line == "" {
 				continue
 			}
-			if killer.KillSession(k.SessionID) {
-				log.Info("session killed", "session_id", k.SessionID)
-			} else {
-				log.Warn("kill: unknown session", "session_id", k.SessionID)
+			switch line {
+			case "session killed", "query killed":
+				log.Info(line, "session_id", sid)
+			default:
+				log.Warn(line, "session_id", sid)
 			}
 		}
 	}()

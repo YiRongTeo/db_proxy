@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,10 +27,11 @@ type mysqlSession struct {
 	capture *resultCapture
 	closer  func()
 
-	db        string    // client-requested database (empty = no default schema)
-	threadID  int64     // backend CONNECTION_ID(); 0 = capture failed
-	startedAt time.Time // session establishment (UTC)
-	lastSeen  time.Time // last activity — heartbeat stamp (UTC)
+	db        string               // client-requested database (empty = no default schema)
+	threadID  int64                // backend CONNECTION_ID(); 0 = capture failed
+	startedAt time.Time            // session establishment (UTC)
+	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
+	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 }
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
@@ -105,6 +107,65 @@ func (p *MySQLProxy) KillSession(id string) bool {
 	}
 	if s.closer != nil {
 		s.closer()
+	}
+	return true
+}
+
+// KillQuery aborts the session's IN-FLIGHT query only, leaving the session
+// (its client and FIRST backend conns) untouched (Task 8.3 two-level kill).
+// It opens a SECOND backend connection with the SAME credentials (MySQL
+// permits same-user KILL QUERY), sends "KILL QUERY <thread_id>", reads the
+// OK/ERR response and closes the second conn. The first conn — the maker's
+// live session — is never touched: the backend aborts the query and sends
+// the client an error result for it (1317 "Query execution was
+// interrupted"), and the session keeps working.
+//
+// Returns false (with the specific reason logged) when the session is
+// unknown, its thread id was never captured (threadID == 0 — Task 8.2
+// degrade rule; kill-query has no query context), the credential context is
+// missing, or the second backend exchange fails. The ctl:kill subscriber
+// logs "kill: unknown session" for the false case; the proxy log carries
+// the detail.
+func (p *MySQLProxy) KillQuery(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	if s.threadID == 0 {
+		p.log.Warn("kill query: no thread id", "session_id", id)
+		return false
+	}
+	if s.tok == nil {
+		p.log.Warn("kill query: no token context", "session_id", id)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
+	defer cancel()
+	backend, err := connectMySQLBackend(ctx, s.tok, p.creds, s.db)
+	if err != nil {
+		p.log.Warn("kill query: backend connect failed", "session_id", id, "err", err)
+		return false
+	}
+	defer backend.Close()
+	// Bound the exchange: connectMySQLBackend clears the deadline for the
+	// relay, and a dead backend must not pin the ctl:kill subscriber.
+	_ = backend.SetDeadline(time.Now().Add(killQueryTimeout))
+	payload := append([]byte{cmdQuery}, "KILL QUERY "...)
+	payload = strconv.AppendInt(payload, s.threadID, 10)
+	if err := writeMySQLPacket(backend, 0, payload); err != nil {
+		p.log.Warn("kill query: send failed", "session_id", id, "err", err)
+		return false
+	}
+	_, resp, err := readMySQLPacket(backend)
+	if err != nil {
+		p.log.Warn("kill query: read failed", "session_id", id, "err", err)
+		return false
+	}
+	if len(resp) > 0 && resp[0] == 0xff {
+		p.log.Warn("kill query: backend error", "session_id", id, "thread_id", s.threadID, "err", mysqlErrMessage(resp))
+		return false
 	}
 	return true
 }
@@ -229,6 +290,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		threadID:  captureMySQLThreadID(backend, p.log),
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
+		tok:       tok,
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
