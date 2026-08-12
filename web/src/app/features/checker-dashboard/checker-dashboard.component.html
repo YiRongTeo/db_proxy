@@ -48,11 +48,14 @@
       <thead>
         <tr>
           <th nzWidth="160px">Ts</th>
-          <th nzWidth="90px">Kind</th>
+          <th nzWidth="170px">Kind</th>
           <th nzWidth="120px">Username</th>
           <th nzWidth="80px">DB</th>
           <th nzWidth="180px">Target</th>
           <th nzWidth="130px">Ticket</th>
+          <th nzWidth="90px">Status</th>
+          <th nzWidth="80px">Output</th>
+          <th nzWidth="100px">Kill</th>
           <th>SQL</th>
         </tr>
       </thead>
@@ -60,18 +63,100 @@
         @for (ev of events(); track ev.id) {
           <tr>
             <td class="cell-ts">{{ ev.ts }}</td>
-            <td>
+            <td class="cell-kinds">
               <nz-tag [nzColor]="kindColor(ev.kind)">{{ ev.kind }}</nz-tag>
+              @if (ev.stmt_type) {
+                <nz-tag [nzColor]="stmtColor(ev.stmt_type)">{{ ev.stmt_type }}</nz-tag>
+              }
             </td>
             <td>{{ ev.username }}</td>
             <td>{{ ev.db_type }}</td>
             <td class="cell-mono">{{ target(ev) }}</td>
             <td>{{ ev.ticket_id || '—' }}</td>
+            <td>
+              @if (ev.status === 'ok') {
+                <nz-tag nzColor="success">ok</nz-tag>
+              } @else if (ev.status === 'error') {
+                <nz-tag
+                  nzColor="error"
+                  nz-tooltip
+                  [nzTooltipTitle]="ev.error || 'error'"
+                  [attr.title]="ev.error || 'error'"
+                >error</nz-tag>
+              } @else {
+                —
+              }
+            </td>
+            <td>
+              <button
+                nz-button
+                nzSize="small"
+                (click)="toggleOutput(ev)"
+                [disabled]="!hasOutput(ev)"
+              >view</button>
+            </td>
+            <td>
+              @if (ev.session_id) {
+                @if (killed()[ev.id]) {
+                  <nz-tag nzColor="red">killed</nz-tag>
+                  <button nz-button nzSize="small" nzDanger disabled>kill</button>
+                } @else {
+                  <button
+                    nz-button
+                    nzSize="small"
+                    nzDanger
+                    nz-popconfirm
+                    [nzPopconfirmTitle]="'Kill session ' + ev.session_id + '?'"
+                    (nzOnConfirm)="kill(ev)"
+                  >kill</button>
+                }
+              } @else {
+                —
+              }
+            </td>
             <td class="cell-sql">{{ ev.sql }}</td>
           </tr>
+          @if (expanded() === ev.id) {
+            <tr [nzExpand]="true" class="output-row">
+              <td colspan="10" class="output-cell">
+                @if (ev.truncated) {
+                  <nz-alert
+                    class="output-alert"
+                    nzType="warning"
+                    nzShowIcon
+                    nzMessage="results truncated (showing first 100)"
+                  />
+                }
+                <nz-table
+                  class="output-table"
+                  [nzData]="outputRows(ev)"
+                  [nzFrontPagination]="false"
+                  [nzShowPagination]="false"
+                  [nzSize]="'small'"
+                >
+                  <thead>
+                    <tr>
+                      @for (col of outputColumns(ev); track col.key) {
+                        <th class="cell-mono">{{ col.title }}</th>
+                      }
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (row of outputRows(ev); track $index) {
+                      <tr>
+                        @for (col of outputColumns(ev); track col.key) {
+                          <td class="cell-mono">{{ row[col.key] }}</td>
+                        }
+                      </tr>
+                    }
+                  </tbody>
+                </nz-table>
+              </td>
+            </tr>
+          }
         } @empty {
           <tr>
-            <td colspan="7" class="cell-empty">
+            <td colspan="10" class="cell-empty">
               No events yet — connect to a channel to watch queries live.
             </td>
           </tr>

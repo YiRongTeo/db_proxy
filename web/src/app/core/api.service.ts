@@ -39,6 +39,11 @@ export interface LoginResponse {
   username: string;
 }
 
+/** Response of POST /api/kill (202 — kill queued on the ctl:kill channel). */
+export interface KillResponse {
+  killed: string;
+}
+
 /**
  * One live query event streamed over /ws/checker
  * (internal/models.QueryEvent — ts is RFC3339 as marshalled by Go's time.Time).
@@ -55,6 +60,14 @@ export interface QueryEvent {
   db_type: string; // mysql | postgres
   sql: string;
   client_addr: string;
+  // Phase 6 enhancement fields (internal/models.QueryEvent — omitempty, may be absent).
+  stmt_type?: string; // select | insert | update | delete | other
+  session_id?: string; // data-plane session id (kill target; NOT the token)
+  status?: string; // ok | error (from the DB response)
+  error?: string;
+  columns?: string[];
+  rows?: string[][];
+  truncated?: boolean;
 }
 
 /**
@@ -89,5 +102,14 @@ export class ApiService {
 
   requestToken(payload: TokenRequest): Observable<TokenResponse> {
     return this.http.post<TokenResponse>('/api/token', payload, { withCredentials: true });
+  }
+
+  /** POST /api/kill — queue a data-plane session kill (202 when accepted). */
+  killSession(sessionId: string): Observable<KillResponse> {
+    return this.http.post<KillResponse>(
+      '/api/kill',
+      { session_id: sessionId },
+      { withCredentials: true },
+    );
   }
 }

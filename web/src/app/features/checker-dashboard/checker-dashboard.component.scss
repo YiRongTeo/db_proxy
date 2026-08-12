@@ -66,6 +66,32 @@
   white-space: nowrap;
 }
 
+.cell-kinds {
+  white-space: nowrap;
+
+  nz-tag {
+    margin-inline-end: 4px;
+  }
+}
+
+.output-row {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.output-cell {
+  padding: 12px 16px;
+}
+
+.output-alert {
+  margin-bottom: 12px;
+}
+
+.output-table {
+  .ant-table {
+    background: transparent;
+  }
+}
+
 .cell-empty {
   padding: 24px 0;
   text-align: center;
