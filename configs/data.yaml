@@ -2,7 +2,8 @@ listen:
   addr: ":3306"            # shared port for MySQL + PostgreSQL (protocol detected)
   detect_delay_ms: 200     # grace period before assuming MySQL (server-first protocol)
   max_conns: 100           # concurrent connection cap enforced by the dispatcher
-tls:                      # optional; when cert_file+key_file present → TLS on the DB wire
+tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
+  enabled: false
   cert_file: "certs/data.crt"
   key_file:  "certs/data.key"
 valkey:

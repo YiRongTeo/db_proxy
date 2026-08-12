@@ -26,7 +26,8 @@ db_presets:
     db_user: "ro_user"
     db_ip: "127.0.0.1"
     db_port: "5433"
-tls:                      # optional; when cert_file+key_file present → HTTPS on http.addr
+tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
+  enabled: false
   cert_file: "certs/control.crt"
   key_file:  "certs/control.key"
 valkey:

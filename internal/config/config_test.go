@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,7 @@ func TestLoadControl(t *testing.T) {
 	if got := cfg.Valkey.Addr; got != "127.0.0.1:6379" {
 		t.Errorf("Valkey.Addr = %q, want %q", got, "127.0.0.1:6379")
 	}
-	assertTLSDefaults(t, cfg.TLS, "certs/control.crt", "certs/control.key")
+	assertTLSDisabled(t, cfg.TLS)
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	if got := len(cfg.DBPresets); got != 3 {
@@ -145,7 +146,7 @@ func TestLoadData(t *testing.T) {
 	if got := cfg.Valkey.DB; got != 0 {
 		t.Errorf("Valkey.DB = %d, want 0", got)
 	}
-	assertTLSDefaults(t, cfg.TLS, "certs/data.crt", "certs/data.key")
+	assertTLSDisabled(t, cfg.TLS)
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	wantCreds := map[string]string{
@@ -168,18 +169,14 @@ func TestLoadData(t *testing.T) {
 	}
 }
 
-// assertTLSDefaults checks the plane TLS block parsed with the committed
-// cert/key paths (and that TLS is non-nil — the committed configs enable it).
-func assertTLSDefaults(t *testing.T, tls *CertConfig, certFile, keyFile string) {
+// assertTLSDisabled checks the plane TLS block is OFF in the committed
+// configs: tls.enabled: false → TLS stays nil and the cert/key paths are
+// never touched (no implicit file-based toggle — certs/ does not even exist
+// yet, which must not matter while disabled).
+func assertTLSDisabled(t *testing.T, tls *CertConfig) {
 	t.Helper()
-	if tls == nil {
-		t.Fatal("TLS = nil, want non-nil (committed configs set cert_file/key_file)")
-	}
-	if got := tls.CertFile; got != certFile {
-		t.Errorf("TLS.CertFile = %q, want %q", got, certFile)
-	}
-	if got := tls.KeyFile; got != keyFile {
-		t.Errorf("TLS.KeyFile = %q, want %q", got, keyFile)
+	if tls != nil {
+		t.Fatalf("TLS = %+v, want nil (committed configs set tls.enabled: false → plaintext)", tls)
 	}
 }
 
@@ -308,5 +305,121 @@ valkey:
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 	if cfg.TLS != nil {
 		t.Errorf("TLS = %+v, want nil (no tls block)", cfg.TLS)
+	}
+}
+
+// TestTLSOffState guards TLS state (a): tls.enabled: false with NO cert/key
+// files anywhere → Load succeeds and TLS is nil (plaintext). The cert/key
+// files must never be touched while the switch is off.
+func TestTLSOffState(t *testing.T) {
+	path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+tls:
+  enabled: false
+  cert_file: "certs/does-not-exist.crt"
+  key_file:  "certs/does-not-exist.key"
+`)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v (enabled:false must not touch files)", path, err)
+	}
+	if cfg.TLS != nil {
+		t.Fatalf("TLS = %+v, want nil (enabled: false → plaintext)", cfg.TLS)
+	}
+}
+
+// TestTLSOnMissingFiles guards TLS state (b): tls.enabled: true with
+// missing/unreadable cert or key → fail-fast Load ERROR naming the file.
+func TestTLSOnMissingFiles(t *testing.T) {
+	// (b1) cert missing.
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+tls:
+  enabled: true
+  cert_file: "certs/nope.crt"
+  key_file:  "certs/nope.key"
+`)
+	_, err := LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for enabled:true with missing cert/key, got nil")
+	}
+	if !strings.Contains(err.Error(), "certs/nope.crt") {
+		t.Errorf("error %q missing the missing cert path", err.Error())
+	}
+
+	// (b2) key missing while cert exists on disk.
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "plane.crt")
+	if err := os.WriteFile(certPath, []byte("cert"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", certPath, err)
+	}
+	path = writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+tls:
+  enabled: true
+  cert_file: %q
+  key_file:  "certs/nope.key"
+`, filepath.ToSlash(certPath)))
+	_, err = LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for enabled:true with missing key, got nil")
+	}
+	if !strings.Contains(err.Error(), "certs/nope.key") {
+		t.Errorf("error %q missing the missing key path", err.Error())
+	}
+
+	// (b3) enabled:true with no cert_file at all → shape error naming the key.
+	path = writeTempConfig(t, `
+http:
+  addr: ":8080"
+tls:
+  enabled: true
+`)
+	_, err = LoadControl(path)
+	if err == nil {
+		t.Fatal("LoadControl: want error for enabled:true without cert_file, got nil")
+	}
+	if !strings.Contains(err.Error(), "tls.cert_file") {
+		t.Errorf("error %q missing tls.cert_file hint", err.Error())
+	}
+}
+
+// TestTLSOnWithFiles guards TLS state (c): tls.enabled: true with both files
+// present → Load succeeds and TLS is populated with Enabled + both paths.
+func TestTLSOnWithFiles(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "plane.crt")
+	keyPath := filepath.Join(dir, "plane.key")
+	for _, f := range []string{certPath, keyPath} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+tls:
+  enabled: true
+  cert_file: %q
+  key_file:  %q
+`, filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	if cfg.TLS == nil {
+		t.Fatal("TLS = nil, want populated (enabled: true with files present)")
+	}
+	if !cfg.TLS.Enabled {
+		t.Error("TLS.Enabled = false, want true")
+	}
+	if got := cfg.TLS.CertFile; got != filepath.ToSlash(certPath) {
+		t.Errorf("TLS.CertFile = %q, want %q", got, filepath.ToSlash(certPath))
+	}
+	if got := cfg.TLS.KeyFile; got != filepath.ToSlash(keyPath) {
+		t.Errorf("TLS.KeyFile = %q, want %q", got, filepath.ToSlash(keyPath))
 	}
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -25,9 +26,12 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 }
 
 // CertConfig carries the optional plane TLS certificate/key pair.
-// When both are non-empty the plane serves TLS (HTTPS / TLS on the DB wire);
-// nil (or empty) keeps plaintext (the default).
+// TLS is EXPLICITLY opt-in via Enabled (binding user directive 2026-08-12):
+// there is NO implicit file-based toggle. Enabled=false (or absent) keeps
+// plaintext and the cert/key files are never touched; Enabled=true REQUIRES
+// readable cert_file+key_file — load fails fast otherwise.
 type CertConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
 	CertFile string `mapstructure:"cert_file"`
 	KeyFile  string `mapstructure:"key_file"`
 }
@@ -106,15 +110,31 @@ func readValkey(v *viper.Viper) ValkeyConfig {
 	}
 }
 
-// readTLS returns nil (plaintext) when the tls block is absent/empty, so TLS
-// stays strictly opt-in.
-func readTLS(v *viper.Viper) *CertConfig {
+// readTLS returns nil (plaintext) when tls.enabled is false or absent — the
+// cert/key files are NOT accessed in that state (no implicit file-based
+// toggle; a tls block with paths but enabled:false stays plaintext).
+// When enabled, it fails fast with a load error if either file is
+// missing/unreadable, so a misconfigured TLS plane never starts silently.
+func readTLS(v *viper.Viper) (*CertConfig, error) {
+	if !v.GetBool("tls.enabled") {
+		return nil, nil
+	}
 	cert := v.GetString("tls.cert_file")
 	key := v.GetString("tls.key_file")
-	if cert == "" && key == "" {
-		return nil
+	if cert == "" {
+		return nil, fmt.Errorf("tls.enabled=true requires tls.cert_file")
 	}
-	return &CertConfig{CertFile: cert, KeyFile: key}
+	if key == "" {
+		return nil, fmt.Errorf("tls.enabled=true requires tls.key_file")
+	}
+	for _, f := range []string{cert, key} {
+		h, err := os.Open(f)
+		if err != nil {
+			return nil, fmt.Errorf("tls enabled: %s: %w", f, err)
+		}
+		h.Close()
+	}
+	return &CertConfig{Enabled: true, CertFile: cert, KeyFile: key}, nil
 }
 
 // LoadControl reads the Control Plane config (configs/control.yaml).
@@ -127,6 +147,10 @@ func LoadControl(path string) (*ControlConfig, error) {
 	}); err != nil {
 		return nil, err
 	}
+	tlsCfg, err := readTLS(v)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ControlConfig{
 		HTTPAddr:      v.GetString("http.addr"),
 		StaticDir:     v.GetString("http.static_dir"),
@@ -137,7 +161,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		AuthUser:      v.GetString("auth.username"),
 		AuthPassword:  v.GetString("auth.password"),
 		SessionTTL:    v.GetInt("auth.session_ttl_hours"),
-		TLS:           readTLS(v),
+		TLS:           tlsCfg,
 		Valkey:        readValkey(v),
 	}
 	// UnmarshalKey must run on the same viper instance that read the file,
@@ -171,11 +195,15 @@ func LoadData(path string) (*DataConfig, error) {
 	}); err != nil {
 		return nil, err
 	}
+	tlsCfg, err := readTLS(v)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &DataConfig{
 		ListenAddr:    v.GetString("listen.addr"),
 		DetectDelayMS: v.GetInt("listen.detect_delay_ms"),
 		MaxConns:      v.GetInt("listen.max_conns"),
-		TLS:           readTLS(v),
+		TLS:           tlsCfg,
 		Valkey:        readValkey(v),
 		Credentials:   map[string]string{},
 	}
