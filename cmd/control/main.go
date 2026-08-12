@@ -70,6 +70,14 @@ func main() {
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: apiSrv.Routes()}
 
 	go func() {
+		if cfg.TLS != nil && cfg.TLS.Enabled {
+			log.Info("control plane listening (https)", "addr", cfg.HTTPAddr)
+			if err := srv.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("https", "err", err)
+				cancel()
+			}
+			return
+		}
 		log.Info("control plane listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "err", err)
