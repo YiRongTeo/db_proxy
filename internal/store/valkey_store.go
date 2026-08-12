@@ -24,11 +24,13 @@ import (
 // SentinelOption.TLSConfig to sentinel conns and ClientOption.TLSConfig to
 // master/data conns.
 type StoreOptions struct {
-	Addrs      []string // direct: [addr]; sentinel: sentinel addrs
-	MasterName string   // sentinel mode when non-empty
-	Password   string
-	DB         int
-	TLS        *tls.Config // nil = plaintext
+	Addrs            []string // direct: [addr]; sentinel: sentinel addrs
+	MasterName       string   // sentinel mode when non-empty
+	Password         string   // master/data connections
+	SentinelUsername string   // sentinel connections (sentinel mode only)
+	SentinelPassword string   // sentinel connections (sentinel mode only)
+	DB               int
+	TLS              *tls.Config // nil = plaintext
 }
 
 // TLSFromFiles builds a *tls.Config from PEM files:
@@ -76,7 +78,13 @@ func TLSFromFiles(caFile, certFile, keyFile string, skipVerify bool, serverName 
 // sentinel mode (MasterName non-empty) InitAddress carries the SENTINEL
 // addresses and the same TLS config is wired for both the sentinel
 // connections (SentinelOption.TLSConfig) and the master/data connections
-// (ClientOption.TLSConfig). Exported so tests (and callers) can assert the
+// (ClientOption.TLSConfig). Sentinel credentials (SentinelUsername/
+// SentinelPassword) are wired into SentinelOption.Username/Password —
+// valkey-go v1.0.76's newSentinelOpt (sentinel.go) copies those onto the
+// option used for sentinel connections, whose per-connection init sends
+// HELLO 3 AUTH (pipe.go), so the sentinel itself is authenticated
+// independently of the master. ClientOption.Password keeps serving the
+// master/data connections. Exported so tests (and callers) can assert the
 // wiring without constructing a client.
 func BuildClientOption(opts StoreOptions) valkey.ClientOption {
 	opt := valkey.ClientOption{
@@ -89,6 +97,8 @@ func BuildClientOption(opts StoreOptions) valkey.ClientOption {
 		opt.Sentinel = valkey.SentinelOption{
 			MasterSet: opts.MasterName,
 			TLSConfig: opts.TLS,
+			Username:  opts.SentinelUsername,
+			Password:  opts.SentinelPassword,
 		}
 	}
 	return opt

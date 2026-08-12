@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,9 +172,12 @@ func TestBuildClientOptionDirect(t *testing.T) {
 func TestBuildClientOptionSentinel(t *testing.T) {
 	tlsCfg := &tls.Config{ServerName: "127.0.0.1"} // test wiring only
 	opt := BuildClientOption(StoreOptions{
-		Addrs:      []string{"127.0.0.1:26379", "127.0.0.2:26379"},
-		MasterName: "mymaster",
-		TLS:        tlsCfg,
+		Addrs:            []string{"127.0.0.1:26379", "127.0.0.2:26379"},
+		MasterName:       "mymaster",
+		Password:         "datapw",
+		SentinelUsername: "suser",
+		SentinelPassword: "spw",
+		TLS:              tlsCfg,
 	})
 	// InitAddress carries the SENTINEL addresses in sentinel mode.
 	if len(opt.InitAddress) != 2 || opt.InitAddress[0] != "127.0.0.1:26379" {
@@ -189,6 +193,18 @@ func TestBuildClientOptionSentinel(t *testing.T) {
 	}
 	if opt.TLSConfig != tlsCfg {
 		t.Fatal("TLSConfig not wired through")
+	}
+	// Task 7.7: sentinel credentials land in SentinelOption (sentinel conns
+	// AUTH with these), while ClientOption.Password keeps serving the
+	// master/data conns.
+	if opt.Sentinel.Username != "suser" {
+		t.Fatalf("Sentinel.Username = %q, want %q", opt.Sentinel.Username, "suser")
+	}
+	if opt.Sentinel.Password != "spw" {
+		t.Fatalf("Sentinel.Password = %q, want %q", opt.Sentinel.Password, "spw")
+	}
+	if opt.Password != "datapw" {
+		t.Fatalf("Password = %q, want %q (master/data conns)", opt.Password, "datapw")
 	}
 }
 
@@ -250,14 +266,20 @@ func TestLiveTLSValkeyRoundTrip(t *testing.T) {
 
 // TestLiveSentinelRoundTrip is a live proof of sentinel mode against the
 // sentinel the gate task 7.6 brings up (127.0.0.1:26379, monitoring the
-// plaintext master on 6379 under the "mymaster" set). Skips with a clear
-// message when that infra is not up yet.
+// plaintext master on 6379 under the "mymaster" set). Task 7.7: the
+// sentinel runs requirepass sentinelpw, so the store must present
+// SentinelPassword for its sentinel connections (the master itself stays
+// passwordless). Skips with a clear message when that infra is not up yet.
 func TestLiveSentinelRoundTrip(t *testing.T) {
 	const sentinelAddr = "127.0.0.1:26379"
 	if !reachable(sentinelAddr, time.Second) {
 		t.Skipf("live sentinel not reachable at %s (gate task 7.6 starts it); skipping", sentinelAddr)
 	}
-	s, err := NewValkeyStore(context.Background(), StoreOptions{Addrs: []string{sentinelAddr}, MasterName: "mymaster"})
+	s, err := NewValkeyStore(context.Background(), StoreOptions{
+		Addrs:            []string{sentinelAddr},
+		MasterName:       "mymaster",
+		SentinelPassword: "sentinelpw",
+	})
 	if err != nil {
 		t.Fatalf("NewValkeyStore via sentinel: %v", err)
 	}
@@ -320,4 +342,29 @@ func TestLiveSentinelRoundTrip(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Subscribe via sentinel did not return within 5s of cancel")
 	}
+}
+
+// TestLiveSentinelRequiresPassword is the negative half of sentinel auth
+// (Task 7.7): the dev sentinel runs requirepass sentinelpw, so connecting
+// WITHOUT the sentinel password must fail — proving the password is
+// enforced server-side and not merely accepted. The failure surface is the
+// store constructor's fail-fast PING (the sentinel conn's HELLO 3 init is
+// rejected with NOAUTH before any command runs).
+func TestLiveSentinelRequiresPassword(t *testing.T) {
+	const sentinelAddr = "127.0.0.1:26379"
+	if !reachable(sentinelAddr, time.Second) {
+		t.Skipf("live sentinel not reachable at %s (gate task 7.6 starts it); skipping", sentinelAddr)
+	}
+	_, err := NewValkeyStore(context.Background(), StoreOptions{
+		Addrs:      []string{sentinelAddr},
+		MasterName: "mymaster",
+		// SentinelPassword intentionally omitted.
+	})
+	if err == nil {
+		t.Fatal("expected error connecting to sentinel without SentinelPassword, got success")
+	}
+	if !strings.Contains(err.Error(), "NOAUTH") {
+		t.Fatalf("expected NOAUTH error from sentinel, got: %v", err)
+	}
+	t.Logf("without sentinel password: %v", err)
 }

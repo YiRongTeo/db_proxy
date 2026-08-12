@@ -273,6 +273,80 @@ valkey:
 	}
 }
 
+// TestValkeySentinelAuth is the Task 7.7 loader probe: sentinel
+// credentials parse from yaml (valkey.sentinel_username /
+// valkey.sentinel_password) and from the ZT_ env names (viper convention:
+// prefix ZT_ + dots→underscores → ZT_VALKEY_SENTINEL_USERNAME /
+// ZT_VALKEY_SENTINEL_PASSWORD), defaulting to "" when absent.
+func TestValkeySentinelAuth(t *testing.T) {
+	t.Run("defaults empty when absent", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+valkey:
+  mode: sentinel
+  master_name: "mymaster"
+  sentinel_addrs: ["127.0.0.1:26379"]
+`)
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl(%q) error: %v", path, err)
+		}
+		if got := cfg.Valkey.SentinelUsername; got != "" {
+			t.Errorf("SentinelUsername = %q, want \"\" (default)", got)
+		}
+		if got := cfg.Valkey.SentinelPassword; got != "" {
+			t.Errorf("SentinelPassword = %q, want \"\" (default)", got)
+		}
+	})
+
+	t.Run("yaml keys parse", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+valkey:
+  mode: sentinel
+  master_name: "mymaster"
+  sentinel_addrs: ["127.0.0.1:26379"]
+  sentinel_username: "sentuser"
+  sentinel_password: "sentpw-yaml"
+`)
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl(%q) error: %v", path, err)
+		}
+		if got := cfg.Valkey.SentinelUsername; got != "sentuser" {
+			t.Errorf("SentinelUsername = %q, want %q", got, "sentuser")
+		}
+		if got := cfg.Valkey.SentinelPassword; got != "sentpw-yaml" {
+			t.Errorf("SentinelPassword = %q, want %q", got, "sentpw-yaml")
+		}
+	})
+
+	t.Run("env overrides: ZT_VALKEY_SENTINEL_USERNAME / ZT_VALKEY_SENTINEL_PASSWORD", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+valkey:
+  mode: sentinel
+  master_name: "mymaster"
+  sentinel_addrs: ["127.0.0.1:26379"]
+`)
+		t.Setenv("ZT_VALKEY_SENTINEL_USERNAME", "env-sentuser")
+		t.Setenv("ZT_VALKEY_SENTINEL_PASSWORD", "env-sentpw")
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl(%q) error: %v", path, err)
+		}
+		if got := cfg.Valkey.SentinelUsername; got != "env-sentuser" {
+			t.Errorf("SentinelUsername = %q, want %q (ZT_VALKEY_SENTINEL_USERNAME)", got, "env-sentuser")
+		}
+		if got := cfg.Valkey.SentinelPassword; got != "env-sentpw" {
+			t.Errorf("SentinelPassword = %q, want %q (ZT_VALKEY_SENTINEL_PASSWORD)", got, "env-sentpw")
+		}
+	})
+}
+
 // TestLoadDataOldShapeCompat guards backward compatibility: the pre-Phase-7
 // flat valkey block (valkey: {addr, password, db}, no mode, no ssl) must still
 // parse — mode defaults to "direct" and ssl defaults to disabled.

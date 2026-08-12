@@ -270,7 +270,8 @@ docker exec valkey-tls valkey-cli --tls --cacert /certs/data.crt -p 6380 ping   
 docker run -d --name valkey-sentinel -p 26379:26379 \
   -v D:/AI/hermes/Project/Project-D/scripts/sentinel.conf:/etc/sentinel.conf:ro \
   valkey/valkey:8-alpine sh -c 'cp /etc/sentinel.conf /tmp/sentinel.conf && exec valkey-sentinel /tmp/sentinel.conf'
-docker exec valkey-sentinel valkey-cli -p 26379 sentinel get-master-addr-by-name mymaster
+docker exec valkey-sentinel valkey-cli -p 26379 -a sentinelpw --no-auth-warning \
+  sentinel get-master-addr-by-name mymaster
 # expect: 127.0.0.1 / 6379
 ```
 
@@ -278,11 +279,30 @@ docker exec valkey-sentinel valkey-cli -p 26379 sentinel get-master-addr-by-name
 > **writable** config file, so a read-only `/etc/sentinel.conf` mount alone fails at boot. The
 > `sh -c` wrapper copies it to `/tmp` first, then execs the real sentinel.
 >
+> **Sentinel auth (Task 7.7, verified 2026-08-12):** `scripts/sentinel.conf` sets
+> `requirepass sentinelpw` — the sentinel itself is authenticated, SEPARATE from the master's
+> password. The store/planes present it via `valkey.sentinel_password` (env
+> `ZT_VALKEY_SENTINEL_PASSWORD`); `valkey.password` stays the master/data-connection password.
+> Without it the sentinel answers `NOAUTH`. (The `-a` + `--no-auth-warning` flags on the
+> verification line are the CLI equivalent.)
+>
 > `scripts/sentinel.conf` monitors the **plaintext** master `127.0.0.1:6379` (sentinel TLS is
 > optional in dev; the client→sentinel and client→master paths carry TLS). Dev caveat: from inside
 > the container that address is its own loopback, so the sentinel may report the master
 > `s_down,o_down` — cosmetic here; `get-master-addr-by-name` still returns the configured
 > `127.0.0.1:6379` (host-reachable) and the store's sentinel live tests pass.
+
+Config snippet (both planes, sentinel mode):
+
+```yaml
+valkey:
+  mode: sentinel
+  master_name: mymaster
+  sentinel_addrs: ["127.0.0.1:26379"]
+  sentinel_password: sentinelpw   # sentinel conns only (Task 7.7)
+  # sentinel_username: ""          # optional, when the sentinel uses ACL users
+  password: ""                     # master/data conns — unchanged by sentinel auth
+```
 
 ### 6.4 Planes in TLS mode (HTTPS + wire TLS + TLS Valkey)
 
@@ -307,7 +327,8 @@ Sentinel store mode instead of direct TLS Valkey (planes resolve the master thro
 
 ```bash
 ZT_VALKEY_MODE=sentinel ZT_VALKEY_MASTER_NAME=mymaster \
-ZT_VALKEY_SENTINEL_ADDRS='["127.0.0.1:26379"]' go run ./cmd/control
+ZT_VALKEY_SENTINEL_ADDRS='["127.0.0.1:26379"]' \
+ZT_VALKEY_SENTINEL_PASSWORD=sentinelpw go run ./cmd/control
 ```
 
 ### 6.5 Clients with TLS flags (verified 2026-08-12 gate)

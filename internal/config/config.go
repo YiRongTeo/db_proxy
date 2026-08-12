@@ -51,13 +51,15 @@ type ValkeySSL struct {
 // master via SentinelAddrs/MasterName. The old flat shape
 // (valkey: {addr, password, db}) still parses: mode defaults to "direct".
 type ValkeyConfig struct {
-	Mode          string    `mapstructure:"mode"`
-	Addr          string    `mapstructure:"addr"`
-	MasterName    string    `mapstructure:"master_name"`
-	SentinelAddrs []string  `mapstructure:"sentinel_addrs"`
-	Password      string    `mapstructure:"password"`
-	DB            int       `mapstructure:"db"`
-	SSL           ValkeySSL `mapstructure:"ssl"`
+	Mode             string    `mapstructure:"mode"`
+	Addr             string    `mapstructure:"addr"`
+	MasterName       string    `mapstructure:"master_name"`
+	SentinelAddrs    []string  `mapstructure:"sentinel_addrs"`
+	Password         string    `mapstructure:"password"`
+	SentinelUsername string    `mapstructure:"sentinel_username"`
+	SentinelPassword string    `mapstructure:"sentinel_password"`
+	DB               int       `mapstructure:"db"`
+	SSL              ValkeySSL `mapstructure:"ssl"`
 }
 
 // ControlConfig mirrors configs/control.yaml.
@@ -94,12 +96,14 @@ type DBPreset struct {
 // valkey: {addr, password, db} therefore still parses unchanged.
 func readValkey(v *viper.Viper) ValkeyConfig {
 	return ValkeyConfig{
-		Mode:          v.GetString("valkey.mode"),
-		Addr:          v.GetString("valkey.addr"),
-		MasterName:    v.GetString("valkey.master_name"),
-		SentinelAddrs: v.GetStringSlice("valkey.sentinel_addrs"),
-		Password:      v.GetString("valkey.password"),
-		DB:            v.GetInt("valkey.db"),
+		Mode:             v.GetString("valkey.mode"),
+		Addr:             v.GetString("valkey.addr"),
+		MasterName:       v.GetString("valkey.master_name"),
+		SentinelAddrs:    v.GetStringSlice("valkey.sentinel_addrs"),
+		Password:         v.GetString("valkey.password"),
+		SentinelUsername: v.GetString("valkey.sentinel_username"),
+		SentinelPassword: v.GetString("valkey.sentinel_password"),
+		DB:               v.GetInt("valkey.db"),
 		SSL: ValkeySSL{
 			Enabled:    v.GetBool("valkey.ssl.enabled"),
 			CAFile:     v.GetString("valkey.ssl.ca_file"),
