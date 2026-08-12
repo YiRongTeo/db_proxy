@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/signal"
@@ -35,13 +37,18 @@ func main() {
 
 	// Both proxies share one listener: the Dispatcher detects the protocol per
 	// connection (PG client-first, MySQL server-first) and routes accordingly.
+	// The proxies are also handed to the kill switch below: the ctl:kill
+	// subscriber fans out to both registries (Task 6.4).
+	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials)
+	pgProxy := proxy.NewPGProxy(log, vs, cfg.Credentials)
 	d := proxy.NewDispatcher(
 		log,
-		proxy.NewMySQLProxy(log, vs, cfg.Credentials),
-		proxy.NewPGProxy(log, vs, cfg.Credentials),
+		mysqlProxy,
+		pgProxy,
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
+	killer := proxy.NewKiller(mysqlProxy, pgProxy)
 
 	l, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -52,6 +59,35 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- d.Serve(l, ctx) }()
+
+	// Kill switch (Task 6.4): subscribe to the ctl:kill channel — the ONLY
+	// coupling between planes (no HTTP). Each message carries
+	// {"session_id": "..."}; the combined killer force-closes that session on
+	// whichever plane holds it. Subscribe blocks until ctx cancellation (it
+	// then returns ctx.Err(), which is not an error here), so the channel is
+	// closed on the way out and the consumer loop below exits with it.
+	killCh := make(chan []byte, 16)
+	go func() {
+		defer close(killCh)
+		if err := vs.Subscribe(ctx, "ctl:kill", false, killCh); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("kill subscriber", "err", err)
+		}
+	}()
+	go func() {
+		for msg := range killCh {
+			var k struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(msg, &k) != nil || k.SessionID == "" {
+				continue
+			}
+			if killer.KillSession(k.SessionID) {
+				log.Info("session killed", "session_id", k.SessionID)
+			} else {
+				log.Warn("kill: unknown session", "session_id", k.SessionID)
+			}
+		}
+	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
