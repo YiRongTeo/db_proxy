@@ -2098,3 +2098,98 @@ Full matrix (both planes up, containers up):
 
 ## Phase 6 gate
 Full suite (Go + Angular) green; ledger updated; amendment 9 verified end-to-end; security matrix gains kill-switch row.
+
+# Phase 7: TLS everywhere + Valkey/Sentinel with SSL (user directive 2026-08-12)
+
+Amendment 10 in hermes-agent-spec.md. Scope: (a) Control Plane HTTPS (HTTP+WS+SPA on :8080 via ListenAndServeTLS); (b) Data Plane TLS on the DB wire (MySQL: advertise CLIENT_SSL + SSLRequest→TLS handshake; PG: SSLRequest→'S' + TLS handshake); (c) Valkey direct AND Sentinel modes, both with optional SSL (TLS to data + sentinel conns). All TLS OPT-IN via config; plaintext remains the default (dev flows unchanged). Certificates from files; self-signed dev certs via scripts/gen-certs.sh (certs/ gitignored).
+
+## Task 7.1: Config shapes (control.yaml + data.yaml + loaders)
+
+```yaml
+# control.yaml additions
+tls:                    # optional; when cert_file+key_file present → HTTPS on http.addr
+  cert_file: "certs/control.crt"
+  key_file:  "certs/control.key"
+
+# data.yaml additions
+tls:
+  cert_file: "certs/data.crt"
+  key_file:  "certs/data.key"
+
+# valkey block (BOTH configs) — backward compatible:
+valkey:
+  mode: direct          # direct | sentinel
+  addr: "127.0.0.1:6379"      # direct mode
+  master_name: "mymaster"     # sentinel mode
+  sentinel_addrs: ["127.0.0.1:26379"]
+  password: ""
+  db: 0
+  ssl:
+    enabled: false
+    ca_file: ""
+    cert_file: ""
+    key_file: ""
+    skip_verify: false
+```
+Go (internal/config/config.go): `CertConfig{CertFile, KeyFile string}` (plane TLS), `ValkeySSL{Enabled, CAFile, CertFile, KeyFile bool/string, SkipVerify bool}`, `ValkeyConfig{Mode, Addr, MasterName string, SentinelAddrs []string, Password string, DB int, SSL ValkeySSL}` — LoadControl/LoadData gain `TLS *CertConfig` and `Valkey ValkeyConfig` (keep field name `Valkey` for minimal churn; the old flat `ValkeyAddr/ValkeyPassword/ValkeyDB` fields are REPLACED by the struct — update the two mains + tests accordingly; direct mode with no ssl block must produce identical behavior to today). Defaults: mode=direct, addr=127.0.0.1:6379. Tests: parse both configs; sentinel mode defaults; ssl block defaults.
+
+## Task 7.2: Store — TLS + sentinel via valkey-go (verified v1.0.76 API)
+
+```go
+// internal/store/valkey_store.go
+type StoreOptions struct {
+    Addrs      []string     // direct: [addr]; sentinel: sentinel addrs
+    MasterName string       // sentinel mode when non-empty
+    Password   string
+    DB         int
+    TLS        *tls.Config  // nil = plaintext
+}
+
+// TLSFromFiles builds a *tls.Config (ca_file → RootCAs pool; cert/key → cert; skip_verify → InsecureSkipVerify).
+// serverName: when non-empty and skip_verify false, set as ServerName (caller passes the addr host).
+func TLSFromFiles(caFile, certFile, keyFile string, skipVerify bool, serverName string) (*tls.Config, error)
+
+func NewValkeyStore(ctx context.Context, opts StoreOptions) (*ValkeyStore, error)
+// builds ClientOption{InitAddress: opts.Addrs, Password, SelectDB, TLSConfig: opts.TLS}
+// + when opts.MasterName != "": opt.Sentinel = valkey.SentinelOption{MasterSet: opts.MasterName, TLSConfig: opts.TLS}
+// (VERIFIED: SentinelOption{TLSConfig, MasterSet, ...}; InitAddress carries the sentinel addrs; the SAME
+// ClientOption.TLSConfig also covers data-plane conns to the master.)
+```
+Update ALL call sites (cmd/control/main.go, cmd/data/main.go, proxy tests' proxyTestStore helper, api tests) to the new constructor. Keep a tiny convenience `NewValkeyStoreDirect(ctx, addr, password, db)` for tests that want plaintext direct. Tests: TLSFromFiles cases (bad paths → error; ca only; skip_verify); option-building unit test (direct vs sentinel: assert InitAddress/MasterSet/TLSConfig wiring via a fake? — build options via an exported-for-test helper `buildClientOption(opts StoreOptions) valkey.ClientOption` and assert fields). LIVE TLS test: second valkey instance with TLS (see gate task; if not up yet, test skips with a clear message — gate 7.6 brings it up).
+
+## Task 7.3: Control Plane HTTPS
+
+1. cmd/control/main.go: when cfg.TLS has cert+key → `srv.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)` (log "control plane listening (https)"); else ListenAndServe as today.
+2. Angular: verify LiveQueryService builds the WS URL from location (wss when https) — if it hardcodes ws://, fix to `(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host`. All API calls are relative (already fine over https).
+3. scripts/gen-certs.sh: openssl self-signed (SAN IP:127.0.0.1,DNS:localhost) → certs/control.{crt,key}, certs/data.{crt,key}. .gitignore += certs/.
+4. Verify: start control with TLS config → curl -sk https://127.0.0.1:8080/api/health → 200; curl -sk https://127.0.0.1:8080/login → SPA html; WS handshake over wss via node (wss:// with rejectUnauthorized false) gets events; plaintext path still works when TLS config absent.
+
+## Task 7.4: Data Plane MySQL TLS (wire-critical)
+
+1. mysql_handshake.go: when TLS enabled, `advertisedCaps |= capSSL` (0x0800).
+2. mysql_proxy.go handleConn: after writeHandshake, read the next packet via br:
+   - if TLS enabled AND it's an SSLRequest (len(payload) >= 32 && LE32(payload[0:4])&capSSL != 0): tls.Server(client, tlsCfg).HandshakeContext(ctx) (handshake deadline already set); then `client = tlsConn; br = bufio.NewReader(tlsConn)` and read the REAL handshake response; continue auth flow unchanged (relay operates over tlsConn via client+br — the existing readMySQLPacket/writeMySQLPacket calls just work).
+   - else: treat as the handshake response (today's path).
+3. Load tls.Config in cmd/data/main.go from cfg.TLS; pass into NewMySQLProxy (new field or param — keep NewMySQLProxy(log, vs, creds) and add `SetTLS(*tls.Config)` or extend NewMySQLProxy(log, vs, creds, tlsCfg) — prefer extending the constructor; update call sites).
+4. Tests: unit — SSLRequest detection (payload with/without SSL bit); LIVE — TLS-enabled data plane (or proxy in-process with tlsCfg), mysql client `--ssl-mode=REQUIRED` full session (SELECT returns rows, capture event flows, single-use works); `--ssl-mode=DISABLED` client against TLS-enabled listener still works (plaintext path preserved); TLS-disabled listener + REQUIRED client → fails cleanly (no SSL advertised → client errors).
+5. Verify TLS certs for the live test: gen-certs.sh first; mysql client needs --ssl-mode=REQUIRED (skips verify? mysql client verifies CA by default in REQUIRED? REQUIRED = encryption without verification — perfect for self-signed).
+
+## Task 7.5: Data Plane PG TLS (wire-critical)
+
+pg_proxy.go: after ReceiveStartupMessage:
+- if startup is *pgproto3.SSLRequest: TLS enabled → write 'S' (0x53), tls.Server(client, tlsCfg).HandshakeContext(ctx), rebuild `be = pgproto3.NewBackend(pgproto3.NewChunkReader(bufio.NewReader(tlsConn)), tlsConn)`, then ReceiveStartupMessage again (real startup over TLS); TLS disabled → write 'N' (existing path).
+- else: normal path.
+Tests: unit — SSLRequest → 'S' when enabled / 'N' when disabled (exact bytes); LIVE — psql `sslmode=require` through the TLS-enabled proxy full session (SELECT returns rows, event captured); sslmode=require against plaintext listener → client fails (server replied 'N').
+
+## Task 7.6: TLS + Sentinel integration gate
+
+1. scripts/gen-certs.sh run; certs in place.
+2. TLS valkey: `docker run -d --name valkey-tls -p 6380:6380 -v <repo>/certs:/certs:ro valkey/valkey:8-alpine valkey-server --port 0 --tls-port 6380 --tls-cert-file /certs/data.crt --tls-key-file /certs/data.key --tls-ca-cert-file /certs/data.crt --tls-auth-clients no` (self-signed CA = the cert itself). Wait for readiness (valkey-cli -p 6380 --tls --cacert certs/data.crt ping — host has no valkey-cli; use `docker exec valkey-tls valkey-cli --tls --cacert /certs/data.crt -p 6380 ping`).
+3. Sentinel: `docker run -d --name valkey-sentinel -p 26379:26379 -v <repo>/scripts/sentinel.conf:/etc/sentinel.conf:ro valkey/valkey:8-alpine valkey-sentinel /etc/sentinel.conf` — sentinel.conf: sentinel monitor mymaster 127.0.0.1 6379 1; sentinel down-after-milliseconds mymaster 5000. (Sentinel connects to the PLAINTEXT 6379 master — sentinel TLS is optional; the CLIENT→sentinel and client→master paths carry TLS.) scripts/sentinel.conf committed.
+4. Store tests vs BOTH: direct TLS (port 6380, ssl enabled, skip_verify true for the self-signed cert OR ca_file=certs/data.crt — prefer ca_file so verification is real) — SetToken/GetDeleteToken round trip; sentinel mode (master_name mymaster, addrs [127.0.0.1:26379], ssl.enabled FALSE for the sentinel conn in this test, since the container's sentinel is plaintext; TLS-to-sentinel covered by config/unit test) — round trip + a PubSub subscribe/publish.
+5. FULL STACK TLS matrix (both planes with TLS + valkey direct TLS): token via `curl -sk https://127.0.0.1:8080/api/token` (API key), mysql client `--ssl-mode=REQUIRED` through :3306 → SELECT + captured event; psql `sslmode=require` → SELECT + event; kill E2E over HTTPS; checker WS over wss receives events; log hygiene; teardown + ports free.
+6. RUN.md: TLS + sentinel sections (config snippets, cert gen, client commands with ssl flags, docker run lines). Full suites: go test ./... + ng test + build.
+7. Commit.
+
+## Phase 7 gate
+Both modes (plaintext default + TLS) verified; valkey direct + sentinel + SSL verified live; full suites green; RUN.md updated; amendment 10 compliance noted in ledger.
