@@ -30,6 +30,7 @@ func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
 		AuthUser:     "admin",
 		AuthPassword: "s3cret",
 		SessionTTL:   8,
+		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

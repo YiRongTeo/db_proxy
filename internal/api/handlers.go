@@ -84,6 +84,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing required fields"}`, http.StatusBadRequest)
 		return
 	}
+	// Spec amendment 9b: every token must be traceable to a ticket.
+	if req.TicketID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ticket_id required"})
+		return
+	}
 	if req.DBType != "mysql" && req.DBType != "postgres" {
 		http.Error(w, `{"error":"db_type must be mysql or postgres"}`, http.StatusUnprocessableEntity)
 		return
@@ -111,4 +116,27 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		Port:      a.cfg.DataPlanePort,
 		ExpiresIn: a.cfg.TokenTTL,
 	})
+}
+
+// handleKill queues a data-plane session kill (session required). The kill
+// is dispatched over the Valkey ctl:kill channel — no HTTP between planes
+// (spec amendment 9e).
+func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.SessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id required"})
+		return
+	}
+	b, err := json.Marshal(map[string]string{"session_id": req.SessionID})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	if err := a.vs.Publish(r.Context(), "ctl:kill", b); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "kill dispatch failed"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"killed": "queued"})
 }
