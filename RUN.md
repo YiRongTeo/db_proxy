@@ -288,8 +288,9 @@ For PostgreSQL use psql or any PG client pointed at the same `127.0.0.1:3306`.
 Login: **admin / admin123** — dev-only defaults, change via `configs/control.yaml`
 (`auth.username` / `auth.password`) or env `ZT_AUTH_USERNAME` / `ZT_AUTH_PASSWORD`.
 
-Checker is **monitor-only** in v1 (live audit; no approval/kill). UI tokens can only target the
-`db_presets` allowlist from `configs/control.yaml`.
+Checker is **monitor-only** for statements in v1 (live audit; no approval of queries). UI tokens
+can only target the `db_presets` allowlist from `configs/control.yaml`. Phase 8 adds per-session
+selection and two-level kill — see 5.2 below.
 
 ### 5.1 Maker write-gating (Task 8.6)
 
@@ -311,6 +312,39 @@ Practical flow for a write-access maker: generate the token → a checker opens 
 dashboard session selector, or any WS client subscribing to `sess:<sid>`) → INSERT/UPDATE/DELETE
 work. If the watcher is removed mid-session, the very next query is blocked until a checker watches
 the session again.
+
+### 5.2 Checker sessions + two-level kill (Phase 8)
+
+**Session directory.** Every connection through the data plane is recorded in Valkey under
+`sess:live:<sid>` (JSON: `session_id, username, db_user, db_type, db, started_at, last_seen,
+thread_id|pid`), SETEX TTL 60 s — SET on start, REFRESH on every published event, DEL on end
+(idle-but-open sessions drop off after 60 s, documented). The checker lists them with
+
+```bash
+curl -b /tmp/zt.jar http://127.0.0.1:8080/api/sessions   # session cookie required
+# 200 → [{"session_id","username","db_user","db_type","db","started_at","last_seen"}, ...]
+```
+
+**Per-session feed.** Every query event is published to `queries:<user>` AND `queries:sess:<sid>`;
+session start/end publish lifecycle events (`kind=session`, `action=started|ended`) to both.
+Selecting a session in the Checker dashboard (or any WS client subscribing to
+`ws://127.0.0.1:8080/ws/checker?channel=sess:<sid>`) switches the feed to ONLY that session's
+events; `channel=*` remains the all-queries feed.
+
+**Two-level kill.** `POST /api/kill` takes an optional `mode`:
+
+| mode | behavior |
+|---|---|
+| `connection` (default) | full disconnect: client + backend conns closed, session removed from the directory (`sess:live` deleted, `ended` event published) — the maker sees MySQL `2013 Lost connection` |
+| `query` | aborts only the in-flight query via a second backend connection (`KILL QUERY <thread_id>` MySQL / `pg_cancel_backend(<pid>)` PG); the session stays alive and the maker can keep running queries. No active query → idempotent ok |
+
+```bash
+curl -b /tmp/zt.jar -X POST http://127.0.0.1:8080/api/kill \
+  -H 'Content-Type: application/json' -d '{"session_id":"sid-...","mode":"query"}'  # 202 {"killed":"queued"}
+```
+
+The Checker dashboard shows one row per session with two buttons: **Kill query** (mode=query,
+session survives) and **Kill connection** (mode=connection, session removed).
 
 ---
 
