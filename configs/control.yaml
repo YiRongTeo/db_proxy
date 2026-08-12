@@ -26,7 +26,19 @@ db_presets:
     db_user: "ro_user"
     db_ip: "127.0.0.1"
     db_port: "5433"
+tls:                      # optional; when cert_file+key_file present → HTTPS on http.addr
+  cert_file: "certs/control.crt"
+  key_file:  "certs/control.key"
 valkey:
-  addr: "127.0.0.1:6379"
+  mode: direct            # direct | sentinel
+  addr: "127.0.0.1:6379"  # direct mode
+  master_name: "mymaster" # sentinel mode
+  sentinel_addrs: ["127.0.0.1:26379"]
   password: ""
   db: 0
+  ssl:
+    enabled: false
+    ca_file: ""
+    cert_file: ""
+    key_file: ""
+    skip_verify: false

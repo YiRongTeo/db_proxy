@@ -24,7 +24,7 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	vs, err := store.NewValkeyStore(ctx, cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
+	vs, err := store.NewValkeyStore(ctx, cfg.Valkey.Addr, cfg.Valkey.Password, cfg.Valkey.DB)
 	if err != nil {
 		log.Error("valkey", "err", err)
 		os.Exit(1)

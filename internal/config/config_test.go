@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -37,9 +39,14 @@ func TestLoadControl(t *testing.T) {
 	if got := cfg.SessionTTL; got != 8 {
 		t.Errorf("SessionTTL = %d, want 8", got)
 	}
-	if got := cfg.ValkeyAddr; got != "127.0.0.1:6379" {
-		t.Errorf("ValkeyAddr = %q, want %q", got, "127.0.0.1:6379")
+	if got := cfg.Valkey.Mode; got != "direct" {
+		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
+	if got := cfg.Valkey.Addr; got != "127.0.0.1:6379" {
+		t.Errorf("Valkey.Addr = %q, want %q", got, "127.0.0.1:6379")
+	}
+	assertTLSDefaults(t, cfg.TLS, "certs/control.crt", "certs/control.key")
+	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	if got := len(cfg.DBPresets); got != 3 {
 		t.Fatalf("len(DBPresets) = %d, want 3", got)
@@ -129,12 +136,17 @@ func TestLoadData(t *testing.T) {
 	if got := cfg.MaxConns; got != 100 {
 		t.Errorf("MaxConns = %d, want 100", got)
 	}
-	if got := cfg.ValkeyAddr; got != "127.0.0.1:6379" {
-		t.Errorf("ValkeyAddr = %q, want %q", got, "127.0.0.1:6379")
+	if got := cfg.Valkey.Mode; got != "direct" {
+		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
-	if got := cfg.ValkeyDB; got != 0 {
-		t.Errorf("ValkeyDB = %d, want 0", got)
+	if got := cfg.Valkey.Addr; got != "127.0.0.1:6379" {
+		t.Errorf("Valkey.Addr = %q, want %q", got, "127.0.0.1:6379")
 	}
+	if got := cfg.Valkey.DB; got != 0 {
+		t.Errorf("Valkey.DB = %d, want 0", got)
+	}
+	assertTLSDefaults(t, cfg.TLS, "certs/data.crt", "certs/data.key")
+	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	wantCreds := map[string]string{
 		"127.0.0.1:3307:ro_user": "ro_pw",
@@ -153,5 +165,148 @@ func TestLoadData(t *testing.T) {
 		if gotPw != wantPw {
 			t.Errorf("Credentials[%q] = %q, want %q", key, gotPw, wantPw)
 		}
+	}
+}
+
+// assertTLSDefaults checks the plane TLS block parsed with the committed
+// cert/key paths (and that TLS is non-nil — the committed configs enable it).
+func assertTLSDefaults(t *testing.T, tls *CertConfig, certFile, keyFile string) {
+	t.Helper()
+	if tls == nil {
+		t.Fatal("TLS = nil, want non-nil (committed configs set cert_file/key_file)")
+	}
+	if got := tls.CertFile; got != certFile {
+		t.Errorf("TLS.CertFile = %q, want %q", got, certFile)
+	}
+	if got := tls.KeyFile; got != keyFile {
+		t.Errorf("TLS.KeyFile = %q, want %q", got, keyFile)
+	}
+}
+
+// assertSSLDefaults checks the valkey ssl block defaulted to disabled/empty.
+func assertSSLDefaults(t *testing.T, ssl ValkeySSL) {
+	t.Helper()
+	if ssl.Enabled {
+		t.Error("Valkey.SSL.Enabled = true, want false (TLS opt-in)")
+	}
+	if got := ssl.CAFile; got != "" {
+		t.Errorf("Valkey.SSL.CAFile = %q, want empty", got)
+	}
+	if got := ssl.CertFile; got != "" {
+		t.Errorf("Valkey.SSL.CertFile = %q, want empty", got)
+	}
+	if got := ssl.KeyFile; got != "" {
+		t.Errorf("Valkey.SSL.KeyFile = %q, want empty", got)
+	}
+	if ssl.SkipVerify {
+		t.Error("Valkey.SSL.SkipVerify = true, want false")
+	}
+}
+
+// writeTempConfig writes yaml content to a fresh temp file and returns its path.
+func writeTempConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write temp config %s: %v", path, err)
+	}
+	return path
+}
+
+// TestLoadControlSentinelShape guards the new sentinel-mode valkey block:
+// mode/master_name/sentinel_addrs must all land on the struct, and the ssl
+// block must parse when present.
+func TestLoadControlSentinelShape(t *testing.T) {
+	path := writeTempConfig(t, `
+http:
+  addr: ":8443"
+valkey:
+  mode: sentinel
+  addr: "10.0.0.5:6379"
+  master_name: "mymaster"
+  sentinel_addrs: ["127.0.0.1:26379", "127.0.0.1:26380"]
+  password: "s3cret"
+  db: 2
+  ssl:
+    enabled: true
+    ca_file: "/etc/ssl/valkey/ca.pem"
+    cert_file: "/etc/ssl/valkey/client.pem"
+    key_file: "/etc/ssl/valkey/client.key"
+    skip_verify: false
+`)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
+	}
+
+	if got := cfg.Valkey.Mode; got != "sentinel" {
+		t.Errorf("Valkey.Mode = %q, want %q", got, "sentinel")
+	}
+	if got := cfg.Valkey.MasterName; got != "mymaster" {
+		t.Errorf("Valkey.MasterName = %q, want %q", got, "mymaster")
+	}
+	wantAddrs := []string{"127.0.0.1:26379", "127.0.0.1:26380"}
+	if got := cfg.Valkey.SentinelAddrs; len(got) != len(wantAddrs) {
+		t.Fatalf("len(SentinelAddrs) = %d, want %d (%v)", len(got), len(wantAddrs), got)
+	}
+	for i, want := range wantAddrs {
+		if got := cfg.Valkey.SentinelAddrs[i]; got != want {
+			t.Errorf("SentinelAddrs[%d] = %q, want %q", i, got, want)
+		}
+	}
+	if got := cfg.Valkey.Addr; got != "10.0.0.5:6379" {
+		t.Errorf("Valkey.Addr = %q, want %q", got, "10.0.0.5:6379")
+	}
+	if got := cfg.Valkey.Password; got != "s3cret" {
+		t.Errorf("Valkey.Password = %q, want %q", got, "s3cret")
+	}
+	if got := cfg.Valkey.DB; got != 2 {
+		t.Errorf("Valkey.DB = %d, want 2", got)
+	}
+	if !cfg.Valkey.SSL.Enabled {
+		t.Error("Valkey.SSL.Enabled = false, want true")
+	}
+	if got := cfg.Valkey.SSL.CAFile; got != "/etc/ssl/valkey/ca.pem" {
+		t.Errorf("Valkey.SSL.CAFile = %q, want %q", got, "/etc/ssl/valkey/ca.pem")
+	}
+
+	// No tls block in this file → plane TLS stays nil (plaintext default).
+	if cfg.TLS != nil {
+		t.Errorf("TLS = %+v, want nil (no tls block)", cfg.TLS)
+	}
+}
+
+// TestLoadDataOldShapeCompat guards backward compatibility: the pre-Phase-7
+// flat valkey block (valkey: {addr, password, db}, no mode, no ssl) must still
+// parse — mode defaults to "direct" and ssl defaults to disabled.
+func TestLoadDataOldShapeCompat(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+valkey:
+  addr: "127.0.0.1:6379"
+  password: "oldpw"
+  db: 3
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+
+	if got := cfg.Valkey.Mode; got != "direct" {
+		t.Errorf("Valkey.Mode = %q, want %q (default when mode absent)", got, "direct")
+	}
+	if got := cfg.Valkey.Addr; got != "127.0.0.1:6379" {
+		t.Errorf("Valkey.Addr = %q, want %q", got, "127.0.0.1:6379")
+	}
+	if got := cfg.Valkey.Password; got != "oldpw" {
+		t.Errorf("Valkey.Password = %q, want %q", got, "oldpw")
+	}
+	if got := cfg.Valkey.DB; got != 3 {
+		t.Errorf("Valkey.DB = %d, want 3", got)
+	}
+	assertSSLDefaults(t, cfg.Valkey.SSL)
+	if cfg.TLS != nil {
+		t.Errorf("TLS = %+v, want nil (no tls block)", cfg.TLS)
 	}
 }

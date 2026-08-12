@@ -28,7 +28,7 @@ func main() {
 
 	// NewValkeyStore pings Valkey during construction (3s timeout) — fail fast
 	// here if the shared store is unreachable.
-	vs, err := store.NewValkeyStore(ctx, cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
+	vs, err := store.NewValkeyStore(ctx, cfg.Valkey.Addr, cfg.Valkey.Password, cfg.Valkey.DB)
 	if err != nil {
 		log.Error("valkey", "err", err)
 		os.Exit(1)

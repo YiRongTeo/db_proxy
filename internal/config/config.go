@@ -24,21 +24,52 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 	return nil
 }
 
+// CertConfig carries the optional plane TLS certificate/key pair.
+// When both are non-empty the plane serves TLS (HTTPS / TLS on the DB wire);
+// nil (or empty) keeps plaintext (the default).
+type CertConfig struct {
+	CertFile string `mapstructure:"cert_file"`
+	KeyFile  string `mapstructure:"key_file"`
+}
+
+// ValkeySSL is the optional TLS block for Valkey connections
+// (data conns in direct mode; data + sentinel conns in sentinel mode).
+type ValkeySSL struct {
+	Enabled    bool   `mapstructure:"enabled"`
+	CAFile     string `mapstructure:"ca_file"`
+	CertFile   string `mapstructure:"cert_file"`
+	KeyFile    string `mapstructure:"key_file"`
+	SkipVerify bool   `mapstructure:"skip_verify"`
+}
+
+// ValkeyConfig is the shared store block for both planes (control.yaml and
+// data.yaml). Mode "direct" connects to Addr; mode "sentinel" discovers the
+// master via SentinelAddrs/MasterName. The old flat shape
+// (valkey: {addr, password, db}) still parses: mode defaults to "direct".
+type ValkeyConfig struct {
+	Mode          string    `mapstructure:"mode"`
+	Addr          string    `mapstructure:"addr"`
+	MasterName    string    `mapstructure:"master_name"`
+	SentinelAddrs []string  `mapstructure:"sentinel_addrs"`
+	Password      string    `mapstructure:"password"`
+	DB            int       `mapstructure:"db"`
+	SSL           ValkeySSL `mapstructure:"ssl"`
+}
+
 // ControlConfig mirrors configs/control.yaml.
 type ControlConfig struct {
-	HTTPAddr       string
-	StaticDir      string
-	APIKey         string
-	TokenTTL       int
-	DataPlaneHost  string
-	DataPlanePort  string
-	AuthUser       string
-	AuthPassword   string
-	SessionTTL     int // hours
-	DBPresets      []DBPreset
-	ValkeyAddr     string
-	ValkeyPassword string
-	ValkeyDB       int
+	HTTPAddr      string
+	StaticDir     string
+	APIKey        string
+	TokenTTL      int
+	DataPlaneHost string
+	DataPlanePort string
+	AuthUser      string
+	AuthPassword  string
+	SessionTTL    int // hours
+	DBPresets     []DBPreset
+	TLS           *CertConfig
+	Valkey        ValkeyConfig
 }
 
 // DBPreset is one selectable database target in the Maker portal.
@@ -52,28 +83,62 @@ type DBPreset struct {
 	DBPort string `mapstructure:"db_port" json:"db_port"`
 }
 
+// readValkey reads the valkey block through the SAME viper instance that read
+// the file (env overrides + defaults resolve consistently). Individual Get*
+// calls (rather than UnmarshalKey) so nested defaults (mode=direct, ssl
+// disabled) apply even when the file omits keys — the old flat shape
+// valkey: {addr, password, db} therefore still parses unchanged.
+func readValkey(v *viper.Viper) ValkeyConfig {
+	return ValkeyConfig{
+		Mode:          v.GetString("valkey.mode"),
+		Addr:          v.GetString("valkey.addr"),
+		MasterName:    v.GetString("valkey.master_name"),
+		SentinelAddrs: v.GetStringSlice("valkey.sentinel_addrs"),
+		Password:      v.GetString("valkey.password"),
+		DB:            v.GetInt("valkey.db"),
+		SSL: ValkeySSL{
+			Enabled:    v.GetBool("valkey.ssl.enabled"),
+			CAFile:     v.GetString("valkey.ssl.ca_file"),
+			CertFile:   v.GetString("valkey.ssl.cert_file"),
+			KeyFile:    v.GetString("valkey.ssl.key_file"),
+			SkipVerify: v.GetBool("valkey.ssl.skip_verify"),
+		},
+	}
+}
+
+// readTLS returns nil (plaintext) when the tls block is absent/empty, so TLS
+// stays strictly opt-in.
+func readTLS(v *viper.Viper) *CertConfig {
+	cert := v.GetString("tls.cert_file")
+	key := v.GetString("tls.key_file")
+	if cert == "" && key == "" {
+		return nil
+	}
+	return &CertConfig{CertFile: cert, KeyFile: key}
+}
+
 // LoadControl reads the Control Plane config (configs/control.yaml).
 func LoadControl(path string) (*ControlConfig, error) {
 	v := viper.New()
 	if err := load(v, path, map[string]any{
 		"http.addr": ":8080", "api.token_ttl_seconds": 300,
 		"auth.session_ttl_hours": 8, "valkey.addr": "127.0.0.1:6379",
+		"valkey.mode": "direct",
 	}); err != nil {
 		return nil, err
 	}
 	cfg := &ControlConfig{
-		HTTPAddr:       v.GetString("http.addr"),
-		StaticDir:      v.GetString("http.static_dir"),
-		APIKey:         v.GetString("api.api_key"),
-		TokenTTL:       v.GetInt("api.token_ttl_seconds"),
-		DataPlaneHost:  v.GetString("api.data_plane_host"),
-		DataPlanePort:  v.GetString("api.data_plane_port"),
-		AuthUser:       v.GetString("auth.username"),
-		AuthPassword:   v.GetString("auth.password"),
-		SessionTTL:     v.GetInt("auth.session_ttl_hours"),
-		ValkeyAddr:     v.GetString("valkey.addr"),
-		ValkeyPassword: v.GetString("valkey.password"),
-		ValkeyDB:       v.GetInt("valkey.db"),
+		HTTPAddr:      v.GetString("http.addr"),
+		StaticDir:     v.GetString("http.static_dir"),
+		APIKey:        v.GetString("api.api_key"),
+		TokenTTL:      v.GetInt("api.token_ttl_seconds"),
+		DataPlaneHost: v.GetString("api.data_plane_host"),
+		DataPlanePort: v.GetString("api.data_plane_port"),
+		AuthUser:      v.GetString("auth.username"),
+		AuthPassword:  v.GetString("auth.password"),
+		SessionTTL:    v.GetInt("auth.session_ttl_hours"),
+		TLS:           readTLS(v),
+		Valkey:        readValkey(v),
 	}
 	// UnmarshalKey must run on the same viper instance that read the file,
 	// otherwise it would unmarshal against a fresh, empty store.
@@ -85,12 +150,11 @@ func LoadControl(path string) (*ControlConfig, error) {
 
 // DataConfig mirrors configs/data.yaml.
 type DataConfig struct {
-	ListenAddr     string
-	DetectDelayMS  int
-	MaxConns       int
-	ValkeyAddr     string
-	ValkeyPassword string
-	ValkeyDB       int
+	ListenAddr    string
+	DetectDelayMS int
+	MaxConns      int
+	TLS           *CertConfig
+	Valkey        ValkeyConfig
 	// Credentials maps a backend identity key (e.g. "127.0.0.1:3307:ro_user")
 	// to its password. The Data Plane owns DB credentials (zero-trust).
 	Credentials map[string]string
@@ -103,17 +167,17 @@ func LoadData(path string) (*DataConfig, error) {
 		"listen.addr": ":3306", "listen.detect_delay_ms": 200,
 		"listen.max_conns": 100,
 		"valkey.addr":      "127.0.0.1:6379",
+		"valkey.mode":      "direct",
 	}); err != nil {
 		return nil, err
 	}
 	cfg := &DataConfig{
-		ListenAddr:     v.GetString("listen.addr"),
-		DetectDelayMS:  v.GetInt("listen.detect_delay_ms"),
-		MaxConns:       v.GetInt("listen.max_conns"),
-		ValkeyAddr:     v.GetString("valkey.addr"),
-		ValkeyPassword: v.GetString("valkey.password"),
-		ValkeyDB:       v.GetInt("valkey.db"),
-		Credentials:    map[string]string{},
+		ListenAddr:    v.GetString("listen.addr"),
+		DetectDelayMS: v.GetInt("listen.detect_delay_ms"),
+		MaxConns:      v.GetInt("listen.max_conns"),
+		TLS:           readTLS(v),
+		Valkey:        readValkey(v),
+		Credentials:   map[string]string{},
 	}
 	var creds []struct {
 		Key      string `mapstructure:"key"`
