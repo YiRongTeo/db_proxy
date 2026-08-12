@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net"
@@ -73,7 +74,21 @@ func main() {
 	// connection (PG client-first, MySQL server-first) and routes accordingly.
 	// The proxies are also handed to the kill switch below: the ctl:kill
 	// subscriber fans out to both registries (Task 6.4).
-	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials)
+	//
+	// MySQL client-side TLS (Task 7.4): when tls.enabled, load the cert/key
+	// pair (the config layer already fail-fasts on enabled+missing/unreadable)
+	// and hand the tls.Config to the MySQL proxy so it advertises CLIENT_SSL
+	// and answers SSLRequests. nil keeps the plaintext wire path.
+	var mysqlTLS *tls.Config
+	if cfg.TLS != nil {
+		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+		if err != nil {
+			log.Error("mysql tls", "err", err)
+			os.Exit(1)
+		}
+		mysqlTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials, mysqlTLS)
 	pgProxy := proxy.NewPGProxy(log, vs, cfg.Credentials)
 	d := proxy.NewDispatcher(
 		log,

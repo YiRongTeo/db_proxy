@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"sync"
@@ -37,20 +38,39 @@ type MySQLProxy struct {
 	log      *slog.Logger
 	vs       *store.ValkeyStore
 	creds    map[string]string
+	tlsCfg   *tls.Config   // non-nil → CLIENT_SSL advertised + SSLRequest upgraded (Task 7.4); nil = plaintext
 	serverID atomic.Uint32 // per-session connection id for the handshake
 
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
 }
 
-func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string) *MySQLProxy {
+// NewMySQLProxy builds a MySQL session handler. tlsCfg nil keeps the
+// plaintext wire path (byte-identical to before TLS existed); non-nil makes
+// the server advertise CLIENT_SSL and answer an SSLRequest with a TLS
+// handshake before auth (client-side TLS, data plane listener).
+func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string, tlsCfg *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
 		log:      log,
 		vs:       vs,
 		creds:    creds,
+		tlsCfg:   tlsCfg,
 		sessions: make(map[string]*mysqlSession),
 	}
 }
+
+// bufferedConn is a net.Conn whose reads drain a bufio.Reader before
+// touching the underlying conn. The SSLRequest reader may buffer client
+// bytes that belong to the TLS handshake (clients commonly coalesce the
+// SSLRequest packet and the ClientHello into one TCP segment): handing the
+// TLS layer a conn that reads through br preserves those bytes, so the
+// handshake never loses them or hangs waiting for a retransmission.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // registerSession adds a session to the registry so it can be killed by id
 // (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself
@@ -87,16 +107,21 @@ func (p *MySQLProxy) KillSession(id string) bool {
 // passes a buffered reader so any peeked client bytes are preserved; ALL
 // client-side reads go through br, writes through client.
 func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Reader) {
-	defer client.Close()
+	defer func() { _ = client.Close() }() // closes the (possibly TLS-wrapped) conn
 	clientAddr := client.RemoteAddr().String()
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second)) // handshake deadline
 
-	// 1. server handshake (seq 0)
+	// 1. server handshake (seq 0). CLIENT_SSL is advertised ONLY when TLS is
+	// configured; otherwise the handshake is byte-identical to pre-TLS.
+	caps := advertisedCaps
+	if p.tlsCfg != nil {
+		caps |= capSSL
+	}
 	authData, err := randomAuthData()
 	if err != nil {
 		return
 	}
-	handshake, err := buildHandshakeV10("8.4.0-zerotrust-proxy", p.serverID.Add(1), authData)
+	handshake, err := buildHandshakeV10("8.4.0-zerotrust-proxy", p.serverID.Add(1), authData, caps)
 	if err != nil {
 		return
 	}
@@ -104,10 +129,43 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		return
 	}
 
-	// 2. handshake response (seq 1): username = token
+	// 2. handshake response (seq 1): username = token. When TLS is enabled
+	// the client may answer with an SSLRequest instead (CLIENT_SSL set): run
+	// the TLS handshake first — the 10s deadline set above still covers it,
+	// and ctx cancellation aborts it too — then read the REAL handshake
+	// response over TLS. Otherwise (plaintext listener, or a plaintext
+	// client on a TLS listener) this packet IS the handshake response.
+	//
+	// authReplySeq is the seq id for the auth-phase reply (OK or ERR).
+	// Plaintext: handshake (srv, seq 0), handshake response (cli, seq 1) →
+	// reply is seq 2. With TLS the client first answers the handshake with
+	// an SSLRequest (cli, seq 1) — the SSLRequest consumes seq 1 — then
+	// sends the real auth response over TLS (cli, seq 2) → the reply MUST be
+	// seq 3. The Go test client tolerates any seq; the mysql 8.4 C client's
+	// strict SSL_read validation does not (ERROR 2013 'reading authorization
+	// packet' on a seq-2 OK under TLS). Set to 3 below when the TLS path is
+	// taken.
+	authReplySeq := byte(2)
 	_, payload, err := readMySQLPacket(br)
 	if err != nil {
 		return
+	}
+	if p.tlsCfg != nil && isSSLRequest(payload) {
+		// bufferedConn: the SSLRequest read may have buffered the client's
+		// ClientHello — the TLS layer must read through br, not the raw conn.
+		tlsConn := tls.Server(&bufferedConn{Conn: client, r: br}, p.tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			p.log.Warn("tls handshake failed", "client", clientAddr, "err", err)
+			return
+		}
+		client = tlsConn
+		br = bufio.NewReader(tlsConn)
+		if _, payload, err = readMySQLPacket(br); err != nil {
+			return
+		}
+		// The SSLRequest consumed seq 1 (handshake=0 srv, SSLRequest=1 cli,
+		// auth=2 cli) → the auth-phase reply must be seq 3, not 2.
+		authReplySeq = 3
 	}
 	if len(payload) > 0 && payload[0] == 0xff {
 		return // client refused
@@ -130,12 +188,12 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	if tok == nil {
 		p.log.Warn("invalid or expired token", "client", clientAddr)
-		_ = writeMySQLPacket(client, 2, errPacket(1045, "42000", "invalid or expired token"))
+		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "invalid or expired token"))
 		return
 	}
 	if tok.DBType != "mysql" {
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
-		_ = writeMySQLPacket(client, 2, errPacket(1045, "42000", "token not valid for this protocol"))
+		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "token not valid for this protocol"))
 		return
 	}
 
@@ -143,13 +201,13 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	backend, err := connectMySQLBackend(ctx, tok, p.creds, database)
 	if err != nil {
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
-		_ = writeMySQLPacket(client, 2, errPacket(1045, "42000", "backend unavailable"))
+		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "backend unavailable"))
 		return
 	}
 	defer backend.Close()
 
-	// 5. OK (seq 2) — session established
-	if err := writeMySQLPacket(client, 2, okPacket()); err != nil {
+	// 5. OK — session established (seq 2 plaintext / 3 under TLS)
+	if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
 		return
 	}
 	// Session established: create the per-session state (pending event +

@@ -14,7 +14,7 @@ func TestBuildHandshakeV10(t *testing.T) {
 		t.Fatalf("test auth data must be 20 bytes, got %d", len(authData))
 	}
 
-	p, err := buildHandshakeV10(serverVersion, connID, authData)
+	p, err := buildHandshakeV10(serverVersion, connID, authData, advertisedCaps)
 	if err != nil {
 		t.Fatalf("buildHandshakeV10: %v", err)
 	}
@@ -123,11 +123,96 @@ func TestBuildHandshakeV10(t *testing.T) {
 	}
 }
 
+// handshakeCapBits walks the fixed handshake layout (past the version string)
+// and returns the advertised capability flags as a single uint32.
+func handshakeCapBits(t *testing.T, p []byte) uint32 {
+	t.Helper()
+	pos := 1 // protocol version
+	end := bytes.IndexByte(p[pos:], 0)
+	if end < 0 {
+		t.Fatal("server version not NUL-terminated")
+	}
+	pos += end + 1 + 4 + 8 + 1 // version+NUL + conn id + auth part1 + filler
+	low := binary.LittleEndian.Uint16(p[pos : pos+2])
+	high := binary.LittleEndian.Uint16(p[pos+5 : pos+7]) // +2 caps-low, +1 charset, +2 status
+	return uint32(low) | uint32(high)<<16
+}
+
+// TestBuildHandshakeV10SSLCap (Task 7.4): the SSL cap (0x0800) is included in
+// the advertised caps exactly when the caller ORs it in — and the plaintext
+// handshake (advertisedCaps alone) stays byte-identical to pre-TLS, i.e. the
+// SSL bit is NOT present.
+func TestBuildHandshakeV10SSLCap(t *testing.T) {
+	authData := []byte("0123456789abcdefghij")
+
+	// Plaintext: advertisedCaps only → no CLIENT_SSL bit, exact set preserved.
+	plain, err := buildHandshakeV10("8.4.0-zerotrust-proxy", 7, authData, advertisedCaps)
+	if err != nil {
+		t.Fatalf("buildHandshakeV10 (plaintext): %v", err)
+	}
+	if got := handshakeCapBits(t, plain); got != advertisedCaps {
+		t.Errorf("plaintext caps = %#x, want exactly %#x (byte-identical to pre-TLS)", got, advertisedCaps)
+	}
+	if handshakeCapBits(t, plain)&capSSL != 0 {
+		t.Errorf("plaintext caps %#x must NOT include CLIENT_SSL 0x0800", handshakeCapBits(t, plain))
+	}
+
+	// TLS enabled: advertisedCaps|capSSL → the SSL bit is advertised.
+	tlsCaps := advertisedCaps | capSSL
+	secured, err := buildHandshakeV10("8.4.0-zerotrust-proxy", 7, authData, tlsCaps)
+	if err != nil {
+		t.Fatalf("buildHandshakeV10 (tls): %v", err)
+	}
+	if got := handshakeCapBits(t, secured); got&capSSL == 0 {
+		t.Errorf("tls caps = %#x, want CLIENT_SSL 0x0800 set", got)
+	}
+	if got := handshakeCapBits(t, secured); got != tlsCaps {
+		t.Errorf("tls caps = %#x, want exactly %#x", got, tlsCaps)
+	}
+}
+
+// TestIsSSLRequest (Task 7.4): an SSLRequest-shaped payload (>= 32 bytes,
+// CLIENT_SSL set in the first 4 bytes) is detected; a real auth response
+// (same shape but no SSL bit) and short payloads are not.
+func TestIsSSLRequest(t *testing.T) {
+	// SSLRequest-shaped: caps + max packet + charset + 23 reserved = 32 bytes.
+	sslReq := make([]byte, 32)
+	binary.LittleEndian.PutUint32(sslReq[0:4], uint32(capSSL|capProtocol41))
+	if !isSSLRequest(sslReq) {
+		t.Error("isSSLRequest = false for 32-byte payload with CLIENT_SSL, want true")
+	}
+
+	// Auth-response-shaped: same layout but WITHOUT the SSL bit.
+	authResp := make([]byte, 32)
+	binary.LittleEndian.PutUint32(authResp[0:4], uint32(capProtocol41|capSecureConnection|capConnectWithDB))
+	if isSSLRequest(authResp) {
+		t.Error("isSSLRequest = true for auth-response-shaped payload without CLIENT_SSL, want false")
+	}
+
+	// Full real handshake response (longer than 32, no SSL bit).
+	full := buildTestHandshakeResponse("sess_abc")
+	if isSSLRequest(full) {
+		t.Error("isSSLRequest = true for full handshake response without CLIENT_SSL, want false")
+	}
+
+	// Short payloads can never be an SSLRequest.
+	if isSSLRequest(nil) || isSSLRequest([]byte{0x01, 0x02, 0x03}) {
+		t.Error("isSSLRequest = true for short payload, want false")
+	}
+
+	// SSL bit present but payload shorter than 32 → not an SSLRequest.
+	short := make([]byte, 31)
+	binary.LittleEndian.PutUint32(short[0:4], uint32(capSSL))
+	if isSSLRequest(short) {
+		t.Error("isSSLRequest = true for 31-byte payload with CLIENT_SSL, want false")
+	}
+}
+
 func TestBuildHandshakeV10RejectsBadAuthData(t *testing.T) {
-	if _, err := buildHandshakeV10("8.0.36", 1, []byte("short")); err == nil {
+	if _, err := buildHandshakeV10("8.0.36", 1, []byte("short"), advertisedCaps); err == nil {
 		t.Error("expected error for auth data shorter than 20 bytes")
 	}
-	if _, err := buildHandshakeV10("8.0.36", 1, nil); err == nil {
+	if _, err := buildHandshakeV10("8.0.36", 1, nil, advertisedCaps); err == nil {
 		t.Error("expected error for nil auth data")
 	}
 }

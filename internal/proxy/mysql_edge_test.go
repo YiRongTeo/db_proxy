@@ -51,7 +51,7 @@ func startEdgeBackend(t *testing.T) (addr string, recv chan []byte, closed chan 
 				if err != nil {
 					return
 				}
-				hs, err := buildHandshakeV10("8.4.0-edge-fake", 1, authData)
+				hs, err := buildHandshakeV10("8.4.0-edge-fake", 1, authData, advertisedCaps)
 				if err != nil {
 					return
 				}
@@ -130,7 +130,7 @@ func startEdgeDispatcher(t *testing.T, vs *store.ValkeyStore, creds map[string]s
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logW, nil))
-	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, creds), &PGProxy{}, 100*time.Millisecond, 64)
+	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, creds, nil), &PGProxy{}, 100*time.Millisecond, 64)
 	go d.Serve(ln, context.Background())
 	return ln
 }

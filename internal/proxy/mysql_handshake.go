@@ -10,7 +10,8 @@ import (
 
 const (
 	capLongPassword     = 1 << 0
-	capConnectWithDB    = 1 << 3 // CLIENT_CONNECT_WITH_DB 0x08 (NOT 0x10 = CLIENT_NO_SCHEMA)
+	capConnectWithDB    = 1 << 3  // CLIENT_CONNECT_WITH_DB 0x08 (NOT 0x10 = CLIENT_NO_SCHEMA)
+	capSSL              = 1 << 11 // CLIENT_SSL 0x0800 — advertised only when TLS is configured (Task 7.4)
 	capProtocol41       = 1 << 9
 	capTransactions     = 1 << 13
 	capSecureConnection = 1 << 15
@@ -25,12 +26,15 @@ const (
 	cmdExecute = 0x17
 )
 
-var advertisedCaps = capLongPassword | capProtocol41 | capTransactions |
+var advertisedCaps uint32 = capLongPassword | capProtocol41 | capTransactions |
 	capSecureConnection | capPluginAuth | capPluginAuthData | capConnectWithDB
 
 // buildHandshakeV10 builds the server's initial handshake payload.
 // authData must be exactly 20 bytes (8-byte part1 + 12-byte part2).
-func buildHandshakeV10(serverVersion string, connID uint32, authData []byte) ([]byte, error) {
+// caps is the FULL capability set to advertise: pass advertisedCaps for
+// plaintext, advertisedCaps|capSSL when TLS is enabled (Task 7.4) — the
+// plaintext handshake is byte-identical to before.
+func buildHandshakeV10(serverVersion string, connID uint32, authData []byte, caps uint32) ([]byte, error) {
 	if len(authData) != 20 {
 		return nil, fmt.Errorf("auth data must be 20 bytes, got %d", len(authData))
 	}
@@ -41,10 +45,10 @@ func buildHandshakeV10(serverVersion string, connID uint32, authData []byte) ([]
 	p = binary.LittleEndian.AppendUint32(p, connID)
 	p = append(p, authData[:8]...)
 	p = append(p, 0x00) // filler
-	p = binary.LittleEndian.AppendUint16(p, uint16(advertisedCaps&0xffff))
+	p = binary.LittleEndian.AppendUint16(p, uint16(caps&0xffff))
 	p = append(p, 33)                          // charset utf8_general_ci
 	p = binary.LittleEndian.AppendUint16(p, 2) // SERVER_STATUS_AUTOCOMMIT
-	p = binary.LittleEndian.AppendUint16(p, uint16(advertisedCaps>>16))
+	p = binary.LittleEndian.AppendUint16(p, uint16(caps>>16))
 	p = append(p, 21)                  // auth plugin data length
 	p = append(p, make([]byte, 10)...) // reserved
 	p = append(p, authData[8:]...)     // 12-byte part2
@@ -107,6 +111,15 @@ func parseHandshakeResponse(payload []byte) (username, database string, err erro
 		}
 	}
 	return username, database, nil
+}
+
+// isSSLRequest reports whether the first client packet is an SSLRequest:
+// a protocol-4.1-shaped payload (>= 32 bytes: caps + max packet + charset +
+// 23 reserved) carrying CLIENT_SSL. A real handshake response (which also
+// starts with caps) is distinguishable by the SSL bit: clients only send an
+// SSLRequest when the server advertised CLIENT_SSL, and only then.
+func isSSLRequest(payload []byte) bool {
+	return len(payload) >= 32 && binary.LittleEndian.Uint32(payload[0:4])&capSSL != 0
 }
 
 func okPacket() []byte {

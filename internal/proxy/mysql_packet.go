@@ -21,11 +21,18 @@ func readMySQLPacket(r io.Reader) (seq byte, payload []byte, err error) {
 }
 
 // writeMySQLPacket replays the original header (same seq) — byte-exact relay.
+// The header and payload are written in a SINGLE Write call so that each MySQL
+// packet lands in exactly one TCP segment / one TLS record. Splitting into two
+// Write calls produces two TLS records for one MySQL packet (4-byte header +
+// payload), which breaks the mysql C client's SSL_read path ('Lost connection
+// at reading authorization packet').
 func writeMySQLPacket(w io.Writer, seq byte, payload []byte) error {
-	hdr := []byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}
-	if _, err := w.Write(hdr); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
+	buf := make([]byte, 4+len(payload))
+	buf[0] = byte(len(payload))
+	buf[1] = byte(len(payload) >> 8)
+	buf[2] = byte(len(payload) >> 16)
+	buf[3] = seq
+	copy(buf[4:], payload)
+	_, err := w.Write(buf)
 	return err
 }

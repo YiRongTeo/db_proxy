@@ -26,7 +26,7 @@ import (
 // false. The 6.2 registry test asserts the closer is invoked; this one pins
 // the closer semantics on real conns.
 func TestSessionRegistryKillClosesBothConns(t *testing.T) {
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
 
 	client, clientPeer := net.Pipe()
 	backend, backendPeer := net.Pipe()
@@ -94,7 +94,7 @@ func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
 // belongs to. Killing one plane's session must leave the other plane's
 // sessions untouched.
 func TestKillerKillsOnEitherPlane(t *testing.T) {
-	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
 	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	k := NewKiller(mysql, pg)
 
@@ -155,7 +155,7 @@ func startKillTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffe
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewMySQLProxy(logger, vs, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"})
+	p := NewMySQLProxy(logger, vs, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}, nil)
 	go func() {
 		for {
 			conn, err := ln.Accept()
