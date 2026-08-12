@@ -39,6 +39,20 @@ export interface LoginResponse {
   username: string;
 }
 
+/**
+ * One live data-plane session directory entry (internal/store.SessionInfo —
+ * Task 8.4). ThreadID is intentionally not exposed; snake_case EXACT.
+ */
+export interface SessionInfo {
+  session_id: string;
+  username: string;
+  db_user: string;
+  db_type: string;
+  db: string;
+  started_at: string;
+  last_seen: string;
+}
+
 /** Response of POST /api/kill (202 — kill queued on the ctl:kill channel). */
 export interface KillResponse {
   killed: string;
@@ -68,6 +82,9 @@ export interface QueryEvent {
   columns?: string[];
   rows?: string[][];
   truncated?: boolean;
+  // Phase 8 enhancement fields (internal/models.QueryEvent — omitempty, may be absent).
+  action?: string; // started|ended — session lifecycle events (kind=session)
+  db?: string; // client-requested target database
 }
 
 /**
@@ -104,11 +121,20 @@ export class ApiService {
     return this.http.post<TokenResponse>('/api/token', payload, { withCredentials: true });
   }
 
-  /** POST /api/kill — queue a data-plane session kill (202 when accepted). */
-  killSession(sessionId: string): Observable<KillResponse> {
+  /** GET /api/sessions — live data-plane session directory (Task 8.4). */
+  sessions(): Observable<SessionInfo[]> {
+    return this.http.get<SessionInfo[]>('/api/sessions', { withCredentials: true });
+  }
+
+  /**
+   * POST /api/kill — queue a data-plane session kill (202 when accepted).
+   * mode selects the kill scope (Task 8.3): 'query' aborts the in-flight
+   * query only; 'connection' terminates the whole backend session.
+   */
+  killSession(sessionId: string, mode: 'query' | 'connection'): Observable<KillResponse> {
     return this.http.post<KillResponse>(
       '/api/kill',
-      { session_id: sessionId },
+      { session_id: sessionId, mode },
       { withCredentials: true },
     );
   }

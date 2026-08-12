@@ -1,5 +1,24 @@
 <nz-card class="checker-card" nzTitle="Checker Dashboard" nzExtra="Live query feed">
   <div class="checker-controls">
+    <div class="session-row">
+      <span class="channel-label">Session</span>
+      <nz-select
+        class="session-select"
+        [ngModel]="selectedSession()"
+        (ngModelChange)="onSessionSelect($event)"
+      >
+        <nz-option nzValue="*" nzLabel="live (all)"></nz-option>
+        @for (s of sessions(); track s.session_id) {
+          <nz-option [nzValue]="s.session_id" [nzLabel]="sessionLabel(s)"></nz-option>
+        }
+      </nz-select>
+      @if (selectedSession() !== '*') {
+        <nz-tag nzColor="geekblue" class="session-context-tag">
+          session: {{ shortenSid(selectedSession()) }} · {{ selectedSessionInfo()?.username ?? '—' }}
+        </nz-tag>
+      }
+    </div>
+
     <div class="channel-row">
       <span class="channel-label">Channel</span>
       <nz-input-group nzCompact class="channel-group">
@@ -68,6 +87,9 @@
               @if (ev.stmt_type) {
                 <nz-tag [nzColor]="stmtColor(ev.stmt_type)">{{ ev.stmt_type }}</nz-tag>
               }
+              @if (ev.action) {
+                <nz-tag [nzColor]="ev.action === 'started' ? 'green' : 'red'">{{ ev.action }}</nz-tag>
+              }
             </td>
             <td>{{ ev.username }}</td>
             <td>{{ ev.db_type }}</td>
@@ -104,11 +126,18 @@
                   <button
                     nz-button
                     nzSize="small"
+                    nz-popconfirm
+                    [nzPopconfirmTitle]="'Kill query on ' + ev.session_id + '?'"
+                    (nzOnConfirm)="kill(ev, 'query')"
+                  >kill query</button>
+                  <button
+                    nz-button
+                    nzSize="small"
                     nzDanger
                     nz-popconfirm
-                    [nzPopconfirmTitle]="'Kill session ' + ev.session_id + '?'"
-                    (nzOnConfirm)="kill(ev)"
-                  >kill</button>
+                    [nzPopconfirmTitle]="'Kill connection ' + ev.session_id + '?'"
+                    (nzOnConfirm)="kill(ev, 'connection')"
+                  >kill connection</button>
                 }
               } @else {
                 —

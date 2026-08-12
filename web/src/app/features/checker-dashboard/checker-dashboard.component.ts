@@ -1,5 +1,6 @@
 import {
   Component,
+  computed,
   effect,
   ElementRef,
   inject,
@@ -15,11 +16,12 @@ import { NzCardModule } from 'ng-zorro-antd/card';
 import { NzInputModule } from 'ng-zorro-antd/input';
 import { NzMessageService } from 'ng-zorro-antd/message';
 import { NzPopconfirmModule } from 'ng-zorro-antd/popconfirm';
+import { NzSelectModule } from 'ng-zorro-antd/select';
 import { NzSwitchModule } from 'ng-zorro-antd/switch';
 import { NzTableModule } from 'ng-zorro-antd/table';
 import { NzTagModule } from 'ng-zorro-antd/tag';
 import { NzTooltipModule } from 'ng-zorro-antd/tooltip';
-import { ApiService, QueryEvent } from '../../core/api.service';
+import { ApiService, QueryEvent, SessionInfo } from '../../core/api.service';
 import { LiveQueryService } from '../../core/live-query.service';
 
 /** Kind → nz-tag color mapping (brief 2.8: query=blue, prepare=purple, execute=orange, use=cyan). */
@@ -65,6 +67,7 @@ export interface OutputColumn {
     NzCardModule,
     NzInputModule,
     NzPopconfirmModule,
+    NzSelectModule,
     NzSwitchModule,
     NzTableModule,
     NzTagModule,
@@ -88,8 +91,22 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   /** Event id whose output table is expanded (single-row expansion). */
   readonly expanded = signal<string | null>(null);
 
-  /** Event id → killed (kill accepted by the control plane). */
+  /** Event id → killed (connection kill accepted by the control plane). */
   readonly killed = signal<Record<string, boolean>>({});
+
+  /** Live data-plane session directory (Task 8.4) backing the session selector. */
+  readonly sessions = signal<SessionInfo[]>([]);
+
+  /** Selector value: '*' = live (all); anything else = a data-plane session id. */
+  readonly selectedSession = signal<string>('*');
+
+  /** The selected session record (null while '*' or after the session left the directory). */
+  readonly selectedSessionInfo = computed(
+    () => this.sessions().find((s) => s.session_id === this.selectedSession()) ?? null,
+  );
+
+  /** Lifecycle event ids already folded into the directory refresh (idempotency). */
+  private readonly seenLifecycle = new Set<string>();
 
   constructor() {
     // Auto-scroll: whenever the ring buffer grows (or the toggle flips on),
@@ -100,9 +117,21 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
         this.scrollToBottom();
       }
     });
+    // Task 8.5: keep the session selector in sync with kind=session lifecycle
+    // events (action started/ended). The directory is re-pulled from the API
+    // so last_seen stays fresh; each lifecycle event is folded in exactly once.
+    effect(() => {
+      for (const ev of this.live.events()) {
+        if (ev.kind !== 'session' || !ev.action || !ev.session_id) continue;
+        if (this.seenLifecycle.has(ev.id)) continue;
+        this.seenLifecycle.add(ev.id);
+        this.refreshSessions();
+      }
+    });
   }
 
   ngOnInit(): void {
+    this.refreshSessions();
     this.connect();
   }
 
@@ -114,6 +143,31 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     this.live.disconnect();
   }
 
+  /** Re-pull the session directory from /api/sessions (init + lifecycle events). */
+  refreshSessions(): void {
+    this.api.sessions().subscribe({
+      next: (list) => this.sessions.set(list),
+      error: () => undefined, // keep the last known directory; the selector stays usable
+    });
+  }
+
+  /** Selector change: '*' keeps the all-queries pattern; a session narrows the feed to sess:<sid>. */
+  onSessionSelect(sid: string): void {
+    this.selectedSession.set(sid);
+    this.channel.set(sid === '*' ? '*' : `sess:${sid}`);
+    this.connect();
+  }
+
+  /** Selector label: username · db_user · db · session_id (sid display truncated to 12 chars). */
+  sessionLabel(s: SessionInfo): string {
+    return `${s.username} · ${s.db_user} · ${s.db} · ${this.shortenSid(s.session_id)}`;
+  }
+
+  /** Truncate a session id for display (the full id stays in the option value). */
+  shortenSid(sid: string): string {
+    return sid.length <= 12 ? sid : `${sid.slice(0, 12)}…`;
+  }
+
   kindColor(kind: string): string {
     return KIND_COLORS[kind] ?? 'default';
   }
@@ -123,9 +177,9 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     return (stmt && STMT_COLORS[stmt.toLowerCase()]) ?? 'default';
   }
 
-  /** "db_user@db_ip:db_port" — the resolved target the token mapped to. */
+  /** "db_user@db_ip:db_port" — the resolved target the token mapped to. Lifecycle events carry no db_ip/db_port → dash. */
   target(ev: QueryEvent): string {
-    return `${ev.db_user}@${ev.db_ip}:${ev.db_port}`;
+    return ev.db_ip ? `${ev.db_user}@${ev.db_ip}:${ev.db_port}` : '—';
   }
 
   /** The output table is available when the event carries columns and/or rows. */
@@ -156,13 +210,22 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     return (ev.rows ?? []).map((r) => Object.fromEntries(r.map((cell, i) => [`c${i}`, cell])));
   }
 
-  /** Popconfirm confirm handler: POST /api/kill, mark killed on 202. */
-  kill(ev: QueryEvent): void {
+  /**
+   * Popconfirm confirm handler: POST /api/kill with the requested mode.
+   * mode=connection marks the row killed on 202 (the backend session is
+   * gone); mode=query only aborts the in-flight query — the row stays live
+   * and the operator sees a "query kill dispatched" confirmation.
+   */
+  kill(ev: QueryEvent, mode: 'query' | 'connection'): void {
     if (!ev.session_id) return;
-    this.api.killSession(ev.session_id).subscribe({
+    this.api.killSession(ev.session_id, mode).subscribe({
       next: () => {
-        this.killed.update((m) => ({ ...m, [ev.id]: true }));
-        this.message.success(`kill queued for session ${ev.session_id}`);
+        if (mode === 'connection') {
+          this.killed.update((m) => ({ ...m, [ev.id]: true }));
+          this.message.success(`kill queued for session ${ev.session_id}`);
+        } else {
+          this.message.success(`query kill dispatched for session ${ev.session_id}`);
+        }
       },
       error: (err: { status?: number }) => {
         const detail = err?.status ? `HTTP ${err.status}` : 'network error';

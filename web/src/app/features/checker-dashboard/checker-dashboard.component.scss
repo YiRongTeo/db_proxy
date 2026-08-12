@@ -11,6 +11,22 @@
   margin-bottom: 16px;
 }
 
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 340px;
+}
+
+.session-select {
+  min-width: 300px;
+}
+
+.session-context-tag {
+  white-space: nowrap;
+}
+
 .channel-row {
   display: flex;
   align-items: center;
