@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -116,12 +117,14 @@ func startTestProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.
 	return ln, done
 }
 
-// --- sniffing semantics ---------------------------------------------------
+// --- sniffing semantics (Task 6.2: publish on response completion) ----------
 
-// TestSniffCommandPublishesQueryEvents: every sniffed command publishes a
-// QueryEvent with the correct kind/sql and full token context to
-// queries:<username>.
-func TestSniffCommandPublishesQueryEvents(t *testing.T) {
+// TestSniffCommandPublishesQueryEventsOnResponse: every sniffed command
+// stashes a pending QueryEvent with the correct kind/sql/stmt_type and full
+// token context; NOTHING is published at sniff time — the event is published
+// only when the backend's response completes (synthetic OK here), carrying
+// status=ok. Non-sniffed commands (COM_QUIT, COM_PING) never publish.
+func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 	vs := proxyTestStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -137,6 +140,7 @@ func TestSniffCommandPublishesQueryEvents(t *testing.T) {
 	waitSubAck(t, acked)
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil)
+	s := newTestSession()
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-3-4",
 		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307"}
 
@@ -145,26 +149,38 @@ func TestSniffCommandPublishesQueryEvents(t *testing.T) {
 		body []byte
 		kind string
 		sql  string
+		stmt string
 	}{
-		{cmdQuery, []byte("SELECT * FROM users"), "query", "SELECT * FROM users"},
+		{cmdQuery, []byte("SELECT * FROM users"), "query", "SELECT * FROM users", "select"},
 		// Real clients NUL-terminate command payloads — the sniffed copy must
 		// be trimmed (Task 3.7 deferred fix); the relayed bytes are untouched.
-		{cmdQuery, []byte("SELECT * FROM users\x00"), "query", "SELECT * FROM users"},
-		{cmdInitDB, []byte("appdb"), "use", "USE appdb"},
-		{cmdInitDB, []byte("appdb\x00"), "use", "USE appdb"},
-		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?"), "prepare", "SELECT id FROM t WHERE id = ?"},
-		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?\x00"), "prepare", "SELECT id FROM t WHERE id = ?"},
-		{cmdExecute, []byte{42, 0, 0, 0, 1, 2, 3}, "execute", "EXECUTE stmt_id=42"},
-		{cmdExecute, []byte{1, 2}, "execute", "EXECUTE stmt_id=?"}, // truncated stmt id
+		{cmdQuery, []byte("SELECT * FROM users\x00"), "query", "SELECT * FROM users", "select"},
+		{cmdInitDB, []byte("appdb"), "use", "USE appdb", "other"},
+		{cmdInitDB, []byte("appdb\x00"), "use", "USE appdb", "other"},
+		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?"), "prepare", "SELECT id FROM t WHERE id = ?", "select"},
+		{cmdPrepare, []byte("SELECT id FROM t WHERE id = ?\x00"), "prepare", "SELECT id FROM t WHERE id = ?", "select"},
+		{cmdExecute, []byte{42, 0, 0, 0, 1, 2, 3}, "execute", "EXECUTE stmt_id=42", "other"},
+		{cmdExecute, []byte{1, 2}, "execute", "EXECUTE stmt_id=?", "other"}, // truncated stmt id
 	}
 	for _, tc := range cases {
-		p.sniffCommand(tc.cmd, tc.body, tok, "127.0.0.1:55555")
+		p.sniffCommand(s, tc.cmd, tc.body, tok, "127.0.0.1:55555")
+		expectNoEvent(t, out) // not published at sniff time — waits for the response
+		completePending(p, s)
 		var ev models.QueryEvent
 		if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
 			t.Fatalf("unmarshal event: %v", err)
 		}
 		if ev.Kind != tc.kind || ev.SQL != tc.sql {
 			t.Errorf("cmd %#x: kind=%q sql=%q, want kind=%q sql=%q", tc.cmd, ev.Kind, ev.SQL, tc.kind, tc.sql)
+		}
+		if ev.StmtType != tc.stmt {
+			t.Errorf("cmd %#x: stmt_type=%q, want %q", tc.cmd, ev.StmtType, tc.stmt)
+		}
+		if ev.Status != "ok" || ev.Error != "" {
+			t.Errorf("cmd %#x: status=%q error=%q, want ok/empty", tc.cmd, ev.Status, ev.Error)
+		}
+		if ev.SessionID != s.id {
+			t.Errorf("cmd %#x: session_id=%q, want %q", tc.cmd, ev.SessionID, s.id)
 		}
 		if ev.Username != "test-user" || ev.TicketID != "T-3-4" ||
 			ev.DBUser != "ro_user" || ev.DBIP != "127.0.0.1" || ev.DBPort != "3307" ||
@@ -176,9 +192,11 @@ func TestSniffCommandPublishesQueryEvents(t *testing.T) {
 		}
 	}
 
-	// Non-sniffed commands (COM_QUIT, COM_PING) must publish nothing.
-	p.sniffCommand(cmdQuit, nil, tok, "127.0.0.1:55555")
-	p.sniffCommand(cmdPing, nil, tok, "127.0.0.1:55555")
+	// Non-sniffed commands (COM_QUIT, COM_PING) must publish nothing, even
+	// after a response completes.
+	p.sniffCommand(s, cmdQuit, nil, tok, "127.0.0.1:55555")
+	p.sniffCommand(s, cmdPing, nil, tok, "127.0.0.1:55555")
+	completePending(p, s)
 	expectNoEvent(t, out)
 }
 
@@ -201,10 +219,13 @@ func TestSniffCommandPublishesTicketChannel(t *testing.T) {
 	waitSubAck(t, acked)
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil)
+	s := newTestSession()
 
-	// With a ticket: event lands on the ticket channel.
-	p.sniffCommand(cmdQuery, []byte("SELECT 1"), &models.TokenPayload{
+	// With a ticket: event lands on the ticket channel once the response
+	// completes.
+	p.sniffCommand(s, cmdQuery, []byte("SELECT 1"), &models.TokenPayload{
 		Username: "test-user", TicketID: "T-3-4", DBUser: "ro_user"}, "c")
+	completePending(p, s)
 	var ev models.QueryEvent
 	if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
 		t.Fatalf("unmarshal event: %v", err)
@@ -214,7 +235,8 @@ func TestSniffCommandPublishesTicketChannel(t *testing.T) {
 	}
 
 	// Without a ticket: nothing on the ticket channel.
-	p.sniffCommand(cmdQuery, []byte("SELECT 2"), &models.TokenPayload{Username: "test-user"}, "c")
+	p.sniffCommand(s, cmdQuery, []byte("SELECT 2"), &models.TokenPayload{Username: "test-user"}, "c")
+	completePending(p, s)
 	expectNoEvent(t, out)
 }
 
@@ -391,6 +413,7 @@ func TestSniffCommandTrimsTrailingNUL(t *testing.T) {
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil)
 	tok := &models.TokenPayload{Username: "test-user", DBUser: "ro_user"}
+	s := newTestSession()
 
 	cases := []struct {
 		name string
@@ -408,7 +431,8 @@ func TestSniffCommandTrimsTrailingNUL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p.sniffCommand(tc.cmd, tc.body, tok, "127.0.0.1:55555")
+			p.sniffCommand(s, tc.cmd, tc.body, tok, "127.0.0.1:55555")
+			completePending(p, s)
 			var ev models.QueryEvent
 			if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
 				t.Fatalf("unmarshal event: %v", err)
@@ -586,5 +610,157 @@ func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
 	// No token value in the logs.
 	if logs := logBuf.String(); strings.Contains(logs, token) {
 		t.Errorf("logs must never contain the token value:\n%s", logs)
+	}
+}
+
+// --- Task 6.2: live response capture -----------------------------------------
+
+// TestMySQLSessionCaptureLive runs a full session against the live mysql-test
+// backend and asserts the PUBLISHED QueryEvents carry the classified stmt
+// type and the captured backend response: a SELECT's result set (columns +
+// rows, status ok, not truncated) and a failing query's server error message
+// (status error). The user channel and the ticket channel both receive the
+// same event.
+func TestMySQLSessionCaptureLive(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	tok := models.TokenPayload{Username: "test-user", DBUser: "ro_user",
+		DBIP: "127.0.0.1", DBPort: "3307", DBType: "mysql", TicketID: "T-6-2"}
+	if err := vs.SetToken(ctx, token, tok, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	userOut := make(chan []byte, 8)
+	userAcked := make(chan struct{}, 1)
+	userSubCtx := valkey.WithOnSubscriptionHook(subCtx, func(valkey.PubSubSubscription) {
+		select {
+		case userAcked <- struct{}{}:
+		default:
+		}
+	})
+	go vs.Subscribe(userSubCtx, "queries:test-user", false, userOut)
+	waitSubAck(t, userAcked)
+	ticketOut := make(chan []byte, 8)
+	ticketAcked := make(chan struct{}, 1)
+	ticketSubCtx := valkey.WithOnSubscriptionHook(subCtx, func(valkey.PubSubSubscription) {
+		select {
+		case ticketAcked <- struct{}{}:
+		default:
+		}
+	})
+	go vs.Subscribe(ticketSubCtx, "queries:ticket:T-6-2", false, ticketOut)
+	waitSubAck(t, ticketAcked)
+
+	var logBuf bytes.Buffer
+	ln, proxyDone := startTestProxy(t, vs, &logBuf)
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Steps 1-5: server handshake, token response, OK.
+	if _, _, err := readMySQLPacket(client); err != nil {
+		t.Fatalf("read handshake: %v", err)
+	}
+	if err := writeMySQLPacket(client, 1, buildTestHandshakeResponse(token)); err != nil {
+		t.Fatalf("write handshake response: %v", err)
+	}
+	seq, resp, err := readMySQLPacket(client)
+	if err != nil {
+		t.Fatalf("read OK: %v", err)
+	}
+	if seq != 2 || len(resp) == 0 || resp[0] != 0x00 {
+		t.Fatalf("expected OK seq 2, got seq=%d resp=% x", seq, resp)
+	}
+
+	// SELECT with a real result set: the published event carries the stmt
+	// type plus the captured columns/rows and status ok.
+	sel := "SELECT id,name FROM demo_items"
+	if err := writeMySQLPacket(client, 0, append([]byte{cmdQuery}, sel...)); err != nil {
+		t.Fatalf("write SELECT: %v", err)
+	}
+	if _, err := readTextResultSet(client); err != nil {
+		t.Fatalf("read result set: %v", err)
+	}
+	var ev models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, userOut), &ev); err != nil {
+		t.Fatalf("unmarshal select event: %v", err)
+	}
+	if ev.Kind != "query" || ev.SQL != sel {
+		t.Errorf("event kind/sql = %q/%q, want query/%q", ev.Kind, ev.SQL, sel)
+	}
+	if ev.StmtType != "select" {
+		t.Errorf("stmt_type = %q, want select", ev.StmtType)
+	}
+	if ev.Status != "ok" || ev.Error != "" {
+		t.Errorf("status/error = %q/%q, want ok/empty", ev.Status, ev.Error)
+	}
+	if !reflect.DeepEqual(ev.Columns, []string{"id", "name"}) {
+		t.Errorf("columns = %q, want [id name]", ev.Columns)
+	}
+	// The live seed is (1,test),(2,bravo),(3,charlie) — row 1's name was
+	// changed to 'test' by a prior task's UPDATE; alpha is only in the docs.
+	wantRows := [][]string{{"1", "test"}, {"2", "bravo"}, {"3", "charlie"}}
+	if !reflect.DeepEqual(ev.Rows, wantRows) {
+		t.Errorf("rows = %q, want %q", ev.Rows, wantRows)
+	}
+	if ev.Truncated {
+		t.Error("truncated = true, want false")
+	}
+	if !strings.HasPrefix(ev.SessionID, "sid-") {
+		t.Errorf("session_id = %q, want sid- prefix", ev.SessionID)
+	}
+	if len(ev.ID) != 16 || ev.Ts.IsZero() {
+		t.Errorf("id=%q ts=%v, want 16-hex id and non-zero ts", ev.ID, ev.Ts)
+	}
+	// The ticket channel receives the same event (same id).
+	var tev models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, ticketOut), &tev); err != nil {
+		t.Fatalf("unmarshal ticket event: %v", err)
+	}
+	if tev.ID != ev.ID {
+		t.Errorf("ticket event id %q != user event id %q", tev.ID, ev.ID)
+	}
+
+	// Failing query: status error with the server's message; no result set.
+	if err := writeMySQLPacket(client, 0, append([]byte{cmdQuery}, "SELECT * FROM nope"...)); err != nil {
+		t.Fatalf("write error query: %v", err)
+	}
+	if seq, resp, err := readMySQLPacket(client); err != nil || len(resp) == 0 || resp[0] != 0xff {
+		t.Fatalf("expected ERR packet, got seq=%d resp=% x err=%v", seq, resp, err)
+	}
+	// Unmarshal into a FRESH struct: absent omitempty fields (columns/rows
+	// on the error event) do NOT clear values left by the previous event.
+	ev = models.QueryEvent{}
+	if err := json.Unmarshal(recvEvent(t, userOut), &ev); err != nil {
+		t.Fatalf("unmarshal error event: %v", err)
+	}
+	if ev.StmtType != "select" {
+		t.Errorf("error event stmt_type = %q, want select", ev.StmtType)
+	}
+	if ev.Status != "error" {
+		t.Errorf("error event status = %q, want error", ev.Status)
+	}
+	if !strings.Contains(ev.Error, "doesn't exist") {
+		t.Errorf("error message = %q, want it to contain %q", ev.Error, "doesn't exist")
+	}
+	if len(ev.Columns) != 0 || len(ev.Rows) != 0 {
+		t.Errorf("error event must carry no result set, got columns=%q rows=%q", ev.Columns, ev.Rows)
+	}
+
+	// Teardown: client close must unblock both pipes; handleConn returns.
+	client.Close()
+	select {
+	case <-proxyDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleConn did not return within 5s of client close")
 	}
 }

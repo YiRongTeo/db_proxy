@@ -5,11 +5,25 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
+
+// mysqlSession tracks one established MySQL session: the pending (sniffed but
+// not yet answered) QueryEvent plus the capture of the backend's response.
+// It also serves as the Task 6.4 kill-registry entry: closer force-closes
+// both conns to tear the session down.
+type mysqlSession struct {
+	id      string
+	mu      sync.Mutex
+	pending *models.QueryEvent
+	capture *resultCapture
+	closer  func()
+}
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
 // session lifecycle: server handshake, client response, single-use token
@@ -24,10 +38,49 @@ type MySQLProxy struct {
 	vs       *store.ValkeyStore
 	creds    map[string]string
 	serverID atomic.Uint32 // per-session connection id for the handshake
+
+	mu       sync.Mutex
+	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
 }
 
 func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string) *MySQLProxy {
-	return &MySQLProxy{log: log, vs: vs, creds: creds}
+	return &MySQLProxy{
+		log:      log,
+		vs:       vs,
+		creds:    creds,
+		sessions: make(map[string]*mysqlSession),
+	}
+}
+
+// registerSession adds a session to the registry so it can be killed by id
+// (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself
+// lives here).
+func (p *MySQLProxy) registerSession(s *mysqlSession) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sessions[s.id] = s
+}
+
+// unregisterSession removes a finished session from the registry.
+func (p *MySQLProxy) unregisterSession(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.sessions, id)
+}
+
+// KillSession force-closes a registered session's client+backend conns.
+// Returns false when no session with that id is registered.
+func (p *MySQLProxy) KillSession(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	if s.closer != nil {
+		s.closer()
+	}
+	return true
 }
 
 // handleConn runs one MySQL session. The Dispatcher owns the accept loop and
@@ -99,6 +152,17 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err := writeMySQLPacket(client, 2, okPacket()); err != nil {
 		return
 	}
+	// Session established: create the per-session state (pending event +
+	// response capture + kill-registry entry) before the relay starts. The
+	// closer is the Task 6.4 kill hook — closing both conns forces both
+	// relay pipes to exit and the defers below to run.
+	s := &mysqlSession{
+		id:     "sid-" + newEventID(),
+		closer: func() { client.Close(); backend.Close() },
+	}
+	p.registerSession(s)
+	defer p.unregisterSession(s.id)
+	defer p.flushPendingOnClose(s)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
 		"db_type", tok.DBType, "client", clientAddr)
 
@@ -107,11 +171,11 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// the second done-slot is buffered so the survivor never blocks.
 	done := make(chan struct{}, 2)
 	go func() {
-		p.pipeClientToBackend(br, backend, tok, clientAddr)
+		p.pipeClientToBackend(br, backend, s, tok, clientAddr)
 		done <- struct{}{}
 	}()
 	go func() {
-		p.pipeBackendToClient(backend, client)
+		p.pipeBackendToClient(backend, client, s)
 		done <- struct{}{}
 	}()
 	<-done
