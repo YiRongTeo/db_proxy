@@ -2196,3 +2196,13 @@ Tests: unit — SSLRequest → 'S' when enabled / 'N' when disabled (exact bytes
 
 ## Phase 7 gate
 Both modes (plaintext default + TLS) verified; valkey direct + sentinel + SSL verified live; full suites green; RUN.md updated; amendment 10 compliance noted in ledger.
+
+## Task 7.7: Sentinel authentication (user directive 2026-08-12)
+
+Sentinel itself requires auth (sentinel.conf `requirepass`) — separate from the master's password. valkey-go v1.0.76 `SentinelOption{Username, Password, ClientName, ...}` carries sentinel-specific credentials; our current wiring sets only MasterSet + TLSConfig, and the single `opts.Password` goes to ClientOption.Password (data conns to the master). Add sentinel auth:
+
+1. internal/config: ValkeyConfig gains `SentinelUsername string` (default "") + `SentinelPassword string` (default ""), yaml `valkey.sentinel_username` / `valkey.sentinel_password`, env `ZT_VALKEY_SENTINEL_USERNAME` / `ZT_VALKEY_SENTINEL_PASSWORD` (viper convention — verify names with the loader probe pattern).
+2. internal/store: StoreOptions gains `SentinelUsername`, `SentinelPassword`; BuildClientOption wires them into `Sentinel: SentinelOption{MasterSet, TLSConfig, Username, Password}` (verify against v1.0.76 source that sentinel conns AUTH with these — sentinel.go). ClientOption.Password keeps serving the master/data conns.
+3. Tests: BuildClientOption wiring assertion (sentinel username/password land in SentinelOption; data password stays in ClientOption); LIVE: scripts/sentinel.conf gains `requirepass sentinelpw`; TestLiveSentinelRoundTrip updated to pass SentinelPassword: "sentinelpw" (round trip + pub/sub still pass); NEW negative assertion: connecting WITHOUT the sentinel password → error (AUTH failed) — proves the password is actually required.
+4. RUN.md §6: sentinel run line + config snippet show requirepass + sentinel_password; note master password stays under `password`.
+5. Full suite + ng test + build; commit; report.
