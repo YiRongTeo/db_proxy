@@ -16,9 +16,9 @@ const testAddr = "127.0.0.1:6379"
 
 func newTestStore(t *testing.T) *ValkeyStore {
 	t.Helper()
-	s, err := NewValkeyStore(context.Background(), testAddr, "", 0)
+	s, err := NewValkeyStoreDirect(context.Background(), testAddr, "", 0)
 	if err != nil {
-		t.Fatalf("NewValkeyStore(%q): %v", testAddr, err)
+		t.Fatalf("NewValkeyStoreDirect(%q): %v", testAddr, err)
 	}
 	t.Cleanup(s.Close)
 	return s

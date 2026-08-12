@@ -21,9 +21,9 @@ import (
 // requests exactly like a browser would.
 func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
 	t.Helper()
-	vs, err := store.NewValkeyStore(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
 	if err != nil {
-		t.Fatalf("NewValkeyStore: %v", err)
+		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{

@@ -73,9 +73,9 @@ func TestKillPublishesCtlKill(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	vs, err := store.NewValkeyStore(ctx, "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStoreDirect(ctx, "127.0.0.1:6379", "", 0)
 	if err != nil {
-		t.Fatalf("NewValkeyStore: %v", err)
+		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
 	defer vs.Close()
 
@@ -175,9 +175,9 @@ func TestTokenRequiresTicketID(t *testing.T) {
 
 	// The tok:<token> key must exist and carry the ticket_id round-trip.
 	ctx := context.Background()
-	vs, err := store.NewValkeyStore(ctx, "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStoreDirect(ctx, "127.0.0.1:6379", "", 0)
 	if err != nil {
-		t.Fatalf("NewValkeyStore: %v", err)
+		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
 	defer vs.Close()
 	p, err := vs.GetDeleteToken(ctx, issued.Token)

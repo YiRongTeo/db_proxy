@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,35 @@ import (
 	"zerotrust-proxy/internal/store"
 )
 
+// storeOptions maps the valkey config block onto store.StoreOptions: mode
+// "sentinel" uses SentinelAddrs + MasterName, anything else is direct against
+// Addr; valkey.ssl.enabled loads the TLS files once here (fail fast) with the
+// ServerName taken from the first address' host.
+func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
+	opts := store.StoreOptions{Password: vc.Password, DB: vc.DB}
+	if vc.Mode == "sentinel" {
+		opts.Addrs = vc.SentinelAddrs
+		opts.MasterName = vc.MasterName
+	} else {
+		opts.Addrs = []string{vc.Addr}
+	}
+	if !vc.SSL.Enabled {
+		return opts, nil
+	}
+	var serverName string
+	if len(opts.Addrs) > 0 {
+		if host, _, err := net.SplitHostPort(opts.Addrs[0]); err == nil {
+			serverName = host
+		}
+	}
+	tlsCfg, err := store.TLSFromFiles(vc.SSL.CAFile, vc.SSL.CertFile, vc.SSL.KeyFile, vc.SSL.SkipVerify, serverName)
+	if err != nil {
+		return opts, err
+	}
+	opts.TLS = tlsCfg
+	return opts, nil
+}
+
 func main() {
 	log := logging.New("control")
 	cfg, err := config.LoadControl("configs/control.yaml")
@@ -24,7 +54,12 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	vs, err := store.NewValkeyStore(ctx, cfg.Valkey.Addr, cfg.Valkey.Password, cfg.Valkey.DB)
+	opts, err := storeOptions(cfg.Valkey)
+	if err != nil {
+		log.Error("valkey tls", "err", err)
+		os.Exit(1)
+	}
+	vs, err := store.NewValkeyStore(ctx, opts)
 	if err != nil {
 		log.Error("valkey", "err", err)
 		os.Exit(1)
