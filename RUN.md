@@ -18,8 +18,9 @@ containers already exist (assumed up from Phase 0). The two `go run` boots + fir
 | git-bash (or WSL) on Windows | this guide's commands are bash-flavored |
 | Optional: PM2 (`npm i -g pm2`) | `pm2 --version` — only needed for the PM2 path (§5) |
 
-The three containers (`valkey`, `mysql-test`, `pg-test`) are the **only** external services. All
-commands below run from the repo root:
+The three containers (`valkey`, `mysql-test`, `pg-test`) are the **only** external services for the
+default plaintext posture. Phase 7 (TLS/sentinel, §6) adds two optional ones: `valkey-tls` and
+`valkey-sentinel`. All commands below run from the repo root:
 
 ```bash
 cd /d/AI/hermes/Project/Project-D        # Windows: cd D:\AI\hermes\Project\Project-D
@@ -227,7 +228,125 @@ Checker is **monitor-only** in v1 (live audit; no approval/kill). UI tokens can 
 
 ---
 
-## 6. Optional: PM2 (long-running ops)
+## 6. TLS mode & Valkey TLS / Sentinel (Phase 7 — optional)
+
+Everything above is the **default plaintext** posture (`tls.enabled: false` in `configs/*.yaml`).
+Phase 7 adds three independent TLS surfaces, each behind an explicit switch (absent/false =
+plaintext, exactly the defaults committed in `configs/`):
+
+| Surface | Switch (env / config key) | Default |
+|---|---|---|
+| Control Plane HTTPS (REST + WS + SPA) | `ZT_TLS_ENABLED` / `tls.enabled` (`configs/control.yaml`) | off |
+| Data Plane wire TLS (MySQL SSL + PG SSLRequest handshakes) | `ZT_TLS_ENABLED` / `tls.enabled` (`configs/data.yaml`) | off |
+| Valkey client TLS (tokens/sessions/PubSub) | `ZT_VALKEY_SSL_ENABLED` / `valkey.ssl.enabled` | off |
+
+> Both planes read the same env names because both configs use the same key paths. Enabling TLS
+> **requires** readable cert+key files — the plane fails fast at boot otherwise.
+
+### 6.1 Certificates (one-time)
+
+```bash
+bash scripts/gen-certs.sh   # idempotent; writes certs/control.{crt,key} + certs/data.{crt,key}
+```
+
+Self-signed rsa:2048, 365 days, `CN=127.0.0.1`, SAN `IP:127.0.0.1,DNS:localhost` (the cert doubles as
+its own CA). `configs/*.yaml` already point `tls.cert_file`/`tls.key_file` and `valkey.ssl.ca_file`
+at these files. Production must use real CA-signed certs.
+
+### 6.2 Valkey with TLS (`valkey-tls`, host port 6380)
+
+```bash
+docker run -d --name valkey-tls -p 6380:6380 \
+  -v D:/AI/hermes/Project/Project-D/certs:/certs:ro \
+  valkey/valkey:8-alpine valkey-server --port 0 --tls-port 6380 \
+  --tls-cert-file /certs/data.crt --tls-key-file /certs/data.key \
+  --tls-ca-cert-file /certs/data.crt --tls-auth-clients no
+docker exec valkey-tls valkey-cli --tls --cacert /certs/data.crt -p 6380 ping   # expect: PONG
+```
+
+### 6.3 Sentinel (`valkey-sentinel`, host port 26379)
+
+```bash
+docker run -d --name valkey-sentinel -p 26379:26379 \
+  -v D:/AI/hermes/Project/Project-D/scripts/sentinel.conf:/etc/sentinel.conf:ro \
+  valkey/valkey:8-alpine sh -c 'cp /etc/sentinel.conf /tmp/sentinel.conf && exec valkey-sentinel /tmp/sentinel.conf'
+docker exec valkey-sentinel valkey-cli -p 26379 sentinel get-master-addr-by-name mymaster
+# expect: 127.0.0.1 / 6379
+```
+
+> **Entrypoint workaround (verified 2026-08-12):** the valkey image's `valkey-sentinel` demands a
+> **writable** config file, so a read-only `/etc/sentinel.conf` mount alone fails at boot. The
+> `sh -c` wrapper copies it to `/tmp` first, then execs the real sentinel.
+>
+> `scripts/sentinel.conf` monitors the **plaintext** master `127.0.0.1:6379` (sentinel TLS is
+> optional in dev; the client→sentinel and client→master paths carry TLS). Dev caveat: from inside
+> the container that address is its own loopback, so the sentinel may report the master
+> `s_down,o_down` — cosmetic here; `get-master-addr-by-name` still returns the configured
+> `127.0.0.1:6379` (host-reachable) and the store's sentinel live tests pass.
+
+### 6.4 Planes in TLS mode (HTTPS + wire TLS + TLS Valkey)
+
+```bash
+cd /d/AI/hermes/Project/Project-D
+# control plane — HTTPS listener + TLS Valkey store + API key (optional)
+ZT_TLS_ENABLED=true ZT_VALKEY_SSL_ENABLED=true ZT_VALKEY_ADDR=127.0.0.1:6380 \
+ZT_VALKEY_SSL_CA_FILE=certs/data.crt ZT_API_API_KEY='dev-key-change-me' go run ./cmd/control
+# data plane — wire TLS on :3306 + TLS Valkey store
+ZT_TLS_ENABLED=true ZT_VALKEY_SSL_ENABLED=true ZT_VALKEY_ADDR=127.0.0.1:6380 \
+ZT_VALKEY_SSL_CA_FILE=certs/data.crt go run ./cmd/data
+```
+
+Readiness is now **HTTPS** (`-k` = self-signed dev cert):
+
+```bash
+curl -sk https://127.0.0.1:8080/api/health      # expect: {"status":"ok","valkey":"up"}
+```
+
+Sentinel store mode instead of direct TLS Valkey (planes resolve the master through the sentinel;
+`valkey.ssl.*` still applies to the client→master leg):
+
+```bash
+ZT_VALKEY_MODE=sentinel ZT_VALKEY_MASTER_NAME=mymaster \
+ZT_VALKEY_SENTINEL_ADDRS='["127.0.0.1:26379"]' go run ./cmd/control
+```
+
+### 6.5 Clients with TLS flags (verified 2026-08-12 gate)
+
+```bash
+# token over HTTPS — same payloads as §3 (API-key or session-cookie flavor)
+TOKEN=$(curl -sk -X POST https://127.0.0.1:8080/api/token \
+  -H "X-Api-Key: dev-ke...-me" -H 'Content-Type: application/json' \
+  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+# MySQL wire TLS — REQUIRED hard-fails if the proxy did not negotiate TLS
+docker exec mysql-test mysql -h host.docker.internal -P 3306 -u "$TOKEN" -pany \
+  --ssl-mode=REQUIRED appdb -e "SELECT id,name FROM demo_items"
+
+# PostgreSQL wire TLS — sslmode=require must be INSIDE the conninfo string;
+# a bare trailing "sslmode=require" argument is IGNORED by psql (verified 2026-08-12)
+docker exec pg-test psql "host=host.docker.internal port=3306 user=$TOKEN dbname=appdb sslmode=require" \
+  -c "SELECT id,name FROM demo_items"
+
+# kill E2E over HTTPS (session-cookie flavor; 202 = queued, data plane force-closes)
+curl -sk -b /tmp/zt.jar -X POST https://127.0.0.1:8080/api/kill \
+  -H 'Content-Type: application/json' -d '{"session_id":"sid-..."}'   # expect: 202 {"killed":"queued"}
+```
+
+Checker WS in TLS mode is `wss://127.0.0.1:8080/ws/checker?channel=*` — Node ≥ 22 global WebSocket
+with `NODE_TLS_REJECT_UNAUTHORIZED=0` (self-signed cert) plus the session cookie header
+(`new WebSocket(url, { headers: { Cookie: 'zt_session=...' } })`).
+
+### 6.6 Env override notes (verified live, 2026-08-12)
+
+- `api.api_key` maps to **`ZT_API_API_KEY`** (viper: `ZT_` prefix + dots→underscores) — **NOT**
+  `ZT_API_KEY`. Setting only `ZT_API_KEY` is silently ignored and `/api/token` stays key-disabled
+  (401); the stale `# set via ZT_API_KEY` comment in `configs/control.yaml` predates this finding.
+- Sentinel mode overrides `valkey.addr` (direct mode); both modes share the `valkey.ssl.*` block.
+
+---
+
+## 7. Optional: PM2 (long-running ops)
 
 ```bash
 cd /d/AI/hermes/Project/Project-D
@@ -239,7 +358,7 @@ pm2 restart zt-data                # e.g. after config change
 
 ---
 
-## 7. Shutdown (reverse order) + port hygiene
+## 8. Shutdown (reverse order) + port hygiene
 
 ```bash
 # 1. stop the data plane first (Ctrl-C in its terminal), then the control plane (Ctrl-C)
@@ -262,7 +381,7 @@ PID=$(netstat -ano | grep -E ':3306\s.*LISTEN' | awk '{print $NF}' | head -1)
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -275,7 +394,7 @@ PID=$(netstat -ano | grep -E ':3306\s.*LISTEN' | awk '{print $NF}' | head -1)
 
 ---
 
-## 9. Verified timings (Task 5.4 gate, 2026-08-11)
+## 10. Verified timings (Task 5.4 gate, 2026-08-11)
 
 Measured from a fresh terminal with the three containers already up (Phase 0 state):
 

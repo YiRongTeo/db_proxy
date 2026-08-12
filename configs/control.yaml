@@ -2,7 +2,7 @@ http:
   addr: ":8080"
   static_dir: "./web/dist/web/browser"
 api:
-  api_key: ""                 # empty → external /api/token disabled; set via ZT_API_KEY
+  api_key: ""                 # empty → external /api/token disabled; set via ZT_API_API_KEY (viper maps api.api_key → ZT_API_API_KEY, NOT ZT_API_KEY)
   token_ttl_seconds: 300
   data_plane_host: "127.0.0.1"
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL)

@@ -9,12 +9,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/valkey-io/valkey-go"
 
 	"zerotrust-proxy/internal/models"
 )
@@ -260,7 +263,8 @@ func TestLiveSentinelRoundTrip(t *testing.T) {
 	}
 	defer s.Close()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	token := uniqueToken(t)
 	cleanupKey(t, s, "tok:"+token)
 	want := models.TokenPayload{Username: "sentinel-user", TicketID: "T-S1"}
@@ -273,5 +277,47 @@ func TestLiveSentinelRoundTrip(t *testing.T) {
 	}
 	if got == nil || *got != want {
 		t.Fatalf("round trip via sentinel: got %+v, want %+v", got, want)
+	}
+
+	// Pub/Sub through the sentinel path: subscribe to a fresh channel on the
+	// discovered master, publish after the subscription is confirmed, and
+	// expect the exact bytes back (gate 7.6 requires subscribe/publish via
+	// the sentinel-discovered connection, not just key round trips).
+	acked := make(chan struct{}, 1)
+	channel := "queries:gate-sentinel-" + uniqueToken(t)
+	subCtx := valkey.WithOnSubscriptionHook(ctx, func(valkey.PubSubSubscription) {
+		select {
+		case acked <- struct{}{}:
+		default:
+		}
+	})
+	out := make(chan []byte, 4)
+	subErr := make(chan error, 1)
+	go func() { subErr <- s.Subscribe(subCtx, channel, false, out) }()
+	select {
+	case <-acked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sentinel-path subscription not confirmed within 5s")
+	}
+	msg := []byte(`{"via":"sentinel","id":1}`)
+	if err := s.Publish(ctx, channel, msg); err != nil {
+		t.Fatalf("Publish via sentinel: %v", err)
+	}
+	select {
+	case gotMsg := <-out:
+		if string(gotMsg) != string(msg) {
+			t.Fatalf("pubsub via sentinel: got %q, want %q", gotMsg, msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pubsub message via sentinel")
+	}
+	cancel()
+	select {
+	case err := <-subErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Subscribe via sentinel returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe via sentinel did not return within 5s of cancel")
 	}
 }
