@@ -179,6 +179,17 @@ func LoadControl(path string) (*ControlConfig, error) {
 	return cfg, nil
 }
 
+// CredentialsAPIConfig is the optional vault block for api-mode credential
+// resolution (Task 8.7): the Data Plane fetches the backend DB password from
+// this API per connect instead of the committed credentials list. The
+// password is NEVER stored or logged — it exists in memory only for the
+// in-flight connect call.
+type CredentialsAPIConfig struct {
+	URL            string `mapstructure:"url"`
+	APIKey         string `mapstructure:"api_key"`
+	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
+}
+
 // DataConfig mirrors configs/data.yaml.
 type DataConfig struct {
 	ListenAddr    string
@@ -186,12 +197,27 @@ type DataConfig struct {
 	MaxConns      int
 	TLS           *CertConfig
 	Valkey        ValkeyConfig
-	// Credentials maps a backend identity key (e.g. "127.0.0.1:3307:ro_user")
-	// to its password. The Data Plane owns DB credentials (zero-trust).
+	// CredentialsSource selects where the backend DB password comes from:
+	// "config" (default — the committed credentials list below) or "api"
+	// (per-connect fetch from CredentialsAPI; Task 8.7).
+	CredentialsSource string
+	// CredentialsAPI is the vault endpoint used when CredentialsSource is
+	// "api". Load fails fast when source=api and URL is empty.
+	CredentialsAPI *CredentialsAPIConfig
+	// Credentials maps a backend identity key (e.g. "mysql:ro_user@127.0.0.1:3307")
+	// to its password. Used only in config mode. The Data Plane owns DB
+	// credentials (zero-trust).
 	Credentials map[string]string
 }
 
 // LoadData reads the Data Plane config (configs/data.yaml).
+//
+// Task 8.7: credentials_source defaults to "config" (committed credentials
+// list); "api" switches to per-connect password fetches from
+// credentials_api.url (vault contract: GET ?db_type&db_user&db_ip&db_port
+// with X-Api-Key → {"password"}). Fail-fast: source=api with an empty URL is
+// a load error — a data plane that cannot resolve passwords must never
+// start silently.
 func LoadData(path string) (*DataConfig, error) {
 	v := viper.New()
 	if err := load(v, path, map[string]any{
@@ -199,6 +225,9 @@ func LoadData(path string) (*DataConfig, error) {
 		"listen.max_conns": 100,
 		"valkey.addr":      "127.0.0.1:6379",
 		"valkey.mode":      "direct",
+		// Task 8.7 credential-source defaults: config mode, vault timeout 5s.
+		"credentials_source":              "config",
+		"credentials_api.timeout_seconds": 5,
 	}); err != nil {
 		return nil, err
 	}
@@ -206,13 +235,30 @@ func LoadData(path string) (*DataConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	source := v.GetString("credentials_source")
+	if source != "config" && source != "api" {
+		return nil, fmt.Errorf("credentials_source must be \"config\" or \"api\", got %q", source)
+	}
+	var apiCfg *CredentialsAPIConfig
+	if source == "api" {
+		apiCfg = &CredentialsAPIConfig{
+			URL:            v.GetString("credentials_api.url"),
+			APIKey:         v.GetString("credentials_api.api_key"),
+			TimeoutSeconds: v.GetInt("credentials_api.timeout_seconds"),
+		}
+		if apiCfg.URL == "" {
+			return nil, fmt.Errorf("credentials_source=api requires credentials_api.url")
+		}
+	}
 	cfg := &DataConfig{
-		ListenAddr:    v.GetString("listen.addr"),
-		DetectDelayMS: v.GetInt("listen.detect_delay_ms"),
-		MaxConns:      v.GetInt("listen.max_conns"),
-		TLS:           tlsCfg,
-		Valkey:        readValkey(v),
-		Credentials:   map[string]string{},
+		ListenAddr:        v.GetString("listen.addr"),
+		DetectDelayMS:     v.GetInt("listen.detect_delay_ms"),
+		MaxConns:          v.GetInt("listen.max_conns"),
+		TLS:               tlsCfg,
+		Valkey:            readValkey(v),
+		CredentialsSource: source,
+		CredentialsAPI:    apiCfg,
+		Credentials:       map[string]string{},
 	}
 	var creds []struct {
 		Key      string `mapstructure:"key"`

@@ -246,7 +246,7 @@ func TestSessionCapturePublish(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:test-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-6-2", DBUser: "ro_user"}
 
@@ -294,7 +294,7 @@ func TestSessionCapturePublish(t *testing.T) {
 // TestSessionRegistryKill: register/unregister + KillSession invokes the
 // closer (the Task 6.4 kill hook) exactly for registered sessions.
 func TestSessionRegistryKill(t *testing.T) {
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	killed := false
 	s := &mysqlSession{id: "sid-test", closer: func() { killed = true }}
 	p.registerSession(s)

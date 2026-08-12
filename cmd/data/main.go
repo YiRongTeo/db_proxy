@@ -47,6 +47,25 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 	return opts, nil
 }
 
+// buildCredResolver constructs the backend-password resolver from the data
+// config (Task 8.7): credentials_source "config" wraps the committed
+// credentials list in a ConfigCredResolver (pre-8.7 behavior); "api" builds
+// an APICredResolver against credentials_api (vault contract: GET
+// ?db_type&db_user&db_ip&db_port with X-Api-Key → {"password"}). The
+// config layer already fail-fasts on source=api with an empty URL; the
+// constructor fail-fasts here on a malformed URL. The password is never
+// stored or logged — it exists in memory only for each in-flight connect.
+func buildCredResolver(cfg *config.DataConfig) (proxy.CredResolver, error) {
+	if cfg.CredentialsSource == "api" {
+		return proxy.NewAPICredResolver(
+			cfg.CredentialsAPI.URL,
+			cfg.CredentialsAPI.APIKey,
+			time.Duration(cfg.CredentialsAPI.TimeoutSeconds)*time.Second,
+		)
+	}
+	return &proxy.ConfigCredResolver{Creds: cfg.Credentials}, nil
+}
+
 func main() {
 	log := logging.New("data")
 	cfg, err := config.LoadData("configs/data.yaml")
@@ -91,8 +110,16 @@ func main() {
 		}
 		dataTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
-	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials, dataTLS)
-	pgProxy := proxy.NewPGProxy(log, vs, cfg.Credentials, dataTLS)
+	// Task 8.7: the backend-password source is a CredResolver — config list
+	// (default) or per-connect credential API. The password is never stored
+	// or logged.
+	credResolver, err := buildCredResolver(cfg)
+	if err != nil {
+		log.Error("credentials", "err", err)
+		os.Exit(1)
+	}
+	mysqlProxy := proxy.NewMySQLProxy(log, vs, credResolver, dataTLS)
+	pgProxy := proxy.NewPGProxy(log, vs, credResolver, dataTLS)
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,

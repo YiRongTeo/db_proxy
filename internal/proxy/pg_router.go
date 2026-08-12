@@ -103,10 +103,10 @@ const defaultPGDatabase = "appdb"
 // pgx's default is unbounded, and a backend that accepts but never speaks
 // would pin the session goroutine, the client connection and the consumed
 // token forever — same failure mode Task 3.8 bounded on the MySQL side.
-func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string, dbName string) (*pgFrontend, error) {
-	pw, ok := creds[backendKey(t)]
-	if !ok {
-		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
+func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, res CredResolver, dbName string) (*pgFrontend, error) {
+	pw, err := res.Password(ctx, backendKey(t))
+	if err != nil {
+		return nil, err
 	}
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable connect_timeout=10",
 		t.DBIP, t.DBPort, t.DBUser, pw)

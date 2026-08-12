@@ -37,7 +37,7 @@ func startGatingProxy(t *testing.T, vs *store.ValkeyStore, creds map[string]stri
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	p := NewMySQLProxy(logger, vs, creds, nil)
+	p := NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -52,8 +52,8 @@ func startGatingProxy(t *testing.T, vs *store.ValkeyStore, creds map[string]stri
 
 // gatingCreds cover both MySQL backend users used by the live gating tests.
 var gatingCreds = map[string]string{
-	"127.0.0.1:3307:rw_user": "rw_pw",
-	"127.0.0.1:3307:ro_user": "ro_pw",
+	"mysql:rw_user@127.0.0.1:3307": "rw_pw",
+	"mysql:ro_user@127.0.0.1:3307": "ro_pw",
 }
 
 // cleanupMarkerRow registers a deferred, best-effort DELETE of the marker row
@@ -234,7 +234,7 @@ func TestMySQLWriteGateDecision(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), watchedSid) })
 
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 
 	// watched write session → allowed for every gated command.
 	for _, cmd := range []byte{cmdQuery, cmdPrepare, cmdExecute} {
@@ -266,7 +266,7 @@ func TestMySQLWriteGateDecision(t *testing.T) {
 	}
 	// Store error → FAIL CLOSED: the command is blocked like an absent watcher.
 	dead := newDeadStore(t)
-	pe := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), dead, nil, nil)
+	pe := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), dead, &ConfigCredResolver{}, nil)
 	se := &mysqlSession{id: "sid-gate-unit-error", access: "write"}
 	if msg := pe.checkWriteGate(se, cmdQuery); msg == "" {
 		t.Error("store error: allowed, want fail-closed block")
@@ -310,7 +310,7 @@ func TestPGWriteGateDecision(t *testing.T) {
 	var out bytes.Buffer
 	be := pgproto3.NewBackend(pgproto3.NewChunkReader(&out), &out)
 	front := pgproto3.NewFrontend(pgproto3.NewChunkReader(&out), io.Discard)
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 
 	// Watched write session → allowed (nothing sent to the client).
 	s := &pgSession{id: watchedSid, access: "write"}

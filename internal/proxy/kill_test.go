@@ -28,7 +28,7 @@ import (
 // false. The 6.2 registry test asserts the closer is invoked; this one pins
 // the closer semantics on real conns.
 func TestSessionRegistryKillClosesBothConns(t *testing.T) {
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 
 	client, clientPeer := net.Pipe()
 	backend, backendPeer := net.Pipe()
@@ -66,7 +66,7 @@ func TestSessionRegistryKillClosesBothConns(t *testing.T) {
 // TestPGProxySessionRegistryKillClosesBothConns mirrors the MySQL test for the
 // PG registry (same closer semantics: client + backend).
 func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 
 	client, clientPeer := net.Pipe()
 	backend, backendPeer := net.Pipe()
@@ -96,8 +96,8 @@ func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
 // belongs to. Killing one plane's session must leave the other plane's
 // sessions untouched.
 func TestKillerKillsOnEitherPlane(t *testing.T) {
-	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
-	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
+	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	k := NewKiller(mysql, pg)
 
 	mc, mcPeer := net.Pipe()
@@ -157,7 +157,7 @@ func startKillTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffe
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewMySQLProxy(logger, vs, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}, nil)
+	p := NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"}}, nil)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -543,7 +543,7 @@ func TestHandleKillPayloadParse(t *testing.T) {
 // panicking.
 func TestMySQLKillQueryUnknownAndNoThreadID(t *testing.T) {
 	var logBuf bytes.Buffer
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(&logBuf, nil)), nil, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(&logBuf, nil)), nil, &ConfigCredResolver{}, nil)
 
 	client, _ := net.Pipe()
 	backend, _ := net.Pipe()
@@ -592,7 +592,7 @@ func TestMySQLKillQueryUnknownAndNoThreadID(t *testing.T) {
 // never invoked).
 func TestPGKillQueryUnknownAndNoThreadID(t *testing.T) {
 	var logBuf bytes.Buffer
-	p := NewPGProxy(slog.New(slog.NewTextHandler(&logBuf, nil)), nil, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(&logBuf, nil)), nil, &ConfigCredResolver{}, nil)
 
 	closed := false
 	p.registerSession(&pgSession{id: "sid-kq-pg", threadID: 0, closer: func() { closed = true }})
@@ -617,8 +617,8 @@ func TestPGKillQueryUnknownAndNoThreadID(t *testing.T) {
 // while the other plane logs nothing; an unknown id logs nothing anywhere.
 func TestKillerKillQueryFanOut(t *testing.T) {
 	var mysqlLog, pgLog bytes.Buffer
-	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(&mysqlLog, nil)), nil, nil, nil)
-	pg := NewPGProxy(slog.New(slog.NewTextHandler(&pgLog, nil)), nil, nil, nil)
+	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(&mysqlLog, nil)), nil, &ConfigCredResolver{}, nil)
+	pg := NewPGProxy(slog.New(slog.NewTextHandler(&pgLog, nil)), nil, &ConfigCredResolver{}, nil)
 	k := NewKiller(mysql, pg)
 
 	pg.registerSession(&pgSession{id: "sid-pg", threadID: 0})
@@ -745,7 +745,7 @@ func startKillTestProxyAny(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Bu
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewMySQLProxy(logger, vs, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}, nil)
+	p := NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"}}, nil)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -769,7 +769,7 @@ func startPGKillTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buf
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewPGProxy(logger, vs, pgLiveCreds, nil)
+	p := NewPGProxy(logger, vs, &ConfigCredResolver{Creds: pgLiveCreds}, nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -821,7 +821,7 @@ func TestMySQLKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil))
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil))
 	killOut := startKillSwitch(t, vs, k)
 
 	clientA, sidA := killTestConnect(t, ln, tokenA, outA)
@@ -1009,7 +1009,7 @@ func TestMySQLKillConnectionLive(t *testing.T) {
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxyAny(t, vs, &logBuf)
 	addr := killTestAddr(ln)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil))
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil))
 	killOut := startKillSwitch(t, vs, k)
 
 	// Bystander B: connects and round-trips BEFORE the kill.
@@ -1111,7 +1111,7 @@ func TestPGKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p, done := startPGKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil), p)
+	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), p)
 	killOut := startKillSwitch(t, vs, k)
 
 	token := pgLiveToken(t, vs)

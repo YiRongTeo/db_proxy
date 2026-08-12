@@ -46,7 +46,7 @@ type mysqlSession struct {
 type MySQLProxy struct {
 	log      *slog.Logger
 	vs       *store.ValkeyStore
-	creds    map[string]string
+	creds    CredResolver  // backend password source: config list or credential API (Task 8.7)
 	tlsCfg   *tls.Config   // non-nil → CLIENT_SSL advertised + SSLRequest upgraded (Task 7.4); nil = plaintext
 	serverID atomic.Uint32 // per-session connection id for the handshake
 
@@ -57,8 +57,10 @@ type MySQLProxy struct {
 // NewMySQLProxy builds a MySQL session handler. tlsCfg nil keeps the
 // plaintext wire path (byte-identical to before TLS existed); non-nil makes
 // the server advertise CLIENT_SSL and answer an SSLRequest with a TLS
-// handshake before auth (client-side TLS, data plane listener).
-func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string, tlsCfg *tls.Config) *MySQLProxy {
+// handshake before auth (client-side TLS, data plane listener). creds
+// resolves the backend DB password per connect (Task 8.7: config list or
+// credential API — the password is never stored or logged).
+func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
 		log:      log,
 		vs:       vs,

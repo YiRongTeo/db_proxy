@@ -164,6 +164,12 @@ func TestLoadData(t *testing.T) {
 	if got := cfg.MaxConns; got != 100 {
 		t.Errorf("MaxConns = %d, want 100", got)
 	}
+	if got := cfg.CredentialsSource; got != "config" {
+		t.Errorf("CredentialsSource = %q, want %q (default)", got, "config")
+	}
+	if cfg.CredentialsAPI != nil {
+		t.Errorf("CredentialsAPI = %+v, want nil (config mode)", cfg.CredentialsAPI)
+	}
 	if got := cfg.Valkey.Mode; got != "direct" {
 		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
@@ -177,9 +183,9 @@ func TestLoadData(t *testing.T) {
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	wantCreds := map[string]string{
-		"127.0.0.1:3307:ro_user": "ro_pw",
-		"127.0.0.1:3307:rw_user": "rw_pw",
-		"127.0.0.1:5433:ro_user": "ro_pw",
+		"mysql:ro_user@127.0.0.1:3307":    "ro_pw",
+		"mysql:rw_user@127.0.0.1:3307":    "rw_pw",
+		"postgres:ro_user@127.0.0.1:5433": "ro_pw",
 	}
 	if got := len(cfg.Credentials); got != len(wantCreds) {
 		t.Fatalf("len(Credentials) = %d, want %d", got, len(wantCreds))
@@ -522,5 +528,126 @@ tls:
 	}
 	if got := cfg.TLS.KeyFile; got != filepath.ToSlash(keyPath) {
 		t.Errorf("TLS.KeyFile = %q, want %q", got, filepath.ToSlash(keyPath))
+	}
+}
+
+// --- Task 8.7: credential source (config vs api) ---------------------------
+
+// TestCredentialsSourceAPIMode: credentials_source: api parses the
+// credentials_api block (url/api_key/timeout_seconds) and the committed
+// credentials list is untouched.
+func TestCredentialsSourceAPIMode(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "http://vault:9000/creds"
+  api_key: "k-123"
+  timeout_seconds: 7
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	if got := cfg.CredentialsSource; got != "api" {
+		t.Errorf("CredentialsSource = %q, want %q", got, "api")
+	}
+	if cfg.CredentialsAPI == nil {
+		t.Fatal("CredentialsAPI = nil, want populated block")
+	}
+	if got := cfg.CredentialsAPI.URL; got != "http://vault:9000/creds" {
+		t.Errorf("CredentialsAPI.URL = %q, want %q", got, "http://vault:9000/creds")
+	}
+	if got := cfg.CredentialsAPI.APIKey; got != "k-123" {
+		t.Errorf("CredentialsAPI.APIKey = %q, want %q", got, "k-123")
+	}
+	if got := cfg.CredentialsAPI.TimeoutSeconds; got != 7 {
+		t.Errorf("CredentialsAPI.TimeoutSeconds = %d, want 7", got)
+	}
+}
+
+// TestCredentialsSourceAPIDefaults: api mode with only a url gets the 5s
+// timeout default and an empty api key.
+func TestCredentialsSourceAPIDefaults(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "http://vault:9000/creds"
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	if got := cfg.CredentialsAPI.TimeoutSeconds; got != 5 {
+		t.Errorf("CredentialsAPI.TimeoutSeconds = %d, want default 5", got)
+	}
+	if got := cfg.CredentialsAPI.APIKey; got != "" {
+		t.Errorf("CredentialsAPI.APIKey = %q, want empty default", got)
+	}
+}
+
+// TestCredentialsSourceAPIMissingURLFailsFast: source=api with no URL is a
+// load ERROR — a data plane that cannot resolve passwords must never start
+// silently.
+func TestCredentialsSourceAPIMissingURLFailsFast(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+`)
+	_, err := LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for source=api without credentials_api.url, got nil")
+	}
+	if !strings.Contains(err.Error(), "credentials_api.url") {
+		t.Errorf("error %q missing the credentials_api.url hint", err.Error())
+	}
+}
+
+// TestCredentialsSourceUnknownFailsFast: an unknown source value is a load
+// error, not a silent fallback to config mode.
+func TestCredentialsSourceUnknownFailsFast(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: bogus
+`)
+	_, err := LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for unknown credentials_source, got nil")
+	}
+	if !strings.Contains(err.Error(), "credentials_source") {
+		t.Errorf("error %q missing the credentials_source hint", err.Error())
+	}
+}
+
+// TestCredentialsSourceEnvOverride: ZT_CREDENTIALS_SOURCE + the
+// credentials_api.* env names override the file, per the viper convention
+// (prefix ZT_, dots → underscores). Note the canonical viper mapping for
+// credentials_api.api_key is ZT_CREDENTIALS_API_API_KEY (the dot becomes an
+// underscore, so the key segment's own underscore survives).
+func TestCredentialsSourceEnvOverride(t *testing.T) {
+	t.Setenv("ZT_CREDENTIALS_SOURCE", "api")
+	t.Setenv("ZT_CREDENTIALS_API_URL", "http://vault-env:9000/creds")
+	t.Setenv("ZT_CREDENTIALS_API_API_KEY", "env-key")
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	if got := cfg.CredentialsSource; got != "api" {
+		t.Errorf("CredentialsSource = %q, want %q (ZT_CREDENTIALS_SOURCE)", got, "api")
+	}
+	if got := cfg.CredentialsAPI.URL; got != "http://vault-env:9000/creds" {
+		t.Errorf("CredentialsAPI.URL = %q, want %q (ZT_CREDENTIALS_API_URL)", got, "http://vault-env:9000/creds")
+	}
+	if got := cfg.CredentialsAPI.APIKey; got != "env-key" {
+		t.Errorf("CredentialsAPI.APIKey = %q, want %q (ZT_CREDENTIALS_API_API_KEY)", got, "env-key")
 	}
 }

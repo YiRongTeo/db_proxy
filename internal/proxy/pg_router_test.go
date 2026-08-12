@@ -12,18 +12,18 @@ import (
 	"zerotrust-proxy/internal/models"
 )
 
-// The credential-key format ("<ip>:<port>:<db_user>") is shared with the
+// The credential-key format ("<dbtype>:<db_user>@<db_ip>:<db_port>") is shared with the
 // MySQL backend and already covered by TestBackendKeyFormat
 // (mysql_router_test.go); the PG missing-creds test below exercises the same
 // backendKey lookup through the PG code path.
 
 func TestConnectPostgresBackendMissingCreds(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
-	_, err := connectPostgresBackend(context.Background(), tok, map[string]string{}, "appdb")
+	tok := &models.TokenPayload{DBType: "postgres", DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
+	_, err := connectPostgresBackend(context.Background(), tok, &ConfigCredResolver{}, "appdb")
 	if err == nil {
 		t.Fatal("expected error for missing credential key")
 	}
-	if !strings.Contains(err.Error(), "no credentials for 127.0.0.1:5433:ro_user") {
+	if !strings.Contains(err.Error(), "no credentials for postgres:ro_user@127.0.0.1:5433") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -36,10 +36,10 @@ func TestConnectPostgresBackendMissingCreds(t *testing.T) {
 // exchange byte-for-byte (any leftover buffered bytes would corrupt the very
 // first frame read back).
 func TestConnectPostgresBackendLiveRoundTrip(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
-	creds := map[string]string{"127.0.0.1:5433:ro_user": "ro_pw"}
+	tok := &models.TokenPayload{DBType: "postgres", DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
+	creds := map[string]string{"postgres:ro_user@127.0.0.1:5433": "ro_pw"}
 
-	f, err := connectPostgresBackend(context.Background(), tok, creds, "appdb")
+	f, err := connectPostgresBackend(context.Background(), tok, &ConfigCredResolver{Creds: creds}, "appdb")
 	if err != nil {
 		t.Fatalf("connectPostgresBackend: %v", err)
 	}
@@ -85,10 +85,10 @@ func TestConnectPostgresBackendLiveRoundTrip(t *testing.T) {
 // 4.2 hardcode is gone): connecting with dbName "postgres" must yield a
 // session whose current_database() is "postgres", not appdb.
 func TestConnectPostgresBackendForwardsDatabase(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
-	creds := map[string]string{"127.0.0.1:5433:ro_user": "ro_pw"}
+	tok := &models.TokenPayload{DBType: "postgres", DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
+	creds := map[string]string{"postgres:ro_user@127.0.0.1:5433": "ro_pw"}
 
-	f, err := connectPostgresBackend(context.Background(), tok, creds, "postgres")
+	f, err := connectPostgresBackend(context.Background(), tok, &ConfigCredResolver{Creds: creds}, "postgres")
 	if err != nil {
 		t.Fatalf("connectPostgresBackend: %v", err)
 	}
@@ -108,9 +108,9 @@ func TestConnectPostgresBackendForwardsDatabase(t *testing.T) {
 }
 
 func TestConnectPostgresBackendWrongPassword(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
-	creds := map[string]string{"127.0.0.1:5433:ro_user": "definitely-wrong-pw"}
-	if _, err := connectPostgresBackend(context.Background(), tok, creds, "appdb"); err == nil {
+	tok := &models.TokenPayload{DBType: "postgres", DBIP: "127.0.0.1", DBPort: "5433", DBUser: "ro_user"}
+	creds := map[string]string{"postgres:ro_user@127.0.0.1:5433": "definitely-wrong-pw"}
+	if _, err := connectPostgresBackend(context.Background(), tok, &ConfigCredResolver{Creds: creds}, "appdb"); err == nil {
 		t.Fatal("expected auth error for wrong password")
 	}
 }

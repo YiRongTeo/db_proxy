@@ -130,7 +130,7 @@ func startEdgeDispatcher(t *testing.T, vs *store.ValkeyStore, creds map[string]s
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logW, nil))
-	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, creds, nil), &PGProxy{}, 100*time.Millisecond, 64)
+	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil), &PGProxy{}, 100*time.Millisecond, 64)
 	go d.Serve(ln, context.Background())
 	return ln
 }
@@ -335,7 +335,7 @@ func TestEdgeCOMQuitClosesSessionCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split backend addr: %v", err)
 	}
-	creds := map[string]string{fmt.Sprintf("127.0.0.1:%s:ro_user", port): "ro_pw"}
+	creds := map[string]string{fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", port): "ro_pw"}
 
 	var logBuf bytes.Buffer
 	ln := startEdgeDispatcher(t, vs, creds, &logBuf)
@@ -414,7 +414,7 @@ func TestEdgeOversizedLengthClaimFailsGracefully(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split backend addr: %v", err)
 	}
-	creds := map[string]string{fmt.Sprintf("127.0.0.1:%s:ro_user", port): "ro_pw"}
+	creds := map[string]string{fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", port): "ro_pw"}
 	ln := startEdgeDispatcher(t, vs, creds, io.Discard)
 	baseline := proxyGoroutines()
 
@@ -493,8 +493,8 @@ func TestEdgeStallingBackendConnectIsBounded(t *testing.T) {
 		t.Fatalf("split stalling backend addr: %v", err)
 	}
 	creds := map[string]string{
-		fmt.Sprintf("127.0.0.1:%s:ro_user", stallPort):   "ro_pw",
-		fmt.Sprintf("127.0.0.1:%s:ro_user", healthyPort): "ro_pw",
+		fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", stallPort):   "ro_pw",
+		fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", healthyPort): "ro_pw",
 	}
 	ln := startEdgeDispatcher(t, vs, creds, io.Discard)
 	baseline := proxyGoroutines()
@@ -562,7 +562,7 @@ func TestEdgeGarbageFirstPacketDoesNotKillDispatcher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split backend addr: %v", err)
 	}
-	creds := map[string]string{fmt.Sprintf("127.0.0.1:%s:ro_user", port): "ro_pw"}
+	creds := map[string]string{fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", port): "ro_pw"}
 	ln := startEdgeDispatcher(t, vs, creds, io.Discard)
 	baseline := proxyGoroutines()
 
@@ -614,7 +614,7 @@ func TestEdgeConcurrentLiveSessions(t *testing.T) {
 	vs := proxyTestStore(t)
 
 	// Live backend credentials (same as the Task 3.7 integration test).
-	creds := map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}
+	creds := map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"}
 	ln := startEdgeDispatcher(t, vs, creds, io.Discard)
 	baseline := proxyGoroutines()
 

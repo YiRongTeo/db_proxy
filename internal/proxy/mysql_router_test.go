@@ -10,19 +10,19 @@ import (
 )
 
 func TestBackendKeyFormat(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
-	if got := backendKey(tok); got != "127.0.0.1:3307:ro_user" {
-		t.Fatalf("backendKey() = %q, want %q", got, "127.0.0.1:3307:ro_user")
+	tok := &models.TokenPayload{DBType: "mysql", DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
+	if got := backendKey(tok); got != "mysql:ro_user@127.0.0.1:3307" {
+		t.Fatalf("backendKey() = %q, want %q", got, "mysql:ro_user@127.0.0.1:3307")
 	}
 }
 
 func TestConnectMySQLBackendMissingCreds(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
-	_, err := connectMySQLBackend(context.Background(), tok, map[string]string{}, "")
+	tok := &models.TokenPayload{DBType: "mysql", DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
+	_, err := connectMySQLBackend(context.Background(), tok, &ConfigCredResolver{}, "")
 	if err == nil {
 		t.Fatal("expected error for missing credential key")
 	}
-	if !strings.Contains(err.Error(), "no credentials for 127.0.0.1:3307:ro_user") {
+	if !strings.Contains(err.Error(), "no credentials for mysql:ro_user@127.0.0.1:3307") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -30,10 +30,10 @@ func TestConnectMySQLBackendMissingCreds(t *testing.T) {
 // TestConnectMySQLBackendLiveRoundTrip is a skip-free LIVE integration test
 // against the mysql-test container (127.0.0.1:3307, ro_user/ro_pw, db appdb).
 func TestConnectMySQLBackendLiveRoundTrip(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
-	creds := map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}
+	tok := &models.TokenPayload{DBType: "mysql", DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
+	creds := map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"}
 
-	conn, err := connectMySQLBackend(context.Background(), tok, creds, "appdb")
+	conn, err := connectMySQLBackend(context.Background(), tok, &ConfigCredResolver{Creds: creds}, "appdb")
 	if err != nil {
 		t.Fatalf("connectMySQLBackend: %v", err)
 	}
@@ -93,9 +93,9 @@ func TestConnectMySQLBackendLiveRoundTrip(t *testing.T) {
 }
 
 func TestConnectMySQLBackendWrongPassword(t *testing.T) {
-	tok := &models.TokenPayload{DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
-	creds := map[string]string{"127.0.0.1:3307:ro_user": "definitely-wrong-pw"}
-	if _, err := connectMySQLBackend(context.Background(), tok, creds, ""); err == nil {
+	tok := &models.TokenPayload{DBType: "mysql", DBIP: "127.0.0.1", DBPort: "3307", DBUser: "ro_user"}
+	creds := map[string]string{"mysql:ro_user@127.0.0.1:3307": "definitely-wrong-pw"}
+	if _, err := connectMySQLBackend(context.Background(), tok, &ConfigCredResolver{Creds: creds}, ""); err == nil {
 		t.Fatal("expected auth error for wrong password")
 	}
 }

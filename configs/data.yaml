@@ -19,10 +19,21 @@ valkey:
     cert_file: ""
     key_file: ""
     skip_verify: false
-credentials:                  # Data Plane owns DB credentials (zero-trust)
-  - key: "127.0.0.1:3307:ro_user"
+# Task 8.7 credential source (user directive 2026-08-13): "config" (default)
+# resolves backend DB passwords from the committed credentials list below;
+# "api" fetches them per connect from credentials_api.url instead. In api
+# mode the password is NEVER stored or logged — it exists in memory only for
+# the in-flight connect call. Load fails fast when source=api and the URL is
+# empty.
+credentials_source: config   # config | api (env: ZT_CREDENTIALS_SOURCE)
+credentials_api:
+  url: ""                    # vault endpoint, e.g. http://vault:9000/creds (env: ZT_CREDENTIALS_API_URL)
+  api_key: ""                # sent as X-Api-Key (env: ZT_CREDENTIALS_API_API_KEY)
+  timeout_seconds: 5         # per-request timeout (env: ZT_CREDENTIALS_API_TIMEOUT_SECONDS)
+credentials:                  # Data Plane owns DB credentials (zero-trust); key format <dbtype>:<db_user>@<db_ip>:<db_port>
+  - key: "mysql:ro_user@127.0.0.1:3307"
     password: "ro_pw"
-  - key: "127.0.0.1:3307:rw_user"
+  - key: "mysql:rw_user@127.0.0.1:3307"
     password: "rw_pw"
-  - key: "127.0.0.1:5433:ro_user"
+  - key: "postgres:ro_user@127.0.0.1:5433"
     password: "ro_pw"

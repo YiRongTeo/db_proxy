@@ -308,7 +308,7 @@ func pgCompletePending(p *PGProxy, s *pgSession) {
 // TestPGSniffClassifiesSQL: SimpleQuery and Parse SQL are classified into
 // the pending event's stmt_type (select/insert/update/delete/other).
 func TestPGSniffClassifiesSQL(t *testing.T) {
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
 	tok := &models.TokenPayload{Username: "pg-user", DBUser: "ro_user"}
 	cache := newStmtCache()
@@ -379,7 +379,7 @@ func TestPGSessionCapturePublish(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:pg-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
@@ -453,7 +453,7 @@ func TestPGSessionStaleCaptureGuard(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:pg-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
@@ -507,7 +507,7 @@ func TestPGSessionReadyForQuerySafetyPublish(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:pg-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
@@ -544,7 +544,7 @@ func TestPGSessionFlushOnClose(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:pg-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
@@ -572,7 +572,7 @@ func TestPGSessionFlushOnClose(t *testing.T) {
 // register/unregister + KillSession invokes the closer exactly for
 // registered sessions.
 func TestPGProxySessionRegistryKill(t *testing.T) {
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	killed := false
 	s := &pgSession{id: "sid-test", closer: func() { killed = true }}
 	p.registerSession(s)

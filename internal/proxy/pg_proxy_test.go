@@ -247,7 +247,7 @@ func startTestPGProxyTLS(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buff
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewPGProxy(logger, vs, creds, loadTestTLS(t))
+	p := NewPGProxy(logger, vs, &ConfigCredResolver{Creds: creds}, loadTestTLS(t))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

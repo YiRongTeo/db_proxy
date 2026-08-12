@@ -22,7 +22,7 @@ import (
 
 // pgLiveCreds point the backend connect at the real pg-test container
 // (Task 0.4: host port 5433, ro_user/ro_pw with SELECT on demo_items).
-var pgLiveCreds = map[string]string{"127.0.0.1:5433:ro_user": "ro_pw"}
+var pgLiveCreds = map[string]string{"postgres:ro_user@127.0.0.1:5433": "ro_pw"}
 
 // startTestPGProxyWithCreds is startTestPGProxy with a caller-supplied
 // credential map (used by relay tests that connect to the live backend).
@@ -34,7 +34,7 @@ func startTestPGProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *byte
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewPGProxy(logger, vs, creds, nil)
+	p := NewPGProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

@@ -70,13 +70,17 @@ func captureMySQLThreadID(backend net.Conn, log *slog.Logger) int64 {
 	}
 }
 
-// backendKey identifies a credential entry: "<ip>:<port>:<db_user>".
+// backendKey identifies a credential entry: "<dbtype>:<db_user>@<db_ip>:<db_port>"
+// (Task 8.7 format — carries the db type so the API resolver can build the
+// vault query params db_type/db_user/db_ip/db_port).
 func backendKey(t *models.TokenPayload) string {
-	return fmt.Sprintf("%s:%s:%s", t.DBIP, t.DBPort, t.DBUser)
+	return fmt.Sprintf("%s:%s@%s:%s", t.DBType, t.DBUser, t.DBIP, t.DBPort)
 }
 
 // connectMySQLBackend authenticates to the real MySQL with Data-Plane-owned
-// credentials, then hands back the raw net.Conn for byte-exact relay.
+// credentials resolved through res (config list or credential API — Task
+// 8.7), then hands back the raw net.Conn for byte-exact relay. The password
+// lives in memory only for this call; it is never logged or stored.
 // dbName is the database the CLIENT requested in its handshake response
 // (forwarded to the backend so the session has the right default schema);
 // empty means no default database.
@@ -93,10 +97,10 @@ func backendKey(t *models.TokenPayload) string {
 // result-set framing (OK instead of EOF terminators). The proxy's own
 // handshake (advertisedCaps) does not offer either flag to clients, so the
 // backend connection must match — hence the explicit unsets below.
-func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, creds map[string]string, dbName string) (net.Conn, error) {
-	pw, ok := creds[backendKey(t)]
-	if !ok {
-		return nil, fmt.Errorf("no credentials for %s", backendKey(t))
+func connectMySQLBackend(ctx context.Context, t *models.TokenPayload, res CredResolver, dbName string) (net.Conn, error) {
+	pw, err := res.Password(ctx, backendKey(t))
+	if err != nil {
+		return nil, err
 	}
 	// Bounded handshake (Task 3.8): go-mysql's timeout parameter covers the
 	// TCP dial only — the initial-handshake read is otherwise unbounded, so a

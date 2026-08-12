@@ -136,6 +136,46 @@ Readiness (second terminal): the log line `"dispatcher listening"` with `"addr":
 netstat -ano | grep ':3306' | grep -i listen
 ```
 
+### 2.3 Credential source (Task 8.7): config list vs credential API
+
+The Data Plane owns the backend DB passwords (zero-trust). Where they come from is
+`credentials_source` in `configs/data.yaml` (env `ZT_CREDENTIALS_SOURCE`):
+
+- **`config` (default)** — the committed `credentials:` list in `configs/data.yaml`.
+  Key format: `<dbtype>:<db_user>@<db_ip>:<db_port>` (e.g. `mysql:ro_user@127.0.0.1:3307`).
+- **`api`** — fetch the password per connect from a vault HTTP endpoint
+  (`credentials_api.url`; env `ZT_CREDENTIALS_API_URL`; `api_key` → `X-Api-Key` header,
+  env `ZT_CREDENTIALS_API_API_KEY`; `timeout_seconds` default 5, env
+  `ZT_CREDENTIALS_API_TIMEOUT_SECONDS`). Load fails fast when `source=api` and the URL is
+  empty, so a data plane that cannot resolve passwords never starts silently.
+
+Vault contract (the only thing the endpoint must implement):
+
+```
+GET {url}?db_type=<mysql|postgres>&db_user=<user>&db_ip=<host>&db_port=<port>
+X-Api-Key: <api_key>
+
+200 → {"password": "<the backend db password>"}
+anything else → the connect fails; the error carries the STATUS CODE ONLY
+```
+
+Password hygiene (HARD requirement, user directive 2026-08-13): the password is **never
+stored and never logged** — it exists in memory only for the in-flight connect call. No
+caching, no disk writes, no log field. Non-200 vault responses surface as status-only
+errors; the response body is never read into an error or log line. Keys in the credential
+list are plaintext in the committed file (as before); `api` mode removes even that.
+
+Quick check (vault stub with `python`):
+
+```bash
+python -c "import http.server,socketserver; \
+class H(http.server.BaseHTTPRequestHandler):
+  def do_GET(s): s.send_response(200); s.end_headers(); s.wfile.write(b'{\"password\":\"ro_pw\"}')
+socketserver.TCPServer(('127.0.0.1',9000),H).serve_forever()" &
+# configs/data.yaml: credentials_source: api, credentials_api.url: http://127.0.0.1:9000/creds
+go run ./cmd/data   # then §4: token → SELECT works, password served by the stub
+```
+
 ---
 
 ## 3. Issue a token (curl)

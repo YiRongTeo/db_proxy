@@ -92,7 +92,7 @@ func buildTestHandshakeResponse(token string) []byte {
 // bufio.Reader + handleConn.
 func startTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer) (net.Listener, <-chan struct{}) {
 	t.Helper()
-	return startTestProxyWithCreds(t, vs, logBuf, map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"})
+	return startTestProxyWithCreds(t, vs, logBuf, map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"})
 }
 
 // startTestProxyWithCreds is startTestProxy with a caller-supplied credential
@@ -105,7 +105,7 @@ func startTestProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewMySQLProxy(logger, vs, creds, nil)
+	p := NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -140,7 +140,7 @@ func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:test-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-3-4",
 		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307"}
@@ -219,7 +219,7 @@ func TestSniffCommandPublishesTicketChannel(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:ticket:T-3-4", false, out)
 	waitSubAck(t, acked)
 
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
 
 	// With a ticket: event lands on the ticket channel once the response
@@ -412,7 +412,7 @@ func TestSniffCommandTrimsTrailingNUL(t *testing.T) {
 	go vs.Subscribe(subCtx, "queries:test-user", false, out)
 	waitSubAck(t, acked)
 
-	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, nil, nil)
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	tok := &models.TokenPayload{Username: "test-user", DBUser: "ro_user"}
 	s := newTestSession()
 
@@ -544,7 +544,7 @@ func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
 	}
 
 	var logBuf bytes.Buffer
-	creds := map[string]string{fmt.Sprintf("127.0.0.1:%s:ro_user", port): "ro_pw"}
+	creds := map[string]string{fmt.Sprintf("mysql:ro_user@127.0.0.1:%s", port): "ro_pw"}
 	ln, proxyDone := startTestProxyWithCreds(t, vs, &logBuf, creds)
 
 	client, err := net.Dial("tcp", ln.Addr().String())
@@ -841,7 +841,7 @@ func startTestTLSProxy(t *testing.T, vs *store.ValkeyStore) (net.Listener, <-cha
 	}
 	t.Cleanup(func() { ln.Close() })
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs,
-		map[string]string{"127.0.0.1:3307:ro_user": "ro_pw"}, tlsCfg)
+		&ConfigCredResolver{Creds: map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"}}, tlsCfg)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

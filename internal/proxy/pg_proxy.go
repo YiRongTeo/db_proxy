@@ -54,8 +54,8 @@ type pgSession struct {
 type PGProxy struct {
 	log    *slog.Logger
 	vs     *store.ValkeyStore
-	creds  map[string]string
-	tlsCfg *tls.Config // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
+	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
+	tlsCfg *tls.Config  // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
 
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
@@ -65,7 +65,9 @@ type PGProxy struct {
 // plaintext wire path (byte-identical to before TLS existed); non-nil makes
 // the proxy answer an SSLRequest with 'S' and upgrade the connection to TLS
 // before the real StartupMessage (client-side TLS, data plane listener).
-func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string, tlsCfg *tls.Config) *PGProxy {
+// creds resolves the backend DB password per connect (Task 8.7: config list
+// or credential API — the password is never stored or logged).
+func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
 	return &PGProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*pgSession)}
 }
 
