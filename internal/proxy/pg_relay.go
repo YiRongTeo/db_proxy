@@ -182,6 +182,7 @@ func (p *PGProxy) sniffPGMessage(msg pgproto3.FrontendMessage, cache *stmtCache,
 		DBIP:       tok.DBIP,
 		DBPort:     tok.DBPort,
 		DBType:     "postgres",
+		DB:         s.db,
 		SQL:        sql,
 		ClientAddr: clientAddr,
 		StmtType:   classifyStmt(sql),
@@ -273,6 +274,25 @@ func (p *PGProxy) publishEvent(s *pgSession, ev *models.QueryEvent) {
 	if rec != nil {
 		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
 	}
+	// Task 8.8 query logging: every published query event is logged with
+	// full context (never the token value — the event carries no token).
+	// The captured result payload (columns/row_count/rows/truncated) is
+	// added ONLY when log_query_output is on; rows are already capped by
+	// the capture (100 rows/512 chars/64KB). Blocked write-gate events
+	// (Task 8.6) flow through here too, carrying status=error + the gating
+	// message — the audit trail shows the block in the log as well.
+	attrs := []any{
+		"username", ev.Username, "ticket_id", ev.TicketID,
+		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType,
+		"stmt_type", ev.StmtType, "status", ev.Status,
+		"session_id", ev.SessionID, "sql", ev.SQL,
+	}
+	if p.logQueryOutput {
+		attrs = append(attrs,
+			"columns", ev.Columns, "row_count", len(ev.Rows),
+			"rows", ev.Rows, "truncated", ev.Truncated)
+	}
+	p.log.Info("query", attrs...)
 }
 
 // refreshSessionLive writes (or refreshes) the session's directory record —
@@ -311,6 +331,14 @@ func (p *PGProxy) publishLifecycle(s *pgSession, tok *models.TokenPayload, actio
 	ctx := context.Background()
 	_ = p.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	_ = p.vs.Publish(ctx, "queries:sess:"+s.id, raw)
+	// Task 8.8 lifecycle logging: same context fields as the query line,
+	// minus sql (lifecycle events carry none). ticket_id comes from the
+	// TOKEN directly — the lifecycle WIRE event deliberately carries no
+	// ticket id (Task 8.2: ticket grouping is query activity only), but
+	// the log line is part of the query-logging context. No credentials,
+	// ever.
+	p.log.Info("session "+action, "username", ev.Username, "ticket_id", tok.TicketID,
+		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType, "session_id", ev.SessionID)
 }
 
 // finishSession removes the session from the directory (DelSessionLive) and

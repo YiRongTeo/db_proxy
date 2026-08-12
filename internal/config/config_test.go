@@ -170,6 +170,9 @@ func TestLoadData(t *testing.T) {
 	if cfg.CredentialsAPI != nil {
 		t.Errorf("CredentialsAPI = %+v, want nil (config mode)", cfg.CredentialsAPI)
 	}
+	if cfg.LogQueryOutput {
+		t.Errorf("LogQueryOutput = true, want false (default: context-only query logs)")
+	}
 	if got := cfg.Valkey.Mode; got != "direct" {
 		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
@@ -650,4 +653,75 @@ listen:
 	if got := cfg.CredentialsAPI.APIKey; got != "env-key" {
 		t.Errorf("CredentialsAPI.APIKey = %q, want %q (ZT_CREDENTIALS_API_API_KEY)", got, "env-key")
 	}
+}
+
+// --- Task 8.8: log_query_output flag ----------------------------------------
+
+// TestLogQueryOutputFlag: log_query_output: true parses onto the struct;
+// absent stays false (default — context-only query logging).
+func TestLogQueryOutputFlag(t *testing.T) {
+	t.Run("yaml true parses", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+log_query_output: true
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if !cfg.LogQueryOutput {
+			t.Error("LogQueryOutput = false, want true (log_query_output: true)")
+		}
+	})
+
+	t.Run("absent defaults false", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.LogQueryOutput {
+			t.Error("LogQueryOutput = true, want false (default)")
+		}
+	})
+}
+
+// TestLogQueryOutputEnvOverride: ZT_LOG_QUERY_OUTPUT overrides the file value
+// (viper convention: prefix ZT_, single key — no dots to replace).
+func TestLogQueryOutputEnvOverride(t *testing.T) {
+	t.Run("env true beats file false", func(t *testing.T) {
+		t.Setenv("ZT_LOG_QUERY_OUTPUT", "true")
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+log_query_output: false
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if !cfg.LogQueryOutput {
+			t.Error("LogQueryOutput = false, want true (ZT_LOG_QUERY_OUTPUT=true)")
+		}
+	})
+
+	t.Run("env false beats file true", func(t *testing.T) {
+		t.Setenv("ZT_LOG_QUERY_OUTPUT", "false")
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+log_query_output: true
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.LogQueryOutput {
+			t.Error("LogQueryOutput = true, want false (ZT_LOG_QUERY_OUTPUT=false)")
+		}
+	})
 }

@@ -57,6 +57,13 @@ type PGProxy struct {
 	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
 	tlsCfg *tls.Config  // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
 
+	// logQueryOutput (Task 8.8) gates the CAPTURED RESULT payload on query
+	// log lines (columns/row_count/rows/truncated). False (default) still
+	// logs every query with full context — username, ticket_id, db_user,
+	// db, db_type, stmt_type, status, session_id, sql — but never the
+	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
+	logQueryOutput bool
+
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 }
@@ -70,6 +77,13 @@ type PGProxy struct {
 func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
 	return &PGProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*pgSession)}
 }
+
+// SetLogQueryOutput toggles whether query log lines carry the captured
+// result payload (Task 8.8): true adds columns/row_count/rows/truncated to
+// each "query" log line; false (default) keeps the lines context-only.
+// The context fields (username, ticket_id, db_user, db, db_type, stmt_type,
+// status, session_id, sql) are logged ALWAYS, regardless of the flag.
+func (p *PGProxy) SetLogQueryOutput(on bool) { p.logQueryOutput = on }
 
 // registerSession adds a session to the registry so it can be killed by id
 // (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself

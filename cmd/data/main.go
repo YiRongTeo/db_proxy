@@ -120,6 +120,12 @@ func main() {
 	}
 	mysqlProxy := proxy.NewMySQLProxy(log, vs, credResolver, dataTLS)
 	pgProxy := proxy.NewPGProxy(log, vs, credResolver, dataTLS)
+	// Task 8.8 query logging: every query is ALWAYS logged with context;
+	// the captured result payload (columns/rows/row_count/truncated) is
+	// added only when log_query_output is on (configs/data.yaml,
+	// ZT_LOG_QUERY_OUTPUT).
+	mysqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
+	pgProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,

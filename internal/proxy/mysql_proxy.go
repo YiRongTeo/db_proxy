@@ -50,6 +50,13 @@ type MySQLProxy struct {
 	tlsCfg   *tls.Config   // non-nil → CLIENT_SSL advertised + SSLRequest upgraded (Task 7.4); nil = plaintext
 	serverID atomic.Uint32 // per-session connection id for the handshake
 
+	// logQueryOutput (Task 8.8) gates the CAPTURED RESULT payload on query
+	// log lines (columns/row_count/rows/truncated). False (default) still
+	// logs every query with full context — username, ticket_id, db_user,
+	// db, db_type, stmt_type, status, session_id, sql — but never the
+	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
+	logQueryOutput bool
+
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
 }
@@ -69,6 +76,13 @@ func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, 
 		sessions: make(map[string]*mysqlSession),
 	}
 }
+
+// SetLogQueryOutput toggles whether query log lines carry the captured
+// result payload (Task 8.8): true adds columns/row_count/rows/truncated to
+// each "query" log line; false (default) keeps the lines context-only.
+// The context fields (username, ticket_id, db_user, db, db_type, stmt_type,
+// status, session_id, sql) are logged ALWAYS, regardless of the flag.
+func (p *MySQLProxy) SetLogQueryOutput(on bool) { p.logQueryOutput = on }
 
 // bufferedConn is a net.Conn whose reads drain a bufio.Reader before
 // touching the underlying conn. The SSLRequest reader may buffer client

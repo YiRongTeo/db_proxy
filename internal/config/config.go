@@ -197,6 +197,13 @@ type DataConfig struct {
 	MaxConns      int
 	TLS           *CertConfig
 	Valkey        ValkeyConfig
+	// LogQueryOutput (yaml log_query_output, env ZT_LOG_QUERY_OUTPUT; Task
+	// 8.8) controls whether the data plane's query log lines carry the
+	// CAPTURED RESULT PAYLOAD (columns/rows/row_count/truncated). Default
+	// false: every query is still logged with full context (username,
+	// ticket, db_user, db, db_type, stmt_type, status, session_id, sql) —
+	// only the result payload is gated behind the flag.
+	LogQueryOutput bool
 	// CredentialsSource selects where the backend DB password comes from:
 	// "config" (default — the committed credentials list below) or "api"
 	// (per-connect fetch from CredentialsAPI; Task 8.7).
@@ -228,6 +235,9 @@ func LoadData(path string) (*DataConfig, error) {
 		// Task 8.7 credential-source defaults: config mode, vault timeout 5s.
 		"credentials_source":              "config",
 		"credentials_api.timeout_seconds": 5,
+		// Task 8.8: query log lines carry context only by default; the
+		// captured result payload (rows) is opt-in via log_query_output.
+		"log_query_output": false,
 	}); err != nil {
 		return nil, err
 	}
@@ -256,6 +266,7 @@ func LoadData(path string) (*DataConfig, error) {
 		MaxConns:          v.GetInt("listen.max_conns"),
 		TLS:               tlsCfg,
 		Valkey:            readValkey(v),
+		LogQueryOutput:    v.GetBool("log_query_output"),
 		CredentialsSource: source,
 		CredentialsAPI:    apiCfg,
 		Credentials:       map[string]string{},

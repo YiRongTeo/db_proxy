@@ -176,6 +176,31 @@ socketserver.TCPServer(('127.0.0.1',9000),H).serve_forever()" &
 go run ./cmd/data   # then §4: token → SELECT works, password served by the stub
 ```
 
+### 2.4 Query logging (Task 8.8)
+
+Every query passing through the proxy is **always** logged at Info with full context:
+
+```
+msg=query  username ticket_id db_user db db_type stmt_type status session_id sql
+```
+
+(`ticket_id` present only when the token was issued with one.) Session lifecycle events are
+logged the same way as `msg="session started"` / `msg="session ended"` — same context fields,
+no SQL; their `ticket_id` comes from the token, matching the query lines.
+
+`log_query_output` (`configs/data.yaml`, env `ZT_LOG_QUERY_OUTPUT`, default **false**) adds the
+captured result payload to each query line: `columns`, `row_count`, `rows` (already capped by
+capture: 100 rows / 512 chars / 64 KB) and the `truncated` flag:
+
+```bash
+ZT_LOG_QUERY_OUTPUT=true go run ./cmd/data
+```
+
+**Hygiene (HARD):** log lines never contain credentials or token values — only the context
+fields above, and — with the flag on — the captured result rows. Lifecycle **wire** events
+(`queries:*`) carry no ticket id at all (Task 8.2 contract); the ticket id appears only in
+query events and log lines.
+
 ---
 
 ## 3. Issue a token (curl)
