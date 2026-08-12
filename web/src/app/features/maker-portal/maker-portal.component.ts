@@ -14,7 +14,7 @@ import { ApiService, DbPreset, TokenResponse } from '../../core/api.service';
 import { AuthService } from '../../core/auth.service';
 
 /**
- * Maker Portal: pick a database preset, optionally attach a ticket id, and
+ * Maker Portal: pick a database preset, attach the required ticket id, and
  * issue a single-use token. The token is copied via the CDK clipboard and
  * the connection details are shown as an nz-descriptions block.
  */
@@ -100,6 +100,10 @@ export class MakerPortalComponent implements OnInit {
   }
 
   submit(): void {
+    if (!this.ticketId().trim()) {
+      this.submitError.set('Ticket id is required');
+      return;
+    }
     if (!this.selectedPreset()) {
       return;
     }

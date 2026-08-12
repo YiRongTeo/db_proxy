@@ -29,7 +29,7 @@
         </nz-form-item>
 
         <nz-form-item>
-          <nz-form-label nzFor="ticket">Ticket id (optional)</nz-form-label>
+          <nz-form-label nzFor="ticket" [nzRequired]="true">Ticket id</nz-form-label>
           <nz-form-control>
             <nz-input-group>
               <input
@@ -57,7 +57,7 @@
               nz-button
               nzType="primary"
               [nzBlock]="true"
-              [disabled]="!selectedPreset() || submitting()"
+              [disabled]="!selectedPreset() || !ticketId().trim() || submitting()"
               [nzLoading]="submitting()"
             >
               Issue token
