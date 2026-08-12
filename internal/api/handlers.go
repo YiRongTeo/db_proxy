@@ -120,16 +120,31 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 
 // handleKill queues a data-plane session kill (session required). The kill
 // is dispatched over the Valkey ctl:kill channel — no HTTP between planes
-// (spec amendment 9e).
+// (spec amendment 9e). Mode selects the kill scope (Task 8.3 two-level
+// kill): "connection" (default) terminates the whole backend session;
+// "query" aborts only the in-flight query. The published payload always
+// carries the resolved mode so the data plane never has to guess.
 func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID string `json:"session_id"`
+		Mode      string `json:"mode"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.SessionID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id required"})
 		return
 	}
-	b, err := json.Marshal(map[string]string{"session_id": req.SessionID})
+	mode := req.Mode
+	if mode == "" {
+		mode = "connection"
+	}
+	if mode != "connection" && mode != "query" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid mode"})
+		return
+	}
+	b, err := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+		Mode      string `json:"mode"`
+	}{SessionID: req.SessionID, Mode: mode})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
@@ -139,4 +154,18 @@ func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"killed": "queued"})
+}
+
+// handleSessions lists the live data-plane session directory (session
+// required). The directory is the sess:live:* keys the data plane
+// heartbeats (Task 8.2); thread_id stays backend-internal and is not
+// exposed to the checker. An empty directory is encoded as [] (never null).
+func (a *api) handleSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := a.vs.ListSessionsParsed(r.Context())
+	if err != nil {
+		a.log.Error("list sessions", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, sessions)
 }

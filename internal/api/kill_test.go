@@ -66,7 +66,8 @@ func TestKillBadRequest(t *testing.T) {
 // subscriber on the ctl:kill channel (exactly what the data plane runs,
 // Task 6.4) is registered BEFORE the POST, then POST /api/kill with
 // {"session_id":"sid-x"} must return 202 {"killed":"queued"} and the
-// subscriber must receive exactly {"session_id":"sid-x"}.
+// subscriber must receive exactly {"session_id":"sid-x","mode":"connection"}
+// — the mode field defaults to "connection" (Task 8.4).
 func TestKillPublishesCtlKill(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
@@ -116,8 +117,8 @@ func TestKillPublishesCtlKill(t *testing.T) {
 
 	select {
 	case m := <-out:
-		if string(m) != `{"session_id":"sid-x"}` {
-			t.Fatalf("ctl:kill message = %s, want %s", m, `{"session_id":"sid-x"}`)
+		if string(m) != `{"session_id":"sid-x","mode":"connection"}` {
+			t.Fatalf("ctl:kill message = %s, want %s", m, `{"session_id":"sid-x","mode":"connection"}`)
 		}
 	case err := <-subErr:
 		t.Fatalf("ctl:kill subscriber exited: %v", err)

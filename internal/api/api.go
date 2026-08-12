@@ -35,9 +35,10 @@ func (a *api) Routes() http.Handler {
 	mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
 	mux.HandleFunc("GET /api/me", a.auth.requireSession(a.auth.handleMe)) // Task 5.7: boot-time session restore
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireSession(a.handleDBPresets))
-	mux.HandleFunc("POST /api/token", a.handleToken)                      // auth inside (key OR session)
-	mux.HandleFunc("POST /api/kill", a.auth.requireSession(a.handleKill)) // Task 6.5: checker kill button
-	mux.HandleFunc("GET /ws/checker", a.auth.requireSession(a.handleWS))  // Task 2.4
+	mux.HandleFunc("POST /api/token", a.handleToken)                             // auth inside (key OR session)
+	mux.HandleFunc("POST /api/kill", a.auth.requireSession(a.handleKill))        // Task 6.5: checker kill button
+	mux.HandleFunc("GET /api/sessions", a.auth.requireSession(a.handleSessions)) // Task 8.4: session directory
+	mux.HandleFunc("GET /ws/checker", a.auth.requireSession(a.handleWS))         // Task 2.4
 	// Task 2.9: SPA static serving — registered LAST so /api/* and /ws/* win.
 	if _, err := os.Stat(a.cfg.StaticDir); err != nil {
 		a.log.Warn("static dir missing; SPA will not be served", "static_dir", a.cfg.StaticDir)

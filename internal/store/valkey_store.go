@@ -258,3 +258,40 @@ func (s *ValkeyStore) ListSessions(ctx context.Context) ([][]byte, error) {
 	}
 	return recs, nil
 }
+
+// SessionInfo is the checker-facing session directory entry (Task 8.4),
+// decoded from the data plane's sess:live:<sid> records. ThreadID is
+// intentionally NOT exposed: it is a backend-internal connection identifier
+// (MySQL CONNECTION_ID / PG backend pid), not part of the control-plane
+// surface.
+type SessionInfo struct {
+	SessionID string    `json:"session_id"`
+	Username  string    `json:"username"`
+	DBUser    string    `json:"db_user"`
+	DBType    string    `json:"db_type"`
+	DB        string    `json:"db"`
+	StartedAt time.Time `json:"started_at"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// ListSessionsParsed returns the live session directory as typed records,
+// decoding each raw sess:live:<sid> payload into SessionInfo. Records that
+// fail to decode are skipped — the data plane only ever writes valid JSON,
+// and one malformed record must not hide the rest of the directory. An
+// empty directory returns an empty non-nil slice so handlers encode it as
+// [] rather than null.
+func (s *ValkeyStore) ListSessionsParsed(ctx context.Context) ([]SessionInfo, error) {
+	raw, err := s.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SessionInfo, 0, len(raw))
+	for _, rec := range raw {
+		var si SessionInfo
+		if err := json.Unmarshal(rec, &si); err != nil {
+			continue // skip malformed record
+		}
+		out = append(out, si)
+	}
+	return out, nil
+}

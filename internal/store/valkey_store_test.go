@@ -293,3 +293,53 @@ func TestListSessionsEmpty(t *testing.T) {
 		t.Fatalf("ListSessions on empty directory returned %d records: %s", len(recs), recs)
 	}
 }
+
+// TestListSessionsParsed (Task 8.4): ListSessionsParsed decodes the raw
+// directory records into typed SessionInfo entries — checker-facing fields
+// only, no thread_id — and returns an empty non-nil slice for an empty
+// directory (so handlers encode [] rather than null).
+func TestListSessionsParsed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
+
+	started := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Millisecond)
+	last := time.Now().UTC().Truncate(time.Millisecond)
+	rec := []byte(`{"session_id":"` + sid + `","username":"alice","db_user":"ro_user","db_type":"mysql","db":"appdb","thread_id":4242,"started_at":"` +
+		started.Format(time.RFC3339Nano) + `","last_seen":"` + last.Format(time.RFC3339Nano) + `"}`)
+	if err := s.SetSessionLive(ctx, sid, rec, 60*time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
+	}
+
+	got, err := s.ListSessionsParsed(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionsParsed: %v", err)
+	}
+	found := false
+	for _, si := range got {
+		if si.SessionID != sid {
+			continue
+		}
+		found = true
+		if si.Username != "alice" || si.DBUser != "ro_user" || si.DBType != "mysql" || si.DB != "appdb" {
+			t.Errorf("parsed record = %+v, want username=alice db_user=ro_user db_type=mysql db=appdb", si)
+		}
+		if !si.StartedAt.Equal(started) || !si.LastSeen.Equal(last) {
+			t.Errorf("parsed timestamps = %v/%v, want %v/%v", si.StartedAt, si.LastSeen, started, last)
+		}
+	}
+	if !found {
+		t.Fatalf("ListSessionsParsed: record for %s missing (got %d records)", sid, len(got))
+	}
+
+	// Empty directory: non-nil empty slice (encodes as [], never null).
+	clearLiveSessions(t, s)
+	got, err = s.ListSessionsParsed(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionsParsed on empty directory: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("ListSessionsParsed on empty directory = %#v (nil=%v), want non-nil empty slice", got, got == nil)
+	}
+}
