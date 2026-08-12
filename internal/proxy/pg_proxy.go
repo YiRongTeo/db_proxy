@@ -5,11 +5,25 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
+	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
+
+// pgSession tracks one established PostgreSQL session: the pending (sniffed
+// but not yet answered) QueryEvent plus the capture of the backend's
+// response. It also serves as the Task 6.4 kill-registry entry: closer
+// force-closes both conns to tear the session down. Mirrors mysqlSession.
+type pgSession struct {
+	id      string
+	mu      sync.Mutex
+	pending *models.QueryEvent
+	capture *pgResultCapture
+	closer  func()
+}
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the
 // client-facing auth flow: SSLRequest → 'N' (spec D10 — no SSL advertised),
@@ -18,7 +32,8 @@ import (
 // Task 4.2 added the backend session (connectPostgresBackend + pgx Hijack);
 // Task 4.3 completes the session with a bidirectional message-level relay
 // and passive SQL sniffing, forwarding the CLIENT-requested database from
-// its StartupMessage to the backend.
+// its StartupMessage to the backend; Task 6.3 adds response capture
+// (pending → publish-on-completion, flush-on-close) and the kill registry.
 //
 // NOTE (D11 redesign): like MySQLProxy, the Dispatcher owns the accept loop
 // and connection limiting — one handleConn per accepted connection.
@@ -26,10 +41,44 @@ type PGProxy struct {
 	log   *slog.Logger
 	vs    *store.ValkeyStore
 	creds map[string]string
+
+	mu       sync.Mutex
+	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 }
 
 func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string) *PGProxy {
-	return &PGProxy{log: log, vs: vs, creds: creds}
+	return &PGProxy{log: log, vs: vs, creds: creds, sessions: make(map[string]*pgSession)}
+}
+
+// registerSession adds a session to the registry so it can be killed by id
+// (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself
+// lives here).
+func (p *PGProxy) registerSession(s *pgSession) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sessions[s.id] = s
+}
+
+// unregisterSession removes a finished session from the registry.
+func (p *PGProxy) unregisterSession(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.sessions, id)
+}
+
+// KillSession force-closes a registered session's client+backend conns.
+// Returns false when no session with that id is registered.
+func (p *PGProxy) KillSession(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	if s.closer != nil {
+		s.closer()
+	}
+	return true
 }
 
 // handleConn runs one PostgreSQL session. The Dispatcher owns the accept loop;
@@ -104,19 +153,31 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	defer front.Close()
 
+	// Session established: create the per-session state (pending event +
+	// response capture + kill-registry entry) before the relay starts. The
+	// closer is the Task 6.4 kill hook — closing both conns forces both
+	// relay pipes to exit and the defers below to run.
+	s := &pgSession{
+		id:     "sid-" + newEventID(),
+		closer: func() { client.Close(); front.Close() },
+	}
+	p.registerSession(s)
+	defer p.unregisterSession(s.id)
+	defer p.flushPendingOnClose(s)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
 		"db_type", tok.DBType, "client", clientAddr)
 
-	// 5. bidirectional relay with passive SQL sniffing. Whichever direction
-	// ends first (client quit, backend close, network error) tears down both
-	// sides; the second done-slot is buffered so the survivor never blocks.
+	// 5. bidirectional relay with passive SQL sniffing and response
+	// capture. Whichever direction ends first (client quit, backend close,
+	// network error) tears down both sides; the second done-slot is
+	// buffered so the survivor never blocks.
 	done := make(chan struct{}, 2)
 	go func() {
-		p.pipePGClientToBackend(be, front, tok, clientAddr)
+		p.pipePGClientToBackend(be, front, s, tok, clientAddr)
 		done <- struct{}{}
 	}()
 	go func() {
-		p.pipePGBackendToClient(front, be)
+		p.pipePGBackendToClient(front, be, s)
 		done <- struct{}{}
 	}()
 	<-done

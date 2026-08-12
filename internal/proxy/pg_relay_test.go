@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -290,10 +291,13 @@ func TestPGProxySniffQueryAndTicketChannel(t *testing.T) {
 }
 
 // TestPGProxySniffPrepareExecute: extended-protocol Parse+Bind+Execute+Sync
-// publishes a prepare event (Parse SQL) then an execute event (resolved
-// through the stmtCache), both relayed to the live backend. A named statement
-// closed via Close is evicted — a later Execute on it reports the portal
-// fallback instead.
+// follows the Task 6.3 pending semantics (mirroring MySQL): the response
+// burst arrives as ONE unit, so the later Execute REPLACES the Parse's
+// pending event — the published event is the execute, carrying the cached
+// SQL and the captured backend response. Phase 1 executes the unnamed
+// statement (status ok, result set captured); phase 2 executes a statement
+// that was closed → the backend errors and the event carries status=error
+// with the server message. Nothing else is published.
 func TestPGProxySniffPrepareExecute(t *testing.T) {
 	vs := proxyTestStore(t)
 	userCh := subscribePG(t, vs, "queries:alice")
@@ -313,17 +317,22 @@ func TestPGProxySniffPrepareExecute(t *testing.T) {
 
 	var ev models.QueryEvent
 	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal prepare event: %v", err)
-	}
-	if ev.Kind != "prepare" || ev.SQL != "SELECT 1" {
-		t.Errorf("prepare event kind=%q sql=%q, want prepare / SELECT 1", ev.Kind, ev.SQL)
-	}
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
 		t.Fatalf("unmarshal execute event: %v", err)
 	}
 	if ev.Kind != "execute" || ev.SQL != "EXECUTE SELECT 1" {
 		t.Errorf("execute event kind=%q sql=%q, want execute / EXECUTE SELECT 1", ev.Kind, ev.SQL)
 	}
+	// Extended protocol WITHOUT a Describe message sends no RowDescription,
+	// so column names may be unknown; the row values are always captured.
+	if ev.Status != "ok" || !reflect.DeepEqual(ev.Rows, [][]string{{"1"}}) {
+		t.Errorf("execute event capture: status=%q rows=%q, want ok/[[1]]", ev.Status, ev.Rows)
+	}
+	if len(ev.Columns) > 1 {
+		t.Errorf("execute event columns = %q, want [] or [?column?]", ev.Columns)
+	}
+	// The Parse's prepare event was REPLACED by the Execute (one response
+	// burst, single pending slot — MySQL-mirror semantics): nothing else.
+	expectNoEvent(t, userCh)
 
 	// Phase 2: named statement, closed before use → evicted from the cache.
 	front.Send(&pgproto3.Parse{Name: "s1", Query: "SELECT 2"})
@@ -332,18 +341,17 @@ func TestPGProxySniffPrepareExecute(t *testing.T) {
 	front.Send(&pgproto3.Sync{})
 	pgDrainUntilReady(t, front)
 
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal named prepare event: %v", err)
-	}
-	if ev.Kind != "prepare" || ev.SQL != "SELECT 2" {
-		t.Errorf("named prepare event kind=%q sql=%q, want prepare / SELECT 2", ev.Kind, ev.SQL)
-	}
+	ev = models.QueryEvent{} // fresh struct: no stale fields from phase 1
 	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
 		t.Fatalf("unmarshal evicted execute event: %v", err)
 	}
 	if ev.Kind != "execute" || ev.SQL != "EXECUTE portal=s1" {
 		t.Errorf("evicted execute event kind=%q sql=%q, want execute / EXECUTE portal=s1", ev.Kind, ev.SQL)
 	}
+	if ev.Status != "error" || !strings.Contains(ev.Error, "does not exist") {
+		t.Errorf("evicted execute event status=%q error=%q, want error containing 'does not exist'", ev.Status, ev.Error)
+	}
+	expectNoEvent(t, userCh)
 
 	if err := front.Send(&pgproto3.Terminate{}); err != nil {
 		t.Fatalf("send Terminate: %v", err)
@@ -403,4 +411,132 @@ func TestPGProxyBackendUnavailable(t *testing.T) {
 		t.Fatalf("message: got %q, want %q", er.Message, "backend unavailable")
 	}
 	waitPGDone(t, done)
+}
+
+// TestPGProxyCaptureLive runs a FULL session through the proxy against the
+// live pg-test container and asserts the PUBLISHED QueryEvents carry the
+// classified stmt type and the captured backend response: the SELECT's real
+// result set (seed verified 2026-08-12: 1|alpha 2|bravo 3|charlie) with
+// status ok, and a failing query with status error + server message. The
+// ticket channel receives the same event.
+func TestPGProxyCaptureLive(t *testing.T) {
+	vs := proxyTestStore(t)
+	userCh := subscribePG(t, vs, "queries:pg63user")
+	ticketCh := subscribePG(t, vs, "queries:ticket:T-6-3")
+
+	ln, done := startTestPGProxyWithCreds(t, vs, &bytes.Buffer{}, pgLiveCreds, 1)
+	token := fmt.Sprintf("pglive63_%d", time.Now().UnixNano())
+	if err := vs.SetToken(context.Background(), token, models.TokenPayload{
+		Username: "pg63user",
+		DBUser:   "ro_user",
+		DBIP:     "127.0.0.1",
+		DBPort:   "5433",
+		DBType:   "postgres",
+		TicketID: "T-6-3",
+	}, 5*time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	front := pgDialDB(t, ln, token, false, "appdb")
+	pgReadUntilReady(t, front)
+
+	// SELECT with a real result set: the published event carries the stmt
+	// type plus the captured columns/rows and status ok.
+	sel := "SELECT id,name FROM demo_items ORDER BY id"
+	pgExecQuery(t, front, sel)
+	var ev models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
+		t.Fatalf("unmarshal select event: %v", err)
+	}
+	if ev.Kind != "query" || ev.SQL != sel {
+		t.Errorf("event kind/sql = %q/%q, want query/%q", ev.Kind, ev.SQL, sel)
+	}
+	if ev.StmtType != "select" {
+		t.Errorf("stmt_type = %q, want select", ev.StmtType)
+	}
+	if ev.Status != "ok" || ev.Error != "" {
+		t.Errorf("status/error = %q/%q, want ok/empty", ev.Status, ev.Error)
+	}
+	if !reflect.DeepEqual(ev.Columns, []string{"id", "name"}) {
+		t.Errorf("columns = %q, want [id name]", ev.Columns)
+	}
+	// Live seed verified directly in the container: 1|alpha 2|bravo 3|charlie.
+	wantRows := [][]string{{"1", "alpha"}, {"2", "bravo"}, {"3", "charlie"}}
+	if !reflect.DeepEqual(ev.Rows, wantRows) {
+		t.Errorf("rows = %q, want %q", ev.Rows, wantRows)
+	}
+	if ev.Truncated {
+		t.Error("truncated = true, want false")
+	}
+	if !strings.HasPrefix(ev.SessionID, "sid-") {
+		t.Errorf("session_id = %q, want sid- prefix", ev.SessionID)
+	}
+	if len(ev.ID) != 16 || ev.Ts.IsZero() {
+		t.Errorf("id=%q ts=%v, want 16-hex id and non-zero ts", ev.ID, ev.Ts)
+	}
+	// The ticket channel receives the same event (same id).
+	var tev models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, ticketCh), &tev); err != nil {
+		t.Fatalf("unmarshal ticket event: %v", err)
+	}
+	if tev.ID != ev.ID {
+		t.Errorf("ticket event id %q != user event id %q", tev.ID, ev.ID)
+	}
+
+	// Failing query: status error with the server's message; no result set
+	// (fresh struct — absent omitempty fields must not leak).
+	if err := front.Send(&pgproto3.Query{String: "SELECT * FROM nope"}); err != nil {
+		t.Fatalf("send error query: %v", err)
+	}
+	var errMsg string
+	for {
+		msg, err := front.Receive()
+		if err != nil {
+			t.Fatalf("receive error response: %v", err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			errMsg = m.Message
+		case *pgproto3.ReadyForQuery:
+			goto drained
+		}
+	}
+drained:
+	if errMsg == "" {
+		t.Fatal("expected a backend error for SELECT * FROM nope")
+	}
+	ev = models.QueryEvent{}
+	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
+		t.Fatalf("unmarshal error event: %v", err)
+	}
+	if ev.Kind != "query" || ev.SQL != "SELECT * FROM nope" || ev.StmtType != "select" {
+		t.Errorf("error event kind/sql/stmt = %q/%q/%q, want query/SELECT * FROM nope/select",
+			ev.Kind, ev.SQL, ev.StmtType)
+	}
+	if ev.Status != "error" || !strings.Contains(ev.Error, "does not exist") {
+		t.Errorf("status/error = %q/%q, want error containing 'does not exist'", ev.Status, ev.Error)
+	}
+	if len(ev.Columns) != 0 || len(ev.Rows) != 0 {
+		t.Errorf("error event carries stale result set: cols=%q rows=%q", ev.Columns, ev.Rows)
+	}
+	if ev.SessionID == "" {
+		t.Error("error event missing session_id")
+	}
+	// The ticket channel receives the error event too (same id).
+	var tevErr models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, ticketCh), &tevErr); err != nil {
+		t.Fatalf("unmarshal ticket error event: %v", err)
+	}
+	if tevErr.ID != ev.ID || tevErr.Status != "error" {
+		t.Errorf("ticket error event id/status = %q/%q, want %q/error", tevErr.ID, tevErr.Status, ev.ID)
+	}
+	expectNoEvent(t, userCh)
+	expectNoEvent(t, ticketCh)
+
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
+	}
+	waitPGDone(t, done)
+	expectNoEvent(t, userCh)
+	expectNoEvent(t, ticketCh)
 }
