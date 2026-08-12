@@ -75,21 +75,23 @@ func main() {
 	// The proxies are also handed to the kill switch below: the ctl:kill
 	// subscriber fans out to both registries (Task 6.4).
 	//
-	// MySQL client-side TLS (Task 7.4): when tls.enabled, load the cert/key
+	// Client-side TLS (Tasks 7.4 + 7.5): when tls.enabled, load the cert/key
 	// pair (the config layer already fail-fasts on enabled+missing/unreadable)
-	// and hand the tls.Config to the MySQL proxy so it advertises CLIENT_SSL
-	// and answers SSLRequests. nil keeps the plaintext wire path.
-	var mysqlTLS *tls.Config
+	// and hand the SAME tls.Config to both proxies — MySQL advertises
+	// CLIENT_SSL and answers SSLRequests, PostgreSQL answers SSLRequest with
+	// 'S' and runs the TLS handshake before the real StartupMessage. nil
+	// keeps the plaintext wire path for both.
+	var dataTLS *tls.Config
 	if cfg.TLS != nil {
 		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		if err != nil {
-			log.Error("mysql tls", "err", err)
+			log.Error("data plane tls", "err", err)
 			os.Exit(1)
 		}
-		mysqlTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		dataTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
-	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials, mysqlTLS)
-	pgProxy := proxy.NewPGProxy(log, vs, cfg.Credentials)
+	mysqlProxy := proxy.NewMySQLProxy(log, vs, cfg.Credentials, dataTLS)
+	pgProxy := proxy.NewPGProxy(log, vs, cfg.Credentials, dataTLS)
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,

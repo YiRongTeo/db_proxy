@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"sync"
@@ -34,20 +35,28 @@ type pgSession struct {
 // and passive SQL sniffing, forwarding the CLIENT-requested database from
 // its StartupMessage to the backend; Task 6.3 adds response capture
 // (pending → publish-on-completion, flush-on-close) and the kill registry.
+// Task 7.5 adds client-side TLS: with tlsCfg set, an SSLRequest is answered
+// with 'S' (0x53) and the session continues over TLS; nil keeps the
+// plaintext 'N' (0x4E) refusal — byte-identical to the pre-TLS wire path.
 //
 // NOTE (D11 redesign): like MySQLProxy, the Dispatcher owns the accept loop
 // and connection limiting — one handleConn per accepted connection.
 type PGProxy struct {
-	log   *slog.Logger
-	vs    *store.ValkeyStore
-	creds map[string]string
+	log    *slog.Logger
+	vs     *store.ValkeyStore
+	creds  map[string]string
+	tlsCfg *tls.Config // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
 
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 }
 
-func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string) *PGProxy {
-	return &PGProxy{log: log, vs: vs, creds: creds, sessions: make(map[string]*pgSession)}
+// NewPGProxy builds a PostgreSQL session handler. tlsCfg nil keeps the
+// plaintext wire path (byte-identical to before TLS existed); non-nil makes
+// the proxy answer an SSLRequest with 'S' and upgrade the connection to TLS
+// before the real StartupMessage (client-side TLS, data plane listener).
+func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds map[string]string, tlsCfg *tls.Config) *PGProxy {
+	return &PGProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*pgSession)}
 }
 
 // registerSession adds a session to the registry so it can be killed by id
@@ -85,7 +94,10 @@ func (p *PGProxy) KillSession(id string) bool {
 // br carries any bytes peeked during protocol detection and ALL client reads
 // go through it, writes through client. Token values are never logged.
 func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Reader) {
-	defer client.Close()
+	// Closure (not defer client.Close()): after the TLS upgrade client is
+	// the tls.Conn, and closing IT closes the wrapped conn too — the
+	// session closer below must tear down whichever layer is current.
+	defer func() { _ = client.Close() }()
 	clientAddr := client.RemoteAddr().String()
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second)) // handshake deadline
 
@@ -98,12 +110,47 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		return
 	}
 	if _, isSSL := startupMsg.(*pgproto3.SSLRequest); isSSL {
-		if _, err := client.Write([]byte{'N'}); err != nil { // refuse SSL
-			return
-		}
-		startupMsg, err = be.ReceiveStartupMessage()
-		if err != nil {
-			return
+		if p.tlsCfg == nil {
+			// TLS not configured: refuse with 'N' (0x4E) — byte-identical
+			// to the pre-TLS wire path. The client then resends the real
+			// StartupMessage in plaintext.
+			if _, err := client.Write([]byte{'N'}); err != nil { // refuse SSL
+				return
+			}
+			startupMsg, err = be.ReceiveStartupMessage()
+			if err != nil {
+				return
+			}
+		} else {
+			// TLS configured: accept with 'S' (0x53) and run the real
+			// handshake — the 10s deadline set above still covers it, and
+			// ctx cancellation aborts it too (HandshakeContext). A
+			// conforming client waits for 'S' before sending its
+			// ClientHello, but one that coalesces the two into a single
+			// segment leaves those bytes in br: bufferedConn (the MySQL
+			// 7.4 pattern) keeps them visible to the TLS layer, so the
+			// handshake never hangs waiting for a retransmission.
+			if _, err := client.Write([]byte{'S'}); err != nil { // accept SSL
+				return
+			}
+			tlsConn := tls.Server(&bufferedConn{Conn: client, r: br}, p.tlsCfg)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				p.log.Warn("tls handshake failed", "client", clientAddr, "err", err)
+				return
+			}
+			// Rebuild the pgproto3 backend over the TLS conn: the REAL
+			// StartupMessage arrives encrypted. Everything downstream
+			// (token GETDEL, FATAL sends, backend connect, relay,
+			// sniffing, capture, kill-registry closer) is unchanged and
+			// now flows over TLS — tls.Conn.Close closes the wrapped
+			// conn, so the session closer tears down the wire either way.
+			client = tlsConn
+			br = bufio.NewReader(tlsConn)
+			be = pgproto3.NewBackend(pgproto3.NewChunkReader(br), tlsConn)
+			startupMsg, err = be.ReceiveStartupMessage()
+			if err != nil {
+				return
+			}
 		}
 	}
 	sm, ok := startupMsg.(*pgproto3.StartupMessage)

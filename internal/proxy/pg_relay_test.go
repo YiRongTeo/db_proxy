@@ -34,7 +34,7 @@ func startTestPGProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *byte
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
-	p := NewPGProxy(logger, vs, creds)
+	p := NewPGProxy(logger, vs, creds, nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

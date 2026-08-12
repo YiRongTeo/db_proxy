@@ -64,7 +64,7 @@ func TestSessionRegistryKillClosesBothConns(t *testing.T) {
 // TestPGProxySessionRegistryKillClosesBothConns mirrors the MySQL test for the
 // PG registry (same closer semantics: client + backend).
 func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
-	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
 
 	client, clientPeer := net.Pipe()
 	backend, backendPeer := net.Pipe()
@@ -95,7 +95,7 @@ func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
 // sessions untouched.
 func TestKillerKillsOnEitherPlane(t *testing.T) {
 	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
-	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil)
 	k := NewKiller(mysql, pg)
 
 	mc, mcPeer := net.Pipe()
