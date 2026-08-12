@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -384,11 +383,9 @@ func TestPGProxySessionOverTLS(t *testing.T) {
 	}
 
 	// Capture event flows exactly as on the plaintext wire (sniffing and
-	// response capture both run over the TLS session).
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal event: %v", err)
-	}
+	// response capture both run over the TLS session). The started
+	// lifecycle event precedes it — recvQueryEvent skips kind=session.
+	ev := recvQueryEvent(t, userCh)
 	if ev.Kind != "query" || ev.SQL != "SELECT 1" || ev.StmtType != "select" || ev.Status != "ok" {
 		t.Errorf("event = kind %q sql %q stmt_type %q status %q, want query/SELECT 1/select/ok",
 			ev.Kind, ev.SQL, ev.StmtType, ev.Status)

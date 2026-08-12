@@ -137,20 +137,81 @@ func (p *MySQLProxy) publishPending(s *mysqlSession, capture *resultCapture) {
 	}
 	s.mu.Unlock()
 	if ev != nil {
-		p.publishEvent(ev)
+		p.publishEvent(s, ev)
 	}
 }
 
-// publishEvent publishes a QueryEvent to queries:<username> AND
-// queries:ticket:<ticket_id> (when present). Best-effort: failures are logged
-// by the store, never fatal to the relay.
-func (p *MySQLProxy) publishEvent(ev *models.QueryEvent) {
+// publishEvent publishes a QueryEvent to queries:<username>,
+// queries:ticket:<ticket_id> (when present) AND — Task 8.2 — the session's
+// own channel queries:sess:<session_id>. It also re-arms the session-directory
+// heartbeat (SetSessionLive with a fresh last_seen), so an active session
+// stays listed while its queries flow. Best-effort: failures are logged by
+// the store, never fatal to the relay. Lifecycle events (started/ended) go
+// through publishLifecycle instead — they must NOT re-create the record
+// after DelSessionLive, and they deliberately skip the ticket channel.
+func (p *MySQLProxy) publishEvent(s *mysqlSession, ev *models.QueryEvent) {
 	raw, _ := json.Marshal(ev)
 	ctx := context.Background()
 	_ = p.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	if ev.TicketID != "" {
 		_ = p.vs.Publish(ctx, "queries:ticket:"+ev.TicketID, raw)
 	}
+	_ = p.vs.Publish(ctx, "queries:sess:"+ev.SessionID, raw)
+	s.mu.Lock()
+	s.lastSeen = time.Now().UTC()
+	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen)
+	s.mu.Unlock()
+	if rec != nil {
+		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
+	}
+}
+
+// refreshSessionLive writes (or refreshes) the session's directory record —
+// sess:live:<sid> with the heartbeat TTL — stamping a fresh last_seen. Called
+// at session start and (via publishEvent) on every published query event.
+// Best-effort: failures are logged by the store, never fatal to the session.
+func (p *MySQLProxy) refreshSessionLive(s *mysqlSession, tok *models.TokenPayload) {
+	s.mu.Lock()
+	s.lastSeen = time.Now().UTC()
+	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen)
+	s.mu.Unlock()
+	if rec == nil {
+		return
+	}
+	_ = p.vs.SetSessionLive(context.Background(), s.id, rec, sessionLiveTTL)
+}
+
+// publishLifecycle publishes a session lifecycle event (Kind=session,
+// Action=started|ended) to queries:<username> AND queries:sess:<sid>. Lifecycle
+// events deliberately do NOT go to the ticket channel — ticket grouping is
+// about query activity, not connection presence.
+func (p *MySQLProxy) publishLifecycle(s *mysqlSession, tok *models.TokenPayload, action, clientAddr string) {
+	ev := models.QueryEvent{
+		ID:         newEventID(),
+		Ts:         time.Now().UTC(),
+		Kind:       "session",
+		Action:     action,
+		Username:   tok.Username,
+		DBUser:     tok.DBUser,
+		DBType:     tok.DBType,
+		DB:         s.db,
+		SessionID:  s.id,
+		ClientAddr: clientAddr,
+	}
+	raw, _ := json.Marshal(ev)
+	ctx := context.Background()
+	_ = p.vs.Publish(ctx, "queries:"+ev.Username, raw)
+	_ = p.vs.Publish(ctx, "queries:sess:"+s.id, raw)
+}
+
+// finishSession removes the session from the directory (DelSessionLive) and
+// publishes the ended lifecycle event. Deferred in handleConn AFTER
+// flushPendingOnClose so the ended event is always the session's last word on
+// the wire — and the record is deleted only after any final query event
+// re-armed the heartbeat.
+func (p *MySQLProxy) finishSession(s *mysqlSession, tok *models.TokenPayload, clientAddr string) {
+	_ = p.vs.DelSessionLive(context.Background(), s.id)
+	p.publishLifecycle(s, tok, "ended", clientAddr)
 }
 
 // flushPendingOnClose publishes any still-pending event as failed when the
@@ -166,5 +227,5 @@ func (p *MySQLProxy) flushPendingOnClose(s *mysqlSession) {
 	}
 	ev.Status = "error"
 	ev.Error = "connection closed before response"
-	p.publishEvent(ev)
+	p.publishEvent(s, ev)
 }

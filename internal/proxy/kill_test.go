@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -265,10 +264,9 @@ func TestMySQLKillSessionLive(t *testing.T) {
 	if _, err := readTextResultSet(clientA); err != nil {
 		t.Fatalf("read result set: %v", err)
 	}
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
-		t.Fatalf("unmarshal event: %v", err)
-	}
+	// The started lifecycle event precedes the SELECT event on the user
+	// channel — recvQueryEvent skips kind=session events.
+	ev := recvQueryEvent(t, out)
 	if !strings.HasPrefix(ev.SessionID, "sid-") {
 		t.Fatalf("session_id = %q, want sid- prefix", ev.SessionID)
 	}
@@ -412,10 +410,9 @@ func TestKillIsolationLive(t *testing.T) {
 		if _, err := readTextResultSet(c); err != nil {
 			t.Fatalf("read result set: %v", err)
 		}
-		var ev models.QueryEvent
-		if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
-			t.Fatalf("unmarshal event: %v", err)
-		}
+		// Each channel's first event is the session's started lifecycle event;
+		// recvQueryEvent skips it and returns the SELECT 1 query event.
+		ev := recvQueryEvent(t, out)
 		if !strings.HasPrefix(ev.SessionID, "sid-") {
 			t.Fatalf("session_id = %q, want sid- prefix", ev.SessionID)
 		}

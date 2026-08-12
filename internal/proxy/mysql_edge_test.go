@@ -313,6 +313,15 @@ func TestEdgeCOMQuitClosesSessionCleanly(t *testing.T) {
 		t.Fatalf("write COM_QUIT: %v", err)
 	}
 
+	// The Task 8.2 thread-id capture (SELECT CONNECTION_ID() on the raw
+	// backend conn, before the OK to the client) lands in the fake backend
+	// first; drain it — the fake backend already OK'd it, so the capture
+	// degrades to threadID 0 and the session proceeds.
+	capQ := append([]byte{cmdQuery}, "SELECT CONNECTION_ID()"...)
+	if pkt := recvBackendPacket(t, backendRecv); !bytes.Equal(pkt, append([]byte{byte(len(capQ)), byte(len(capQ) >> 8), byte(len(capQ) >> 16), 0}, capQ...)) {
+		t.Fatalf("backend received % x, want the thread-id capture query % x (seq 0)", pkt, capQ)
+	}
+
 	// The backend received the COM_QUIT byte-exact, then closed without replying.
 	if pkt := recvBackendPacket(t, backendRecv); !bytes.Equal(pkt, []byte{0x01, 0x00, 0x00, 0x00, cmdQuit}) {
 		t.Fatalf("backend received % x, want byte-exact COM_QUIT header+payload", pkt)
@@ -390,8 +399,17 @@ func TestEdgeOversizedLengthClaimFailsGracefully(t *testing.T) {
 		t.Fatal("backend conn not closed within 5s of oversized claim + disconnect (hang)")
 	}
 
-	// The relay never forwarded anything: the backend never received a packet
-	// after auth (the relay only writes complete packets).
+	// The Task 8.2 thread-id capture (SELECT CONNECTION_ID() on the raw
+	// backend conn, before the OK to the client) is the ONE packet the
+	// backend sees after auth; drain it — the fake backend already OK'd it,
+	// so the capture degrades to threadID 0 and the session proceeds.
+	capQ := append([]byte{cmdQuery}, "SELECT CONNECTION_ID()"...)
+	if pkt := recvBackendPacket(t, backendRecv); !bytes.Equal(pkt, append([]byte{byte(len(capQ)), byte(len(capQ) >> 8), byte(len(capQ) >> 16), 0}, capQ...)) {
+		t.Fatalf("backend received % x, want the thread-id capture query % x (seq 0)", pkt, capQ)
+	}
+
+	// The relay never forwarded anything else: the backend never received a
+	// packet after the capture (the relay only writes complete packets).
 	select {
 	case p := <-backendRecv:
 		t.Fatalf("backend received a packet it must never see (relay forwarded a partial/giant claim): % x", p)

@@ -578,10 +578,19 @@ func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
 		t.Fatalf("write COM_PING: %v", err)
 	}
 
-	// Exact wire bytes the client wrote: 3-byte LE length + seq + payload.
+	// The Task 8.2 thread-id capture runs FIRST on the raw backend conn
+	// (before the OK packet): the fake backend must have received exactly
+	// the capture's COM_QUERY, and the capture consumed its OK reply, so
+	// the relay stream starts clean.
 	want := func(seq byte, payload []byte) []byte {
 		return append([]byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}, payload...)
 	}
+	capQ := append([]byte{cmdQuery}, "SELECT CONNECTION_ID()"...)
+	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(0, capQ)) {
+		t.Errorf("backend received % x\nwant the thread-id capture query % x (seq 0)", got, want(0, capQ))
+	}
+
+	// Exact wire bytes the client wrote: 3-byte LE length + seq + payload.
 	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(0, query)) {
 		t.Errorf("backend received % x\nwant byte-exact % x (seq 0, trailing NUL preserved)", got, want(0, query))
 	}
@@ -691,10 +700,9 @@ func TestMySQLSessionCaptureLive(t *testing.T) {
 	if _, err := readTextResultSet(client); err != nil {
 		t.Fatalf("read result set: %v", err)
 	}
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, userOut), &ev); err != nil {
-		t.Fatalf("unmarshal select event: %v", err)
-	}
+	// The started lifecycle event precedes the query event on the user
+	// channel — recvQueryEvent skips kind=session events.
+	ev := recvQueryEvent(t, userOut)
 	if ev.Kind != "query" || ev.SQL != sel {
 		t.Errorf("event kind/sql = %q/%q, want query/%q", ev.Kind, ev.SQL, sel)
 	}
@@ -740,10 +748,7 @@ func TestMySQLSessionCaptureLive(t *testing.T) {
 	}
 	// Unmarshal into a FRESH struct: absent omitempty fields (columns/rows
 	// on the error event) do NOT clear values left by the previous event.
-	ev = models.QueryEvent{}
-	if err := json.Unmarshal(recvEvent(t, userOut), &ev); err != nil {
-		t.Fatalf("unmarshal error event: %v", err)
-	}
+	ev = recvQueryEvent(t, userOut)
 	if ev.StmtType != "select" {
 		t.Errorf("error event stmt_type = %q, want select", ev.StmtType)
 	}
@@ -948,10 +953,8 @@ func TestMySQLSessionOverTLS(t *testing.T) {
 	}
 
 	// Capture event flows with the response status (same as plaintext).
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
-		t.Fatalf("unmarshal event: %v", err)
-	}
+	// The started lifecycle event precedes it on the channel — skip it.
+	ev := recvQueryEvent(t, out)
 	if ev.Status != "ok" || ev.StmtType != "select" || ev.SQL != "SELECT 1" {
 		t.Errorf("event = status %q stmt_type %q sql %q, want ok/select/SELECT 1", ev.Status, ev.StmtType, ev.SQL)
 	}

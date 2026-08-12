@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -136,5 +137,159 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 	if sess != nil {
 		t.Fatalf("GetSession after delete: expected nil, got %+v", sess)
+	}
+}
+
+// --- Task 8.2: session directory (sess:live:* keys) -------------------------
+
+func uniqueSid(t *testing.T) string {
+	t.Helper()
+	id, err := newID()
+	if err != nil {
+		t.Fatalf("newID: %v", err)
+	}
+	return "test-sid-" + id
+}
+
+// findLiveRecord returns the record for sid among ListSessions results.
+func findLiveRecord(t *testing.T, recs [][]byte, sid string) []byte {
+	t.Helper()
+	for _, rec := range recs {
+		if bytes.Contains(rec, []byte(`"session_id":"`+sid+`"`)) {
+			return rec
+		}
+	}
+	return nil
+}
+
+// countLiveRecords counts the records for sid among ListSessions results.
+func countLiveRecords(recs [][]byte, sid string) int {
+	n := 0
+	for _, rec := range recs {
+		if bytes.Contains(rec, []byte(`"session_id":"`+sid+`"`)) {
+			n++
+		}
+	}
+	return n
+}
+
+// clearLiveSessions deletes every sess:live:* key (keeps the empty-list
+// assertion deterministic on the shared dev Valkey).
+func clearLiveSessions(t *testing.T, s *ValkeyStore) {
+	t.Helper()
+	ctx := context.Background()
+	cursor := uint64(0)
+	for {
+		res, err := s.client.Do(ctx, s.client.B().Scan().Cursor(cursor).Match("sess:live:*").Count(100).Build()).AsScanEntry()
+		if err != nil {
+			t.Fatalf("cleanup scan: %v", err)
+		}
+		if len(res.Elements) > 0 {
+			_ = s.client.Do(ctx, s.client.B().Del().Key(res.Elements...).Build()).Error()
+		}
+		cursor = res.Cursor
+		if cursor == 0 {
+			return
+		}
+	}
+}
+
+// TestSessionLiveRoundTrip: SetSessionLive writes the record, ListSessions
+// returns it (raw JSON), a refresh updates it in place (still one record),
+// and DelSessionLive removes it — the full key lifecycle.
+func TestSessionLiveRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
+
+	rec1 := []byte(`{"session_id":"` + sid + `","username":"alice","db":"appdb","thread_id":42}`)
+	if err := s.SetSessionLive(ctx, sid, rec1, 60*time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
+	}
+	recs, err := s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got == nil {
+		t.Fatalf("ListSessions after set: record for %s missing (got %d records)", sid, len(recs))
+	} else if string(got) != string(rec1) {
+		t.Fatalf("ListSessions record = %s, want %s", got, rec1)
+	}
+
+	// Refresh: same sid, newer record — still exactly one entry.
+	rec2 := []byte(`{"session_id":"` + sid + `","username":"alice","db":"appdb","thread_id":42,"last_seen":"2026-08-13T00:00:00Z"}`)
+	if err := s.SetSessionLive(ctx, sid, rec2, 60*time.Second); err != nil {
+		t.Fatalf("SetSessionLive refresh: %v", err)
+	}
+	recs, err = s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after refresh: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got == nil || string(got) != string(rec2) {
+		t.Fatalf("ListSessions after refresh = %s, want %s", got, rec2)
+	}
+	// Refresh must not duplicate the key: exactly ONE record for this sid
+	// (the list may legitimately hold other live sessions from packages
+	// running concurrently on the shared dev Valkey).
+	if n := countLiveRecords(recs, sid); n != 1 {
+		t.Fatalf("ListSessions after refresh: %d records for %s, want 1", n, sid)
+	}
+
+	// Deletion: the key is gone.
+	if err := s.DelSessionLive(ctx, sid); err != nil {
+		t.Fatalf("DelSessionLive: %v", err)
+	}
+	recs, err = s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after delete: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got != nil {
+		t.Fatalf("ListSessions after delete: record for %s still present: %s", sid, got)
+	}
+}
+
+// TestSessionLiveTTLExpiry: a short TTL record disappears from the
+// directory once it expires (the heartbeat semantics — an idle session
+// drops off when its heartbeats stop).
+func TestSessionLiveTTLExpiry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
+
+	if err := s.SetSessionLive(ctx, sid, []byte(`{"session_id":"`+sid+`"}`), time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
+	}
+	recs, err := s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if findLiveRecord(t, recs, sid) == nil {
+		t.Fatal("record missing before TTL expiry")
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	recs, err = s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after expiry: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got != nil {
+		t.Fatalf("record still present after TTL expiry: %s", got)
+	}
+}
+
+// TestListSessionsEmpty: an empty directory returns (nil, nil).
+func TestListSessionsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	clearLiveSessions(t, s) // deterministic on the shared dev Valkey
+
+	recs, err := s.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions on empty directory: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("ListSessions on empty directory returned %d records: %s", len(recs), recs)
 	}
 }

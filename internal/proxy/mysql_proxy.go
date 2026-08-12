@@ -17,13 +17,19 @@ import (
 // mysqlSession tracks one established MySQL session: the pending (sniffed but
 // not yet answered) QueryEvent plus the capture of the backend's response.
 // It also serves as the Task 6.4 kill-registry entry: closer force-closes
-// both conns to tear the session down.
+// both conns to tear the session down. The Task 8.2 session-directory fields
+// (db, threadID, startedAt, lastSeen) feed the sess:live:<sid> record.
 type mysqlSession struct {
 	id      string
 	mu      sync.Mutex
 	pending *models.QueryEvent
 	capture *resultCapture
 	closer  func()
+
+	db        string    // client-requested database (empty = no default schema)
+	threadID  int64     // backend CONNECTION_ID(); 0 = capture failed
+	startedAt time.Time // session establishment (UTC)
+	lastSeen  time.Time // last activity — heartbeat stamp (UTC)
 }
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
@@ -213,16 +219,29 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
-	// relay pipes to exit and the defers below to run.
+	// relay pipes to exit and the defers below to run. Task 8.2: the
+	// backend thread id is captured NOW (backend idle, client not yet
+	// told the session is up) and the session is entered in the directory
+	// with a started lifecycle event.
 	s := &mysqlSession{
-		id:     "sid-" + newEventID(),
-		closer: func() { client.Close(); backend.Close() },
+		id:        "sid-" + newEventID(),
+		db:        database,
+		threadID:  captureMySQLThreadID(backend, p.log),
+		startedAt: time.Now().UTC(),
+		lastSeen:  time.Now().UTC(),
+		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
+	// Deferred in this order so teardown is: flushPendingOnClose (any
+	// unanswered query publishes first, re-arming the heartbeat) → finish
+	// session (DelSessionLive + ended event) → unregister.
+	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
+	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
+	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
-		"db_type", tok.DBType, "client", clientAddr)
+		"db_type", tok.DBType, "client", clientAddr, "db", database, "thread_id", s.threadID)
 
 	// 6. bidirectional relay with passive sniffing. Whichever direction ends
 	// first (client quit, backend close, network error) tears down both sides;
@@ -236,8 +255,19 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		p.pipeBackendToClient(backend, client, s)
 		done <- struct{}{}
 	}()
+	// Wait for BOTH relay pipes before teardown (Task 8.2 round-3 race fix):
+	// the first done only means one direction ended — the survivor may still
+	// be inside publishEvent, whose SetSessionLive re-arms the
+	// session-directory heartbeat. Closing both conns unblocks the survivor
+	// (it is normally blocked on a read of the opposite conn); the second
+	// receive then guarantees its final publish — and thus its SetSessionLive
+	// — completed BEFORE the teardown defers run DelSessionLive. A literal
+	// `<-done; <-done` before the closes would deadlock every dropped-client
+	// teardown: the survivor never exits on its own while the opposite conn
+	// stays open.
 	<-done
 	client.Close()
 	backend.Close()
+	<-done
 	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }

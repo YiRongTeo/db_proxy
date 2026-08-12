@@ -255,10 +255,9 @@ func TestPGProxySniffQueryAndTicketChannel(t *testing.T) {
 	pgReadUntilReady(t, front)
 	pgExecQuery(t, front, "SELECT id FROM demo_items") // drains to ReadyForQuery
 
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal user-channel event: %v", err)
-	}
+	// The started lifecycle event precedes the query event — recvQueryEvent
+	// skips kind=session events.
+	ev := recvQueryEvent(t, userCh)
 	if ev.Kind != "query" || ev.SQL != "SELECT id FROM demo_items" {
 		t.Errorf("user event kind=%q sql=%q, want query / SELECT id FROM demo_items", ev.Kind, ev.SQL)
 	}
@@ -281,12 +280,17 @@ func TestPGProxySniffQueryAndTicketChannel(t *testing.T) {
 		t.Errorf("ticket event kind=%q sql=%q ticket=%q, want query / SELECT id FROM demo_items / T-4-3", tick.Kind, tick.SQL, tick.TicketID)
 	}
 
-	// Terminate ends the session and must NOT be sniffed.
+	// Terminate ends the session and must NOT be sniffed; the teardown
+	// publishes the ended lifecycle event on the user channel (never on the
+	// ticket channel).
 	if err := front.Send(&pgproto3.Terminate{}); err != nil {
 		t.Fatalf("send Terminate: %v", err)
 	}
 	waitPGDone(t, done)
-	expectNoEvent(t, userCh)
+	ended := recvSessionEvent(t, userCh)
+	if ended.Action != "ended" || !strings.HasPrefix(ended.SessionID, "sid-") {
+		t.Errorf("ended event action/session = %q/%q, want ended/sid-...", ended.Action, ended.SessionID)
+	}
 	expectNoEvent(t, ticketCh)
 }
 
@@ -315,10 +319,8 @@ func TestPGProxySniffPrepareExecute(t *testing.T) {
 	front.Send(&pgproto3.Sync{})
 	pgDrainUntilReady(t, front)
 
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal execute event: %v", err)
-	}
+	// The started lifecycle event precedes it — recvQueryEvent skips it.
+	ev := recvQueryEvent(t, userCh)
 	if ev.Kind != "execute" || ev.SQL != "EXECUTE SELECT 1" {
 		t.Errorf("execute event kind=%q sql=%q, want execute / EXECUTE SELECT 1", ev.Kind, ev.SQL)
 	}
@@ -341,10 +343,7 @@ func TestPGProxySniffPrepareExecute(t *testing.T) {
 	front.Send(&pgproto3.Sync{})
 	pgDrainUntilReady(t, front)
 
-	ev = models.QueryEvent{} // fresh struct: no stale fields from phase 1
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal evicted execute event: %v", err)
-	}
+	ev = recvQueryEvent(t, userCh)
 	if ev.Kind != "execute" || ev.SQL != "EXECUTE portal=s1" {
 		t.Errorf("evicted execute event kind=%q sql=%q, want execute / EXECUTE portal=s1", ev.Kind, ev.SQL)
 	}
@@ -444,10 +443,8 @@ func TestPGProxyCaptureLive(t *testing.T) {
 	// type plus the captured columns/rows and status ok.
 	sel := "SELECT id,name FROM demo_items ORDER BY id"
 	pgExecQuery(t, front, sel)
-	var ev models.QueryEvent
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal select event: %v", err)
-	}
+	// The started lifecycle event precedes it — recvQueryEvent skips it.
+	ev := recvQueryEvent(t, userCh)
 	if ev.Kind != "query" || ev.SQL != sel {
 		t.Errorf("event kind/sql = %q/%q, want query/%q", ev.Kind, ev.SQL, sel)
 	}
@@ -505,10 +502,7 @@ drained:
 	if errMsg == "" {
 		t.Fatal("expected a backend error for SELECT * FROM nope")
 	}
-	ev = models.QueryEvent{}
-	if err := json.Unmarshal(recvEvent(t, userCh), &ev); err != nil {
-		t.Fatalf("unmarshal error event: %v", err)
-	}
+	ev = recvQueryEvent(t, userCh)
 	if ev.Kind != "query" || ev.SQL != "SELECT * FROM nope" || ev.StmtType != "select" {
 		t.Errorf("error event kind/sql/stmt = %q/%q/%q, want query/SELECT * FROM nope/select",
 			ev.Kind, ev.SQL, ev.StmtType)
@@ -537,6 +531,10 @@ drained:
 		t.Fatalf("send Terminate: %v", err)
 	}
 	waitPGDone(t, done)
-	expectNoEvent(t, userCh)
+	// Teardown publishes the ended lifecycle event on the user channel only.
+	ended := recvSessionEvent(t, userCh)
+	if ended.Action != "ended" || ended.SessionID == "" {
+		t.Errorf("ended event action/session = %q/%q, want ended/<sid>", ended.Action, ended.SessionID)
+	}
 	expectNoEvent(t, ticketCh)
 }

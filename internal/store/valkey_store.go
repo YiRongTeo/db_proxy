@@ -207,3 +207,54 @@ func (s *ValkeyStore) GetSession(ctx context.Context, id string) (*models.Sessio
 func (s *ValkeyStore) DeleteSession(ctx context.Context, id string) error {
 	return s.client.Do(ctx, s.client.B().Del().Key("sess:ui:"+id).Build()).Error()
 }
+
+// sessionLivePrefix keys the session directory entries (Task 8.2):
+// sess:live:<session_id> = JSON session record with a heartbeat TTL.
+const sessionLivePrefix = "sess:live:"
+
+// SetSessionLive stores (or refreshes) a live session record with a TTL
+// (SETEX). rec is the raw JSON marshaled by the data plane; ttl is the
+// heartbeat — an idle-but-open session drops off the directory when its
+// heartbeats stop (documented Phase 8 behavior).
+func (s *ValkeyStore) SetSessionLive(ctx context.Context, sid string, rec []byte, ttl time.Duration) error {
+	return s.client.Do(ctx, s.client.B().Set().Key(sessionLivePrefix+sid).Value(string(rec)).Ex(ttl).Build()).Error()
+}
+
+// DelSessionLive removes a live session record (session close).
+func (s *ValkeyStore) DelSessionLive(ctx context.Context, sid string) error {
+	return s.client.Do(ctx, s.client.B().Del().Key(sessionLivePrefix+sid).Build()).Error()
+}
+
+// ListSessions returns the raw JSON records of all live sessions: a full
+// SCAN of sess:live:* (cursor walk) followed by MGET. Records whose keys
+// expired between the SCAN and the MGET are skipped. Errors are wrapped;
+// an empty directory returns (nil, nil).
+func (s *ValkeyStore) ListSessions(ctx context.Context) ([][]byte, error) {
+	var keys []string
+	cursor := uint64(0)
+	for {
+		res, err := s.client.Do(ctx, s.client.B().Scan().Cursor(cursor).Match(sessionLivePrefix+"*").Count(100).Build()).AsScanEntry()
+		if err != nil {
+			return nil, fmt.Errorf("list sessions scan: %w", err)
+		}
+		keys = append(keys, res.Elements...)
+		cursor = res.Cursor
+		if cursor == 0 {
+			break
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	vals, err := s.client.Do(ctx, s.client.B().Mget().Key(keys...).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list sessions mget: %w", err)
+	}
+	recs := make([][]byte, 0, len(vals))
+	for _, v := range vals {
+		if v != "" { // key expired between SCAN and MGET → nil → skip
+			recs = append(recs, []byte(v))
+		}
+	}
+	return recs, nil
+}

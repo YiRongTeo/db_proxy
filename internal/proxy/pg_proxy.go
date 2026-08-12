@@ -18,12 +18,19 @@ import (
 // but not yet answered) QueryEvent plus the capture of the backend's
 // response. It also serves as the Task 6.4 kill-registry entry: closer
 // force-closes both conns to tear the session down. Mirrors mysqlSession.
+// The Task 8.2 session-directory fields (db, threadID, startedAt, lastSeen)
+// feed the sess:live:<sid> record.
 type pgSession struct {
 	id      string
 	mu      sync.Mutex
 	pending *models.QueryEvent
 	capture *pgResultCapture
 	closer  func()
+
+	db        string    // client-requested database (raw startup value, may be "")
+	threadID  int64     // backend pg_backend_pid(); 0 = capture failed
+	startedAt time.Time // session establishment (UTC)
+	lastSeen  time.Time // last activity — heartbeat stamp (UTC)
 }
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the
@@ -203,16 +210,28 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
-	// relay pipes to exit and the defers below to run.
+	// relay pipes to exit and the defers below to run. Task 8.2: the
+	// backend pid is captured NOW (backend idle) and the session is
+	// entered in the directory with a started lifecycle event.
 	s := &pgSession{
-		id:     "sid-" + newEventID(),
-		closer: func() { client.Close(); front.Close() },
+		id:        "sid-" + newEventID(),
+		db:        sm.Parameters["database"],
+		threadID:  capturePGThreadID(front, p.log),
+		startedAt: time.Now().UTC(),
+		lastSeen:  time.Now().UTC(),
+		closer:    func() { client.Close(); front.Close() },
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
+	// Deferred in this order so teardown is: flushPendingOnClose (any
+	// unanswered query publishes first, re-arming the heartbeat) → finish
+	// session (DelSessionLive + ended event) → unregister.
+	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
+	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
+	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
-		"db_type", tok.DBType, "client", clientAddr)
+		"db_type", tok.DBType, "client", clientAddr, "db", s.db, "thread_id", s.threadID)
 
 	// 5. bidirectional relay with passive SQL sniffing and response
 	// capture. Whichever direction ends first (client quit, backend close,
@@ -227,8 +246,19 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		p.pipePGBackendToClient(front, be, s)
 		done <- struct{}{}
 	}()
+	// Wait for BOTH relay pipes before teardown (Task 8.2 round-3 race fix,
+	// PG mirror of the MySQL fix): the first done only means one direction
+	// ended — the survivor may still be inside publishEvent, whose
+	// SetSessionLive re-arms the session-directory heartbeat. Closing both
+	// conns unblocks the survivor (it is normally blocked on a read of the
+	// opposite conn); the second receive then guarantees its final publish —
+	// and thus its SetSessionLive — completed BEFORE the teardown defers run
+	// DelSessionLive. A literal `<-done; <-done` before the closes would
+	// deadlock every dropped-client teardown: the survivor never exits on its
+	// own while the opposite conn stays open.
 	<-done
 	client.Close()
 	front.Close()
+	<-done
 	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }

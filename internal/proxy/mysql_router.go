@@ -3,13 +3,72 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"zerotrust-proxy/internal/models"
 )
+
+// captureMySQLThreadID asks the freshly connected backend for its connection
+// id — SELECT CONNECTION_ID() on the RAW conn while the backend session is
+// still idle (before the OK packet is written to the client, so there is no
+// client traffic to interleave). The FULL response is consumed (column
+// count, column defs, EOF, row, terminating EOF) so the byte-exact relay
+// starts from a clean stream with the backend's seq counter back at rest.
+//
+// Task 8.2 degrade-gracefully rule: ANY failure — write/read error, ERR
+// packet, non-result-set reply (e.g. a stub backend answering OK), unparsable
+// cell — logs and returns 0. The session proceeds with threadID 0; the
+// session directory simply lacks connection context for kill-query.
+func captureMySQLThreadID(backend net.Conn, log *slog.Logger) int64 {
+	if err := writeMySQLPacket(backend, 0, append([]byte{cmdQuery}, "SELECT CONNECTION_ID()"...)); err != nil {
+		log.Warn("thread id capture: write failed", "err", err)
+		return 0
+	}
+	var threadID int64
+	stage := 0 // 0 = awaiting column count, 1 = column defs, 2 = rows
+	for {
+		_, payload, err := readMySQLPacket(backend)
+		if err != nil {
+			log.Warn("thread id capture: read failed", "err", err)
+			return 0
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		switch payload[0] {
+		case 0xff: // ERR packet — capture failed
+			log.Warn("thread id capture: backend error", "err", mysqlErrMessage(payload))
+			return 0
+		case 0x00: // OK (no result set — non-SELECT/stub backend): nothing to read
+			return 0
+		case 0xfe: // EOF: ends the column defs (→ rows) or the rows (→ done)
+			if stage == 1 {
+				stage = 2
+				continue
+			}
+			return threadID
+		}
+		switch stage {
+		case 0:
+			stage = 1 // column count packet
+		case 1:
+			// column definition — skipped
+		case 2:
+			// TEXT-protocol DataRow with exactly one cell (validated by
+			// parseMySQLRow's want-count check).
+			if row, consumed := parseMySQLRow(payload, 1); consumed > 0 {
+				if v, err := strconv.ParseInt(row[0], 10, 64); err == nil {
+					threadID = v
+				}
+			}
+		}
+	}
+}
 
 // backendKey identifies a credential entry: "<ip>:<port>:<db_user>".
 func backendKey(t *models.TokenPayload) string {

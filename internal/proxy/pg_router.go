@@ -3,12 +3,58 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"strconv"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v5"
 	"zerotrust-proxy/internal/models"
 )
+
+// capturePGThreadID asks the freshly connected backend for its backend pid —
+// a raw Q 'SELECT pg_backend_pid()' on the hijacked conn while the backend
+// session is still idle (before the relay starts, so there is no client
+// traffic to interleave). The FULL exchange is consumed (RowDescription,
+// DataRow, CommandComplete, ReadyForQuery) so the message-level relay starts
+// from a clean stream.
+//
+// Task 8.2 degrade-gracefully rule: ANY failure — send/receive error,
+// ErrorResponse, unparsable cell — logs and returns 0. The session proceeds
+// with pid 0; the session directory simply lacks connection context.
+func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
+	if err := front.f.Send(&pgproto3.Query{String: "SELECT pg_backend_pid()"}); err != nil {
+		log.Warn("thread id capture: send failed", "err", err)
+		return 0
+	}
+	var pid int64
+	for {
+		msg, err := front.f.Receive()
+		if err != nil {
+			log.Warn("thread id capture: receive failed", "err", err)
+			return 0
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			// Re-encode to raw framing and decode the payload (int16 count +
+			// per-cell int32 len + bytes) with the 1-column validation.
+			raw, err := m.Encode(nil)
+			if err != nil || len(raw) < 5 {
+				continue
+			}
+			if row, ok := parsePGDataRow(raw[5:], 1); ok {
+				if v, err := strconv.ParseInt(row[0], 10, 64); err == nil {
+					pid = v
+				}
+			}
+		case *pgproto3.ErrorResponse:
+			log.Warn("thread id capture: backend error", "err", m.Message)
+			return 0
+		case *pgproto3.ReadyForQuery: // exchange fully consumed — stream is clean
+			return pid
+		}
+	}
+}
 
 // pgFrontend wraps the hijacked backend connection with a pgproto3 Frontend
 // (we act as the client toward the real PostgreSQL server).
