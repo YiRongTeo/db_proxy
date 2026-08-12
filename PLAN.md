@@ -2206,3 +2206,51 @@ Sentinel itself requires auth (sentinel.conf `requirepass`) — separate from th
 3. Tests: BuildClientOption wiring assertion (sentinel username/password land in SentinelOption; data password stays in ClientOption); LIVE: scripts/sentinel.conf gains `requirepass sentinelpw`; TestLiveSentinelRoundTrip updated to pass SentinelPassword: "sentinelpw" (round trip + pub/sub still pass); NEW negative assertion: connecting WITHOUT the sentinel password → error (AUTH failed) — proves the password is actually required.
 4. RUN.md §6: sentinel run line + config snippet show requirepass + sentinel_password; note master password stays under `password`.
 5. Full suite + ng test + build; commit; report.
+
+# Phase 8: Checker sessions + two-level kill (user directive 2026-08-13)
+
+Amendment 11 in hermes-agent-spec.md. Three requirements: (a) checker connects per SESSION (select a session, view its feed); (b) session list visible to the checker: username, session_id, db, db_user; (c) kill split into KILL QUERY (abort in-flight query only, session survives) vs KILL CONNECTION (terminate the maker's session — the existing behavior, relabeled).
+
+## Design
+
+**Session directory (decoupling preserved — all via Valkey):**
+- Data plane session record: `{session_id, username, db_user, db_type, db, started_at, last_seen, thread_id|pid}`. `db` = client-requested database (MySQL CONNECT_WITH_DB / PG startup database).
+- `sess:live:<sid>` key = JSON session record, SETEX TTL 60s: SET on session start, REFRESH on every published event, DEL on session end. (Idle-but-open sessions drop off after 60s — documented.)
+- Lifecycle events: on start/end publish a QueryEvent with `kind="session"`, `action="started"|"ended"` (new QueryEvent fields `Action`, `DB` — omitempty, backward-compatible) to `queries:<user>` + `queries:sess:<sid>`.
+- Every query event additionally published to `queries:sess:<sid>`.
+- Control plane `GET /api/sessions` → SCAN `sess:live:*` → list (no HTTP between planes).
+
+**Two-level kill:**
+- `ctl:kill` payload: `{"session_id": "...", "mode": "query"|"connection"}` — mode absent = "connection" (backward compat).
+- KILL CONNECTION: existing KillSession (closes client + backend conns).
+- KILL QUERY (data plane): session records `thread_id` (MySQL `SELECT CONNECTION_ID()`) / `pid` (PG `SELECT pg_backend_pid()`) captured right after backend connect, BEFORE the OK to the client (backend is idle; read the single-row result raw). On kill-query: open a SECOND backend connection with the same creds → MySQL `KILL QUERY <thread_id>` (same-user allowed) / PG `SELECT pg_cancel_backend(<pid>)` (same-user allowed) → read response → close. The maker's in-flight query aborts (client sees an error result for it); the session stays alive. No active query → idempotent ok with a note.
+- Control plane `/api/kill` accepts optional `mode` (default connection); checker gets TWO buttons.
+
+## Task 8.1: Models — QueryEvent += Action, DB (omitempty; round-trip + backward-compat tests; TS interface sync deferred to 8.5)
+
+## Task 8.2: Data plane — session directory + lifecycle
+1. mysql_proxy.go/pg_proxy.go: session record struct + registry entries gain {db, thread_id/pid, started_at, last_seen}. db: MySQL = the parsed CONNECT_WITH_DB (already forwarded in 3.7); PG = startup database. thread/pid: after backend connect, before OK: MySQL write COM_QUERY "SELECT CONNECTION_ID()" via writeMySQLPacket on the raw backend conn, read + parse first cell (reuse parseMySQLRow, 1 col); PG send Q "SELECT pg_backend_pid()" raw, parse DataRow.
+2. store: `SetSessionLive(ctx, sid string, rec []byte, ttl)` (SETEX), `DelSessionLive` (DEL), `ListSessions` (SCAN sess:live:* + MGET) — add to ValkeyStore + tests (round trip, TTL, empty).
+3. Relay wiring: on session start → SET + publish lifecycle event (kind=session, action=started, session fields incl. db + db_user + username); on EVERY event publish → refresh SETEX; on session close → DEL + publish action=ended. All events also published to `queries:sess:<sid>`.
+4. Tests: lifecycle events (subscribe queries:alice + queries:sess:<sid> — both receive started/ended with correct fields); sess:live key appears/refresh/vanishes (TTL or DEL); per-session channel receives only that session's events (two concurrent sessions, no cross-talk).
+
+## Task 8.3: Data plane — two-level kill
+1. ctl:kill handler (cmd/data/main.go + killer): parse {session_id, mode}; mode=connection → existing KillSession; mode=query → new `KillQuery(sid) bool`: registry lookup → open second backend conn (mysql_router/pg_router reuse) → send KILL QUERY / pg_cancel_backend → read response → close second conn → log outcome. Both modes return true/false for the log line ("session killed" / "query killed" / "kill: unknown session").
+2. Tests: unit — payload parse (mode default connection); LIVE — (a) kill-query: maker runs SELECT SLEEP(60) through the proxy (background client), ctl:kill {sid, mode:query} → maker's client gets an ERROR for the sleep (query aborted) BUT the session stays: the maker immediately runs SELECT 1 → OK (session survived); (b) kill-connection: SLEEP session + {sid, mode:connection} → 2013 lost connection + registry empty + sess:live deleted; (c) isolation re-asserted for both modes (bystander unaffected).
+
+## Task 8.4: Control plane — GET /api/sessions + kill mode
+1. store.ListSessions → handler `GET /api/sessions` (requireSession) → 200 [{session_id, username, db_user, db_type, db, started_at, last_seen}].
+2. handleKill: optional mode (default connection) → publish {"session_id", "mode"}.
+3. Tests: sessions 401/200 (live valkey: seed sess:live keys directly, assert the list shape); kill mode passthrough (subscriber receives the mode field; absent mode → "connection").
+
+## Task 8.5: Angular — session selector + two kill buttons
+1. ApiService: `sessions()` GET /api/sessions; `killSession(sessionId, mode)` POST /api/kill {session_id, mode}; QueryEvent TS interface += action?, db?.
+2. Checker: session selector (nz-select) — options from /api/sessions on load + live add/remove via kind=session events (action started/ended); options show `username · session_id · db · db_user`; a "live (all)" option = current channel behavior. Selecting a session switches the WS channel to `sess:<sid>`; events in the table get a session-context tag; back to "live (all)" → `*`.
+3. Kill column becomes two buttons: "Kill query" (mode=query, nz-popconfirm) and "Kill connection" (mode=connection, nz-popconfirm danger); killed state per event id as today (connection kill marks killed; query kill shows a "query killed" message and keeps the row live).
+4. Tests: selector renders sessions from the API + live add/remove; channel switching (mock WS — assert subscribe channel string); two kill buttons call killSession with the right mode; session-event rows show started/ended.
+
+## Task 8.6: Integration gate
+Full stack: both planes + valkey (plaintext quick pass is fine; TLS pass optional for this phase — do plaintext to keep the gate fast, note TLS unaffected since the wire code is untouched). Matrix: (1) /api/sessions lists the active session with correct fields after a maker connects (mysql + pg); (2) session events appear in WS; (3) checker selects the session → only that session's events arrive (second concurrent session's events do NOT appear); (4) KILL QUERY: SLEEP aborts with an error, same session runs SELECT 1 OK after; (5) KILL CONNECTION: 2013 + session gone from /api/sessions; (6) isolation: bystander unaffected by both modes; (7) gates: go suite + ng test + build; (8) commit; (9) report.
+
+## Phase 8 gate
+All tasks reviewed; full suites green; amendment 11 verified end-to-end; ledger updated.
