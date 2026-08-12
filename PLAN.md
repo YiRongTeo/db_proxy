@@ -71,7 +71,7 @@ GRANT SELECT ON appdb.* TO 'ro_user'@'%';
 CREATE USER 'rw_user'@'%' IDENTIFIED WITH mysql_native_password BY 'rw_pw';
 GRANT ALL PRIVILEGES ON appdb.* TO 'rw_user'@'%';
 CREATE TABLE IF NOT EXISTS demo_items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100));
-INSERT INTO demo_items (name) VALUES ('alpha'),('bravo'),('charlie');
+INSERT INTO demo_items (name) VALUES ('test'),('bravo'),('charlie');
 FLUSH PRIVILEGES;"
 ```
 **Verify:** `docker exec mysql-test mysql -uroot -proot_pw -e "SELECT COUNT(*) FROM appdb.demo_items;"` → 3.
@@ -2088,7 +2088,7 @@ func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
 ## Task 6.8: Enhancement integration gate
 Full matrix (both planes up, containers up):
 1. Ticket required: POST /api/token without ticket_id → 400; with → 200.
-2. SELECT through proxy (mysql client): event arrives with stmt_type=select, status=ok, columns=[id,name], rows=[[1,alpha],[2,bravo],[3,charlie]], truncated=false; checker WS receives it.
+2. SELECT through proxy (mysql client): event arrives with stmt_type=select, status=ok, columns=[id,name], rows=[[1,test],[2,bravo],[3,charlie]], truncated=false; checker WS receives it.
 3. INSERT through proxy (rw_user token): event status=ok, stmt_type=insert, no rows; row actually inserted (verify via direct container query).
 4. Deliberate error (e.g. SELECT * FROM nonexistent): event status=error with message containing "doesn't exist"; query still relayed byte-exact.
 5. UPDATE: stmt_type=update, status=ok.

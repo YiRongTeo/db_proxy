@@ -60,7 +60,7 @@ GRANT SELECT ON appdb.* TO 'ro_user'@'%';
 CREATE USER 'rw_user'@'%' IDENTIFIED WITH mysql_native_password BY 'rw_pw';
 GRANT ALL PRIVILEGES ON appdb.* TO 'rw_user'@'%';
 CREATE TABLE IF NOT EXISTS demo_items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100));
-INSERT INTO demo_items (name) VALUES ('alpha'),('bravo'),('charlie');
+INSERT INTO demo_items (name) VALUES ('test'),('bravo'),('charlie');
 FLUSH PRIVILEGES;"
 ```
 
@@ -180,7 +180,7 @@ For PostgreSQL swap `"db_type":"postgres"` and the backend port `"db_port":"5433
 ```bash
 docker exec mysql-test mysql -h host.docker.internal -P 3306 -u "$TOKEN" -proot_pw appdb \
   -e "SELECT id,name FROM demo_items;"
-# expect: 3 rows (alpha/bravo/charlie); password is ignored — the TOKEN is the credential
+# expect: 3 rows (test/bravo/charlie); password is ignored — the TOKEN is the credential
 ```
 
 ### 4.2 psql through the proxy (same shared port 3306!)

@@ -349,3 +349,156 @@ func TestMySQLKillSessionLive(t *testing.T) {
 		t.Fatalf("observer session broken after kill: %v", err)
 	}
 }
+
+// --- Task 6.8: session-scoped kill isolation (live, three sessions) ---------
+
+// TestKillIsolationLive is the final-gate isolation regression: THREE live
+// sessions against mysql-test through one proxy; killing the MIDDLE session
+// (by the id the checker would use) must close exactly that client, leave the
+// other in-flight session untouched (its long SLEEP completes with the correct
+// result and it keeps round-tripping), let a THIRD fresh session connect and
+// query afterwards, and report unknown ids as false without disturbing anyone.
+func TestKillIsolationLive(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+
+	setToken := func(user, ticket string) string {
+		token, err := store.NewToken()
+		if err != nil {
+			t.Fatalf("NewToken: %v", err)
+		}
+		tok := models.TokenPayload{Username: user, DBUser: "ro_user",
+			DBIP: "127.0.0.1", DBPort: "3307", DBType: "mysql", TicketID: ticket}
+		if err := vs.SetToken(ctx, token, tok, time.Minute); err != nil {
+			t.Fatalf("SetToken: %v", err)
+		}
+		return token
+	}
+	tokenA := setToken("iso-a", "T-6-8-a")
+	tokenB := setToken("iso-b", "T-6-8-b")
+	tokenC := setToken("iso-c", "T-6-8-c")
+
+	// One subscription per user → each client maps to exactly its session id
+	// (the published event's session_id is what the checker would kill with).
+	sub := func(channel string) <-chan []byte {
+		subCtx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		out := make(chan []byte, 16)
+		acked := make(chan struct{}, 1)
+		subCtx = valkey.WithOnSubscriptionHook(subCtx, func(valkey.PubSubSubscription) {
+			select {
+			case acked <- struct{}{}:
+			default:
+			}
+		})
+		go vs.Subscribe(subCtx, channel, false, out)
+		waitSubAck(t, acked)
+		return out
+	}
+	outA := sub("queries:iso-a")
+	outB := sub("queries:iso-b")
+
+	var logBuf bytes.Buffer
+	ln, p := startKillTestProxy(t, vs, &logBuf)
+
+	// connect dials a session, runs a quick SELECT, and returns the client
+	// plus the session id from the published event (the checker's view).
+	connect := func(token string, out <-chan []byte) (net.Conn, string) {
+		t.Helper()
+		c := dialTestMySQLSession(t, ln, token)
+		if err := writeMySQLPacket(c, 0, append([]byte{cmdQuery}, "SELECT 1"...)); err != nil {
+			t.Fatalf("write SELECT 1: %v", err)
+		}
+		if _, err := readTextResultSet(c); err != nil {
+			t.Fatalf("read result set: %v", err)
+		}
+		var ev models.QueryEvent
+		if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
+			t.Fatalf("unmarshal event: %v", err)
+		}
+		if !strings.HasPrefix(ev.SessionID, "sid-") {
+			t.Fatalf("session_id = %q, want sid- prefix", ev.SessionID)
+		}
+		return c, ev.SessionID
+	}
+	clientA, sidA := connect(tokenA, outA)
+	clientB, sidB := connect(tokenB, outB)
+
+	// Both clients go into long server-side SLEEPs (SLEEP blocks in MySQL, so
+	// each session is genuinely in-flight mid-query when the kill lands).
+	for _, c := range []net.Conn{clientA, clientB} {
+		if err := writeMySQLPacket(c, 0, append([]byte{cmdQuery}, "SELECT SLEEP(8)"...)); err != nil {
+			t.Fatalf("write SLEEP: %v", err)
+		}
+	}
+	// Give both SLEEPs time to reach the backend and start sleeping, and
+	// confirm both sessions are registered in the kill registry.
+	time.Sleep(1500 * time.Millisecond)
+	for name, sid := range map[string]string{"A": sidA, "B": sidB} {
+		p.mu.Lock()
+		_, present := p.sessions[sid]
+		p.mu.Unlock()
+		if !present {
+			t.Fatalf("session %s (%s) not registered while sleeping", name, sid)
+		}
+	}
+
+	// The kill: exactly session A, by the id the checker would use.
+	if !p.KillSession(sidA) {
+		t.Fatalf("KillSession(%q) on a live session returned false", sidA)
+	}
+
+	// 1. Session A is gone: its client read fails immediately, and the session
+	// unregisters as handleConn unwinds on the closed conns.
+	if _, _, err := readMySQLPacket(clientA); err == nil {
+		t.Fatal("client A read succeeded after kill — conn not closed")
+	}
+	waitSessionUnregistered(t, p, sidA)
+
+	// 4. Unknown id → false; the still-sleeping session B is not disturbed.
+	if p.KillSession("sid-no-such-iso") {
+		t.Fatal("KillSession(unknown) returned true")
+	}
+
+	// 2. Session B is UNAFFECTED: its SLEEP completes with the correct result
+	// (SLEEP returns one row whose value is 0) and it keeps round-tripping.
+	rows, err := readTextResultSet(clientB)
+	if err != nil {
+		t.Fatalf("client B's SLEEP failed after A's kill: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("SLEEP result rows = %d, want 1", len(rows))
+	}
+	if v, ok := decodeLenencString(rows[0]); !ok || v != "0" {
+		t.Fatalf("SLEEP result cell = %q (ok=%v), want \"0\"", v, ok)
+	}
+	if err := writeMySQLPacket(clientB, 0, append([]byte{cmdQuery}, "SELECT 42"...)); err != nil {
+		t.Fatalf("write B SELECT 42: %v", err)
+	}
+	rows, err = readTextResultSet(clientB)
+	if err != nil {
+		t.Fatalf("client B's follow-up query failed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("SELECT 42 rows = %d, want 1", len(rows))
+	}
+	if v, ok := decodeLenencString(rows[0]); !ok || v != "42" {
+		t.Fatalf("SELECT 42 cell = %q (ok=%v), want \"42\"", v, ok)
+	}
+
+	// 3. A THIRD fresh session connects and queries fine after the kill.
+	clientC := dialTestMySQLSession(t, ln, tokenC)
+	if err := writeMySQLPacket(clientC, 0, append([]byte{cmdQuery}, "SELECT 'fresh-ok'"...)); err != nil {
+		t.Fatalf("write C SELECT: %v", err)
+	}
+	rows, err = readTextResultSet(clientC)
+	if err != nil {
+		t.Fatalf("fresh session C failed after kill: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("C SELECT rows = %d, want 1", len(rows))
+	}
+	if v, ok := decodeLenencString(rows[0]); !ok || v != "fresh-ok" {
+		t.Fatalf("C SELECT cell = %q (ok=%v), want \"fresh-ok\"", v, ok)
+	}
+}
