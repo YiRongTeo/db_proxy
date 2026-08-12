@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -52,6 +54,107 @@ func startGatingProxy(t *testing.T, vs *store.ValkeyStore, creds map[string]stri
 var gatingCreds = map[string]string{
 	"127.0.0.1:3307:rw_user": "rw_pw",
 	"127.0.0.1:3307:ro_user": "ro_pw",
+}
+
+// cleanupMarkerRow registers a deferred, best-effort DELETE of the marker row
+// DIRECTLY against the live backend (127.0.0.1:3307 as rw_user), bypassing the
+// proxy and its gate, so a test that fails after INSERTing its marker can
+// never leave residue in demo_items. Leftover markers break
+// TestMySQLSessionCaptureLive, which asserts the EXACT 3-row seed — this
+// cleanup keeps that assertion stable even when a gating test Fatalfs
+// mid-way (inline cleanups that run through the proxy cannot: the watcher
+// may be gone and the DELETE itself gated).
+func cleanupMarkerRow(t *testing.T, marker string) {
+	t.Helper()
+	t.Cleanup(func() {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:3307", 5*time.Second)
+		if err != nil {
+			t.Logf("cleanup: dial backend: %v", err)
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		_, hs, err := readMySQLPacket(conn)
+		if err != nil {
+			t.Logf("cleanup: read handshake: %v", err)
+			return
+		}
+		salt, err := handshakeSalt(hs)
+		if err != nil {
+			t.Logf("cleanup: parse handshake: %v", err)
+			return
+		}
+		// mysql_native_password scramble (rw_user is created with that
+		// plugin — PLAN.md seed): SHA1(pw) XOR SHA1(salt + SHA1(SHA1(pw))).
+		stage1 := sha1.Sum([]byte("rw_pw"))
+		stage2 := sha1.Sum(stage1[:])
+		h := sha1.New()
+		h.Write(salt)
+		h.Write(stage2[:])
+		stage3 := h.Sum(nil)
+		auth := make([]byte, 20)
+		for i := range auth {
+			auth[i] = stage1[i] ^ stage3[i]
+		}
+		caps := uint32(capProtocol41 | capSecureConnection | capConnectWithDB)
+		resp := binary.LittleEndian.AppendUint32(nil, caps)
+		resp = binary.LittleEndian.AppendUint32(resp, 1<<24)
+		resp = append(resp, 33) // charset utf8_general_ci
+		resp = append(resp, make([]byte, 23)...)
+		resp = append(resp, "rw_user"...)
+		resp = append(resp, 0x00)
+		resp = append(resp, byte(len(auth)))
+		resp = append(resp, auth...)
+		resp = append(resp, "appdb"...)
+		resp = append(resp, 0x00)
+		if err := writeMySQLPacket(conn, 1, resp); err != nil {
+			t.Logf("cleanup: write handshake response: %v", err)
+			return
+		}
+		if _, pkt, err := readMySQLPacket(conn); err != nil || len(pkt) == 0 || pkt[0] != 0x00 {
+			t.Logf("cleanup: backend auth failed: err=%v pkt=% x", err, pkt)
+			return
+		}
+		q := append([]byte{cmdQuery}, "DELETE FROM demo_items WHERE name = '"+marker+"'"...)
+		if err := writeMySQLPacket(conn, 0, q); err != nil {
+			t.Logf("cleanup: write DELETE: %v", err)
+			return
+		}
+		if _, pkt, err := readMySQLPacket(conn); err != nil || len(pkt) == 0 || pkt[0] != 0x00 {
+			t.Logf("cleanup: DELETE failed: err=%v pkt=% x", err, pkt)
+		}
+	})
+}
+
+// handshakeSalt extracts the 20-byte auth-plugin-data (8-byte part1 +
+// 12-byte part2) from a HandshakeV10 payload as sent by a real MySQL server.
+func handshakeSalt(p []byte) ([]byte, error) {
+	if len(p) < 34 || p[0] != 0x0a {
+		return nil, errors.New("not a HandshakeV10 payload")
+	}
+	rest := p[1:]
+	i := bytes.IndexByte(rest, 0) // server version terminator
+	if i < 0 {
+		return nil, errors.New("unterminated server version")
+	}
+	rest = rest[i+1:]
+	if len(rest) < 4+8+1+2+1+2+2+1+10 {
+		return nil, errors.New("handshake truncated before auth data")
+	}
+	salt := append([]byte{}, rest[4:12]...) // skip conn id (4); part1 (8)
+	pos := 4 + 8 + 1 + 2 + 1 + 2 + 2        // filler, caps low, charset, status, caps high
+	pluginLen := int(rest[pos])
+	pos++
+	pos += 10 // reserved
+	part2Len := 13
+	if pluginLen > 8 {
+		part2Len = pluginLen - 8
+	}
+	if len(rest) < pos+part2Len {
+		return nil, errors.New("handshake truncated in auth-plugin-data part2")
+	}
+	return append(salt, rest[pos:pos+part2Len-1]...), nil // drop trailing NUL
 }
 
 // readMySQLErrPacket reads one MySQL packet and asserts it is an ERR packet.
@@ -261,6 +364,7 @@ func TestMySQLWriteGateBlocksUnwatched(t *testing.T) {
 	vs := proxyTestStore(t)
 	ctx := context.Background()
 	marker := fmt.Sprintf("gate-marker-%d", time.Now().UnixNano())
+	cleanupMarkerRow(t, marker)
 
 	rwToken, err := store.NewToken()
 	if err != nil {
@@ -320,6 +424,7 @@ func TestMySQLWriteGateWatcherPass(t *testing.T) {
 	vs := proxyTestStore(t)
 	ctx := context.Background()
 	marker := fmt.Sprintf("gate-marker-%d", time.Now().UnixNano())
+	cleanupMarkerRow(t, marker)
 
 	rwToken, err := store.NewToken()
 	if err != nil {
@@ -422,6 +527,7 @@ func TestMySQLWriteGateWatcherRemovedMidSession(t *testing.T) {
 	vs := proxyTestStore(t)
 	ctx := context.Background()
 	marker := fmt.Sprintf("gate-marker-%d", time.Now().UnixNano())
+	cleanupMarkerRow(t, marker)
 
 	rwToken, err := store.NewToken()
 	if err != nil {
