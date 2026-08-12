@@ -16,7 +16,7 @@ containers already exist (assumed up from Phase 0). The two `go run` boots + fir
 | Docker Desktop running | `docker info --format '{{.ServerVersion}}'` prints a version |
 | Go toolchain (1.25+) | `go version` |
 | git-bash (or WSL) on Windows | this guide's commands are bash-flavored |
-| Optional: PM2 (`npm i -g pm2`) | `pm2 --version` — only needed for the PM2 path (§5) |
+| Optional: PM2 (`npm i -g pm2`) | `pm2 --version` — only needed for the PM2 path (§7) |
 
 The three containers (`valkey`, `mysql-test`, `pg-test`) are the **only** external services for the
 default plaintext posture. Phase 7 (TLS/sentinel, §6) adds two optional ones: `valkey-tls` and
@@ -315,7 +315,7 @@ ZT_VALKEY_SENTINEL_ADDRS='["127.0.0.1:26379"]' go run ./cmd/control
 ```bash
 # token over HTTPS — same payloads as §3 (API-key or session-cookie flavor)
 TOKEN=$(curl -sk -X POST https://127.0.0.1:8080/api/token \
-  -H "X-Api-Key: dev-ke...-me" -H 'Content-Type: application/json' \
+  -H "X-Api-Key: $ZT_API_API_KEY" -H 'Content-Type: application/json' \
   -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 
@@ -365,6 +365,8 @@ pm2 restart zt-data                # e.g. after config change
 #    PM2: pm2 stop zt-data && pm2 stop zt-control   (or: pm2 delete ecosystem.config.cjs)
 # 2. optional: stop containers (data stays in the named volumes)
 docker stop pg-test mysql-test valkey
+#    Phase 7 containers (optional, TLS + sentinel): they may stay up between runs —
+#    if you stop them: docker stop valkey-tls valkey-sentinel
 # 3. verify the host ports are free:
 netstat -ano | grep -E ':(8080|3306|6379|3307|5433)\s' | grep -i listen
 #    expect: NO output (containers stopped) or only the container-mapped backend ports
