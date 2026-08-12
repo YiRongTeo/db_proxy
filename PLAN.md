@@ -2249,8 +2249,36 @@ Amendment 11 in hermes-agent-spec.md. Three requirements: (a) checker connects p
 3. Kill column becomes two buttons: "Kill query" (mode=query, nz-popconfirm) and "Kill connection" (mode=connection, nz-popconfirm danger); killed state per event id as today (connection kill marks killed; query kill shows a "query killed" message and keeps the row live).
 4. Tests: selector renders sessions from the API + live add/remove; channel switching (mock WS — assert subscribe channel string); two kill buttons call killSession with the right mode; session-event rows show started/ended.
 
-## Task 8.6: Integration gate
+## Task 8.9: Integration gate (combined)
 Full stack: both planes + valkey (plaintext quick pass is fine; TLS pass optional for this phase — do plaintext to keep the gate fast, note TLS unaffected since the wire code is untouched). Matrix: (1) /api/sessions lists the active session with correct fields after a maker connects (mysql + pg); (2) session events appear in WS; (3) checker selects the session → only that session's events arrive (second concurrent session's events do NOT appear); (4) KILL QUERY: SLEEP aborts with an error, same session runs SELECT 1 OK after; (5) KILL CONNECTION: 2013 + session gone from /api/sessions; (6) isolation: bystander unaffected by both modes; (7) gates: go suite + ng test + build; (8) commit; (9) report.
 
+## Task 8.6: Maker write-gating (user directive 2026-08-13)
+
+A read-WRITE maker cannot trigger ANY query unless a checker is connected to their session.
+
+1. Config/control: db_presets gain `access: read|write` (committed control.yaml: MySQL read-only → read, MySQL read-write → write, PG read-only → read). handleToken sets the new TokenPayload field.
+2. models: TokenPayload += `Access string json:"access,omitempty"` (read|write; round-trip + backward-compat tests).
+3. Control plane WS hub (internal/api/websocket.go): when a checker subscribes with channel `sess:<sid>` → SET `watch:<sid>` EX 30; per-checker heartbeat goroutine refreshes every 10s while connected (and while its channel stays sess:<sid> — channel switches update/remove the key); on disconnect → DEL `watch:<sid>` (only the one it held). Helper `setWatch/refreshWatch/clearWatch` on the hub (store SETEX/DEL reuse — store already has SET/DEL surface; add if missing).
+4. Data plane: session.access from the token (registry field). In the client→backend relay, BEFORE forwarding any SQL-executing command (MySQL COM_QUERY 0x03, COM_STMT_PREPARE 0x16, COM_STMT_EXECUTE 0x17; PG 'Q', 'P', 'E') on a session with access=="write": `EXISTS watch:<sid>` (store helper `WatchActive(ctx, sid) (bool, error)`, errors → treat as active? NO — fail closed: on error, BLOCK with the same error (fail-safe)); not watched → reply to the client with an error (MySQL errPacket 1045 "maker gating: no checker connected to session <sid>"; PG ErrorResponse FATAL 28000 same message), DO NOT forward, still publish the QueryEvent with status=error + that message (audit trail shows the block).
+5. Tests: unit — gate decision helper (watched/unwatched/error); LIVE — rw token: (a) no watcher → query blocked with the error, backend untouched (verify via a side effect: INSERT fails AND row absent), event published status=error; (b) watcher present (SET watch:<sid> directly) → query passes; (c) read-only token: no watcher → query passes (gate only for write); (d) watcher removed mid-session → next query blocked.
+6. Docs: RUN.md — explain the rule + how the checker watching a session enables writes.
+
+## Task 8.7: Credential API provider (user directive 2026-08-13)
+
+Alternative backend-credential source: fetch the DB password from an API per connect; NEVER stored or logged.
+
+1. data.yaml: `credentials_source: config` (default; keeps the committed credentials list) | `api`; `credentials_api: {url: "...", api_key: "", timeout_seconds: 5}`. Loader fields + defaults (env ZT_CREDENTIALS_SOURCE etc.).
+2. internal/proxy: `type CredResolver interface { Password(ctx context.Context, key string) (string, error) }`; `ConfigCredResolver{creds map[string]string}` (current behavior); `APICredResolver{url, apiKey string, timeout time.Duration, hc *http.Client}` — GET `{url}?db_type=&db_user=&db_ip=&db_port=` (query params from the parsed key parts) with `X-Api-Key`; 200 → {password}; non-200 → error WITHOUT the response body content (status code only); net/http default logging absent (no client logging). connectMySQLBackend/connectPostgresBackend switch from the raw map to the resolver (proxies hold the resolver; NewMySQLProxy/NewPGProxy signatures gain it — update ALL call sites incl. tests; config resolver wraps the existing map so tests are unchanged in behavior).
+3. Password hygiene (HARD): password lives in memory for the connect call only; NEVER logged (no field in any log line; error messages carry status codes / key, not the password); never written to disk; no caching beyond the in-flight connect.
+4. cmd/data/main.go: build the resolver from cfg (api mode → APICredResolver with the configured url/key/timeout; config mode → ConfigCredResolver).
+5. Tests: unit — APICredResolver against httptest.Server (200 → password used; 404 → error mentioning status; key query params correct — assert the request URL); config resolver unchanged behavior; LIVE — api-mode data plane against a tiny local vault stub (httptest in a test harness OR a temp HTTP server in the gate): full session works, password NOT in the data plane log (grep). Negative: vault 404 → connect fails with a clean error, no password in logs.
+
+## Task 8.8: Query logging with output flag (user directive 2026-08-13)
+
+1. data.yaml: `log_query_output: false` (default; env ZT_LOG_QUERY_OUTPUT).
+2. Data plane publish path (both proxies): after publishing each query event → `log.Info("query", "username", ..., "ticket_id", ..., "db_user", ..., "db", ..., "db_type", ..., "stmt_type", ..., "status", ..., "session_id", ..., "sql", ev.SQL)`; when cfg.LogQueryOutput: also "columns", ev.Columns, "row_count", len(ev.Rows), "rows", ev.Rows (already capped 100/512/64KB by capture; truncated flag logged too). Session lifecycle events logged at Info as "session started"/"session ended" with the same context fields (no SQL).
+3. NO credentials ever (house rule + resolver hygiene); no token values.
+4. Tests: capture the logger (slog with a buffer handler in tests) — query log line contains the context fields + SQL; with log_query_output=true also columns/rows; false → absent. Live: data plane log grep shows the query line with context, and with the flag on, the rows.
+
 ## Phase 8 gate
-All tasks reviewed; full suites green; amendment 11 verified end-to-end; ledger updated.
+All tasks reviewed; full suites green; amendments 11 + 12 verified end-to-end; ledger updated.
