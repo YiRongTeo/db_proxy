@@ -1915,8 +1915,8 @@ func (c *resultCapture) feed(payload []byte) {
 			c.columns = append(c.columns, name)
 		}
 		if len(c.columns) >= c.colCount { c.stage = 2 }
-	case 2: // data row
-		row, consumed := parseMySQLRow(payload)
+	case 2: // data row (TEXT protocol: lenenc cells, no leading count)
+		row, consumed := parseMySQLRow(payload, c.colCount)
 		if consumed > 0 {
 			if len(c.rows) < capMaxRows && c.bytes+len(payload) <= capMaxEvent {
 				c.rows = append(c.rows, row)
@@ -1980,20 +1980,37 @@ func readLenencString(p []byte, off int) (int, int, bool) {
 	return start, int(n), true
 }
 
-// parseMySQLRow decodes a DataRow packet into cells; returns (nil,0) on malformed.
-func parseMySQLRow(p []byte) ([]string, int) {
-	n, sz, ok := readLenencInt(p, 0)
-	if !ok || n == 0 || n > 1024 { return nil, 0 }
-	off := sz
-	row := make([]string, 0, n)
-	for i := uint64(0); i < n; i++ {
-		if off < len(p) && p[off] == 0xfb { row = append(row, ""); off++; continue }
+// parseMySQLRow decodes a TEXT-protocol DataRow into cells. VERIFIED LIVE
+// (2026-08-12, packet dump through the relay): text rows carry NO leading
+// field-count byte — they are a plain sequence of lenenc strings (first byte
+// is the first cell's length). Cells parse until the payload is exhausted;
+// the count is validated against the captured column count when known.
+// (A leading-count format is the BINARY protocol — not used here.)
+func parseMySQLRow(p []byte, want int) ([]string, int) {
+	if len(p) == 0 {
+		return nil, 0
+	}
+	off := 0
+	row := make([]string, 0, 8)
+	for off < len(p) {
+		if p[off] == 0xfb { // NULL cell
+			row = append(row, "")
+			off++
+			continue
+		}
 		start, ln, ok := readLenencString(p, off)
-		if !ok { return nil, 0 }
+		if !ok {
+			return nil, 0
+		}
 		cell := string(p[start : start+ln])
-		if len(cell) > capMaxCell { cell = cell[:capMaxCell] + "…" }
+		if len(cell) > capMaxCell {
+			cell = cell[:capMaxCell] + "…"
+		}
 		row = append(row, cell)
 		off = start + ln
+	}
+	if want > 0 && len(row) != want {
+		return nil, 0
 	}
 	return row, off
 }
