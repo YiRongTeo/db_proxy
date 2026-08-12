@@ -2106,17 +2106,20 @@ Amendment 10 in hermes-agent-spec.md. Scope: (a) Control Plane HTTPS (HTTP+WS+SP
 ## Task 7.1: Config shapes (control.yaml + data.yaml + loaders)
 
 ```yaml
-# control.yaml additions
-tls:                    # optional; when cert_file+key_file present → HTTPS on http.addr
+# control.yaml additions — EXPLICIT ENABLE SWITCH (user directive 2026-08-12):
+# every TLS surface is on/off via config. enabled: true REQUIRES cert_file+key_file (fail fast); absent/false = plaintext.
+tls:
+  enabled: false          # ← explicit on/off; no implicit file-based toggles
   cert_file: "certs/control.crt"
   key_file:  "certs/control.key"
 
 # data.yaml additions
 tls:
+  enabled: false
   cert_file: "certs/data.crt"
   key_file:  "certs/data.key"
 
-# valkey block (BOTH configs) — backward compatible:
+# valkey block (BOTH configs) — backward compatible; ssl.enabled is the explicit switch:
 valkey:
   mode: direct          # direct | sentinel
   addr: "127.0.0.1:6379"      # direct mode
@@ -2131,7 +2134,7 @@ valkey:
     key_file: ""
     skip_verify: false
 ```
-Go (internal/config/config.go): `CertConfig{CertFile, KeyFile string}` (plane TLS), `ValkeySSL{Enabled, CAFile, CertFile, KeyFile bool/string, SkipVerify bool}`, `ValkeyConfig{Mode, Addr, MasterName string, SentinelAddrs []string, Password string, DB int, SSL ValkeySSL}` — LoadControl/LoadData gain `TLS *CertConfig` and `Valkey ValkeyConfig` (keep field name `Valkey` for minimal churn; the old flat `ValkeyAddr/ValkeyPassword/ValkeyDB` fields are REPLACED by the struct — update the two mains + tests accordingly; direct mode with no ssl block must produce identical behavior to today). Defaults: mode=direct, addr=127.0.0.1:6379. Tests: parse both configs; sentinel mode defaults; ssl block defaults.
+Go (internal/config/config.go): `CertConfig{Enabled bool, CertFile, KeyFile string}` (plane TLS — Enabled true + missing files → Load error), `ValkeySSL{Enabled, CAFile, CertFile, KeyFile, SkipVerify}`, `ValkeyConfig{Mode, Addr, MasterName, SentinelAddrs, Password, DB, SSL}` — LoadControl/LoadData gain `TLS *CertConfig` and `Valkey ValkeyConfig` (replacing the flat fields); mode=direct default; ssl.enabled default false.
 
 ## Task 7.2: Store — TLS + sentinel via valkey-go (verified v1.0.76 API)
 
