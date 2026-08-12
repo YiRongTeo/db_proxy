@@ -2282,3 +2282,43 @@ Alternative backend-credential source: fetch the DB password from an API per con
 
 ## Phase 8 gate
 All tasks reviewed; full suites green; amendments 11 + 12 verified end-to-end; ledger updated.
+
+# Phase 9: MSSQL support (user directive 2026-08-13)
+
+Amendment 13 in hermes-agent-spec.md. Add Microsoft SQL Server (TDS) as a third wire protocol on the shared data-plane listener, with the FULL feature parity of MySQL/PG: token auth, audit + capture, session directory, two-level kill, write-gating, TLS negotiation, credential API mode, query logging.
+
+## Wire facts (TDS 7.4+)
+- Client-first: prelogin packet (type 0x12, 8-byte header: type/status/len/spid/packetid/window). Detection: first byte 0x12 → mssql (0x00 → pg; silence → mysql).
+- Prelogin payload: offset/length pairs — ENCRYPTION (0x01) negotiation: server replies ENCRYPT_ON(0x01) when tls.enabled, ENCRYPT_NOT_SUP(0x02) otherwise; when encryption negotiated the TLS handshake runs RAW (not TDS-framed) immediately after the prelogin response, then Login7 inside TLS (MySQL-style pattern from 7.4; NO TDS seq — TDS has no sequence numbers, packetid is a session counter the client manages; the 7.4 seq lesson does not apply, but the bufferedConn + fresh-br pattern does).
+- Login7 (0x10): fixed header + offset/length table (username, password [obfuscated with the fixed magic XOR key 0x03..0x54 — documented, hand-rollable], appname, server, library, language, database, clienthostname...). Auth: username=token → GETDEL single-use → build a NEW login7 to the backend with the REAL db_user + real password (obfuscated with the same key), keep the client's other fields (database, appname...); client's own password field ignored/zeroed. Wrong-db-type → login7 response with an ERROR token (mirror 1045/28000 semantics).
+- Client→server: SQL batch 0x01 (raw TDS SQL text), RPC 0x03 (procedure), ATTENTION 0x06 (cancel), LOGOUT 0x0E. Server→client: LOGINACK 0xAD, ENVCHANGE 0xE3 (database/language/packet size + SPID), ERROR 0xAA (message), INFO 0xAB, COLMETADATA 0x81 (columns), ROW 0xD1 (cells), DONE 0xFD / DONEINPROC 0xFF / DONEERROR 0xFE (completion + status; DONEERROR → status=error).
+- Kill-query: ATTENTION on the LIVE backend conn (connection-scoped cancel — no SPID needed; the in-flight batch aborts with an attention/error result, session survives). Kill-connection: registry closer (both conns).
+- Capture: COLMETADATA (type info + length-prefixed names) → columns; ROW cells parsed per SQL type (int/bigint, varchar/nvarchar with collation prefix, bit, datetime, decimal, binary — a MINI type table for the common types; unknown → raw bytes as string); caps 100 rows/512 chars/64KB + truncated. Status from DONE*/ERROR; multi-result batches → first result set (MySQL/PG parity).
+
+## Task 9.1: Infra + detection + config
+1. mssql container: `mcr.microsoft.com/mssql/server:2022-latest`, host :1434, ACCEPT_EULA=Y, strong SA password; mixed-mode SQL logins ro_user (SELECT on appdb) + rw_user (SELECT/INSERT/UPDATE/DELETE); db appdb + demo_items(id,name) seeded via sqlcmd (mssql-tools18 in-image; -C for cert trust). Note sqlcmd v18 defaults to Encrypt=mandatory — determine the empirical flags for plaintext (-N optional? connection-string Encrypt=Optional?) vs TLS mode; document.
+2. Dispatcher detection: first client byte 0x12 → mssql (before/after the pg 0x00 branch — read the dispatcher); tests for all three protocols' first-byte routing.
+3. configs: data.yaml credentials += mssql:<user>@127.0.0.1:1434 entries; control.yaml db_presets += mssql read-only (ro_user, access read) + mssql read-write (rw_user, access write); config tests.
+4. gate: full suite green; commit.
+
+## Task 9.2: TDS core — prelogin + login7 auth
+1. internal/proxy/mssql_packet.go: 8-byte header read/write (LE length), prelogin build/parse (offset/length walk), encryption negotiation per tlsCfg (ENCRYPT_ON + raw TLS handshake via bufferedConn pattern when enabled; NOT_SUP otherwise).
+2. mssql_proxy.go: handleConn — read prelogin (client-first, deadline 10s) → respond → [TLS if negotiated] → Login7 → parse (offset/length table) → GETDEL (token as username; wrong-db-type → ERROR-token login response; expired/consumed → same) → build backend login7 (real creds, magic-key obfuscation, keep database field) → connectPostgresBackend-style mssql backend connect (:1434 per token db_ip/db_port) → relay LOGINACK/ENVCHANGE/DONE to the client → session established (registry + lifecycle events + sess:live + queries:sess:<sid> — mirror 8.2 wiring).
+3. Session record: db from login7 database field (fallback envchange); threadID n/a (0) — attention-based kill.
+4. Tests: framing unit (header round trip, length edge); prelogin negotiation bytes (ON vs NOT_SUP vs client REQ+disabled → honest NOT_SUP); login7 parse (all fields incl. database); obfuscation (known plaintext → magic-key bytes — golden vector from the spec); LIVE: sqlcmd connect (plaintext mode + TLS mode when tls.enabled) → token accepted, wrong token → clean failure, pg/mysql token on mssql → protocol mismatch error.
+
+## Task 9.3: Relay + capture + session
+1. Relay: pipe client→backend (SQL batch 0x01 + RPC 0x03 sniff → classifyStmt + stash pending; ATTENTION 0x06, LOGOUT 0x0E pass through) + backend→client (feed capture pre-write: COLMETADATA→columns, ROW→cells mini-type table, DONE*/ERROR→status; publish on completion to queries:<user> + queries:ticket:<t> + queries:sess:<sid>; flush-on-close; pointer-identity guard) — mirror mysql_relay.go/pg_relay.go structure.
+2. mssqlResultCapture: token state machine (metadata → rows → done), caps 100/512/64KB, truncated flag; classifyStmt reuse.
+3. Tests: unit token parse (metadata walk, row cells per type, done/error statuses, truncation); LIVE sqlcmd: SELECT demo_items → event stmt_type=select status=ok columns/rows; bad table → status=error + message; INSERT → stmt_type=insert; session lifecycle events + per-session channel; two concurrent sessions no cross-talk.
+
+## Task 9.4: Kill + gating
+1. KillQuery(mssql): send ATTENTION (0x06, header len 8) on the LIVE backend conn → in-flight batch aborts (client sees the attention error), session survives; kill-connection via registry.
+2. Write-gating: access=write sessions → WatchActive check before forwarding SQL batch/RPC (fail closed, ERROR token to client + audit event).
+3. Tests LIVE: WAITFOR DELAY '00:00:30' + kill-query → aborted (attention error), same session SELECT 1 OK; kill-connection → client error + registry/sess:live cleanup; gating blocked/pass/ro-exempt/watcher-removed (mirror 8.6 matrix); isolation.
+
+## Task 9.5: Integration gate
+Full stack matrix: (1) token via API (mssql preset) → sqlcmd connect through :3306 → SELECT 3 rows + checker WS event with capture; (2) INSERT + audit event; (3) error query event; (4) session selector lists the mssql session (db=appdb); (5) kill-query WAITFOR + kill-connection E2E; (6) gating rw without watcher blocked + watcher enables; (7) TLS mode pass (tls.enabled + sqlcmd -C -N) IF the container client supports it empirically (else document + test via a Go TDS client); (8) credential API mode (8.7) covers mssql db_type; (9) log hygiene; (10) RUN.md mssql section (container, sqlcmd client commands with -C and encryption flags, presets); (11) gates: go suite + ng test + build; commit; report.
+
+## Phase 9 gate
+All tasks reviewed; full suites green; amendment 13 verified end-to-end; ledger updated.
