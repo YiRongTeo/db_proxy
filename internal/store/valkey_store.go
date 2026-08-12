@@ -259,6 +259,51 @@ func (s *ValkeyStore) ListSessions(ctx context.Context) ([][]byte, error) {
 	return recs, nil
 }
 
+// watchPrefix keys the checker-presence records (Task 8.6): watch:<sid>
+// exists while at least one checker is subscribed to the session's own
+// channel (sess:<sid>). The Data Plane's maker write-gate probes it with
+// WatchActive before relaying SQL on write-access sessions.
+const watchPrefix = "watch:"
+
+// SetWatch records checker presence on a session (watch:<sid>) with a
+// presence lease ttl — the Control Plane WS hub sets it on subscribe to
+// channel sess:<sid> and refreshes it on a heartbeat while the checker
+// stays connected (SET … EX semantics).
+func (s *ValkeyStore) SetWatch(ctx context.Context, sid string, ttl time.Duration) error {
+	return s.client.Do(ctx, s.client.B().Set().Key(watchPrefix+sid).Value("1").Ex(ttl).Build()).Error()
+}
+
+// DelWatch removes checker presence for a session (checker disconnected or
+// switched away from the session's channel).
+func (s *ValkeyStore) DelWatch(ctx context.Context, sid string) error {
+	return s.client.Do(ctx, s.client.B().Del().Key(watchPrefix+sid).Build()).Error()
+}
+
+// WatchActive reports whether a checker is currently watching the session
+// (EXISTS watch:<sid>) — the Data Plane's maker write-gate probe. Callers
+// treat an error as FAIL CLOSED (the gate blocks the command).
+func (s *ValkeyStore) WatchActive(ctx context.Context, sid string) (bool, error) {
+	n, err := s.client.Do(ctx, s.client.B().Exists().Key(watchPrefix+sid).Build()).AsInt64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// WatchTTL returns the remaining presence lease of a watch key (0 when the
+// key is absent or has no expiry) — used by tests to prove the hub's
+// heartbeat refreshes the lease rather than merely setting the key once.
+func (s *ValkeyStore) WatchTTL(ctx context.Context, sid string) (time.Duration, error) {
+	secs, err := s.client.Do(ctx, s.client.B().Ttl().Key(watchPrefix+sid).Build()).AsInt64()
+	if err != nil {
+		return 0, err
+	}
+	if secs < 0 {
+		return 0, nil // -1 no expiry / -2 missing — neither is a valid lease
+	}
+	return time.Duration(secs) * time.Second, nil
+}
+
 // SessionInfo is the checker-facing session directory entry (Task 8.4),
 // decoded from the data plane's sess:live:<sid> records. ThreadID is
 // intentionally NOT exposed: it is a backend-internal connection identifier

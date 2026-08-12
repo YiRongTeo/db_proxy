@@ -37,10 +37,73 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 			return
 		}
 		p.sniffPGMessage(msg, cache, s, tok, clientAddr)
+		// Task 8.6 maker write-gate: check BEFORE forwarding, per message
+		// (never cached), fail-closed. A blocked message is answered to the
+		// CLIENT (FATAL 28000) and NOT forwarded; the sniffed event is
+		// published immediately as status=error so the audit trail shows it.
+		if p.gatePGMessage(be, msg, s) {
+			continue
+		}
 		if err := front.f.Send(msg); err != nil { // relay unchanged
 			return
 		}
 	}
+}
+
+// gatePGMessage implements the Task 8.6 maker write-gate on the PG relay:
+// a SQL-executing message (SimpleQuery 'Q', Parse 'P', Execute 'E') on a
+// write-access session is allowed only while a checker watches the session
+// (EXISTS watch:<sid>). Returns true when the message was BLOCKED — the
+// caller must not forward it. Unwatched (or store error — fail closed) →
+// ErrorResponse FATAL 28000 with the gating message is sent to the client;
+// SimpleQuery also gets the trailing ReadyForQuery a simple-query response
+// always ends with, while extended-protocol messages (P/E) get the bare
+// ErrorResponse — the client's Sync (relayed) draws the backend's
+// ReadyForQuery.
+func (p *PGProxy) gatePGMessage(be *pgproto3.Backend, msg pgproto3.FrontendMessage, s *pgSession) bool {
+	if s.access != "write" {
+		return false
+	}
+	var gated bool
+	switch msg.(type) {
+	case *pgproto3.Query, *pgproto3.Parse, *pgproto3.Execute:
+		gated = true
+	}
+	if !gated {
+		return false
+	}
+	watched, err := p.vs.WatchActive(context.Background(), s.id)
+	if err != nil {
+		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
+	} else if watched {
+		return false
+	}
+	blockMsg := gatingMessage(s.id)
+	_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000", Message: blockMsg})
+	if _, ok := msg.(*pgproto3.Query); ok {
+		_ = be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	}
+	p.publishBlocked(s, blockMsg)
+	return true
+}
+
+// publishBlocked publishes the session's pending event immediately with
+// status=error and the gating message (Task 8.6): a message blocked by the
+// maker write-gate never reaches the backend, so no backend response will
+// ever complete the pending capture — the audit trail must still show the
+// block. The pending slot is cleared so the next message starts fresh.
+func (p *PGProxy) publishBlocked(s *pgSession, msg string) {
+	s.mu.Lock()
+	ev := s.pending
+	s.pending = nil
+	s.capture = nil
+	s.mu.Unlock()
+	if ev == nil {
+		return
+	}
+	ev.Status = "error"
+	ev.Error = msg
+	p.publishEvent(s, ev)
 }
 
 // pipePGBackendToClient relays backend messages back to the client, feeding

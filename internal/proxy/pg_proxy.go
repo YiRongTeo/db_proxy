@@ -33,6 +33,7 @@ type pgSession struct {
 	startedAt time.Time            // session establishment (UTC)
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
+	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
 }
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the
@@ -293,6 +294,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
 		tok:       tok,
+		access:    tok.Access,
 		closer:    func() { client.Close(); front.Close() },
 	}
 	p.registerSession(s)

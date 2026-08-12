@@ -11,6 +11,7 @@ type TokenPayload struct {
 	DBPort   string `json:"db_port"`             // backend DB port
 	DBType   string `json:"db_type"`             // "mysql" | "postgres"
 	TicketID string `json:"ticket_id,omitempty"` // optional maker-checker grouping
+	Access   string `json:"access,omitempty"`    // "read" | "write" (Task 8.6 maker write-gating); absent = read
 }
 
 // TokenResponse is returned by POST /api/token.

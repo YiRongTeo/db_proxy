@@ -43,6 +43,109 @@ func cleanupKey(t *testing.T, s *ValkeyStore, key string) {
 	})
 }
 
+// TestWatchPresence (Task 8.6): SetWatch makes WatchActive true with a TTL
+// lease, a refresh re-arms the lease, DelWatch removes presence, and
+// WatchTTL reports 0 for an absent key (never negative).
+func TestWatchPresence(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "watch:"+sid)
+
+	active, err := s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive before set: %v", err)
+	}
+	if active {
+		t.Error("WatchActive before set = true, want false")
+	}
+	ttl, err := s.WatchTTL(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchTTL before set: %v", err)
+	}
+	if ttl != 0 {
+		t.Errorf("WatchTTL before set = %v, want 0", ttl)
+	}
+
+	if err := s.SetWatch(ctx, sid, 30*time.Second); err != nil {
+		t.Fatalf("SetWatch: %v", err)
+	}
+	active, err = s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive after set: %v", err)
+	}
+	if !active {
+		t.Error("WatchActive after set = false, want true")
+	}
+	ttl, err = s.WatchTTL(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchTTL after set: %v", err)
+	}
+	if ttl <= 0 || ttl > 30*time.Second {
+		t.Errorf("WatchTTL after set = %v, want (0, 30s]", ttl)
+	}
+
+	// Refresh re-arms the lease (heartbeat semantics): TTL must not shrink.
+	if err := s.SetWatch(ctx, sid, 30*time.Second); err != nil {
+		t.Fatalf("SetWatch refresh: %v", err)
+	}
+	ttl2, err := s.WatchTTL(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchTTL after refresh: %v", err)
+	}
+	if ttl2 < ttl {
+		t.Errorf("WatchTTL shrank on refresh: %v -> %v", ttl, ttl2)
+	}
+
+	if err := s.DelWatch(ctx, sid); err != nil {
+		t.Fatalf("DelWatch: %v", err)
+	}
+	active, err = s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive after delete: %v", err)
+	}
+	if active {
+		t.Error("WatchActive after delete = true, want false")
+	}
+	ttl, err = s.WatchTTL(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchTTL after delete: %v", err)
+	}
+	if ttl != 0 {
+		t.Errorf("WatchTTL after delete = %v, want 0", ttl)
+	}
+}
+
+// TestWatchPresenceTTLExpiry: an un-refreshed watch key expires on its own —
+// a crashed checker/hub cannot leave a stale "watched" state forever.
+func TestWatchPresenceTTLExpiry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "watch:"+sid)
+
+	if err := s.SetWatch(ctx, sid, time.Second); err != nil {
+		t.Fatalf("SetWatch: %v", err)
+	}
+	active, err := s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive: %v", err)
+	}
+	if !active {
+		t.Fatal("WatchActive before expiry = false, want true")
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+
+	active, err = s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive after expiry: %v", err)
+	}
+	if active {
+		t.Error("WatchActive after TTL expiry = true, want false")
+	}
+}
+
 func TestSetTokenGetDeleteTokenSingleUse(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

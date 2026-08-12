@@ -32,6 +32,7 @@ type mysqlSession struct {
 	startedAt time.Time            // session establishment (UTC)
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
+	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
 }
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
@@ -291,6 +292,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
 		tok:       tok,
+		access:    tok.Access,
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
@@ -310,7 +312,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// the second done-slot is buffered so the survivor never blocks.
 	done := make(chan struct{}, 2)
 	go func() {
-		p.pipeClientToBackend(br, backend, s, tok, clientAddr)
+		p.pipeClientToBackend(br, backend, client, s, tok, clientAddr)
 		done <- struct{}{}
 	}()
 	go func() {

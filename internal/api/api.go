@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/store"
@@ -20,6 +21,12 @@ type api struct {
 	cfg  *config.ControlConfig
 	vs   *store.ValkeyStore
 	auth *authMiddleware
+
+	// Task 8.6 maker write-gate: checker watch presence lease + heartbeat
+	// period. Zero values fall back to watchPresenceTTL / watchHeartbeat —
+	// tests shorten them via these fields so heartbeats are observable fast.
+	watchTTL       time.Duration
+	watchHeartbeat time.Duration
 }
 
 // NewAPI builds the Control Plane API with its dependencies.

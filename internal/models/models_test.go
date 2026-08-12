@@ -36,6 +36,47 @@ func TestTokenPayloadRoundTrip(t *testing.T) {
 	})
 }
 
+func TestTokenPayloadAccessRoundTrip(t *testing.T) {
+	// Task 8.6: the access field (read|write) round-trips through JSON.
+	roundTrip(t, TokenPayload{
+		Username: "alice.ad",
+		DBUser:   "app_rw",
+		DBIP:     "10.0.0.5",
+		DBPort:   "3306",
+		DBType:   "mysql",
+		TicketID: "TCKT-1042",
+		Access:   "write",
+	})
+}
+
+func TestTokenPayloadEmptyAccessOmitted(t *testing.T) {
+	// Task 8.6 backward compatibility: a payload without access (legacy
+	// tokens / read-only targets) must marshal WITHOUT the access key — the
+	// data plane reads its absence as "read" (gate not applied).
+	p := TokenPayload{
+		Username: "alice.ad",
+		DBUser:   "app_ro",
+		DBIP:     "10.0.0.5",
+		DBPort:   "3306",
+		DBType:   "mysql",
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "access") {
+		t.Errorf("expected access to be omitted, got %s", data)
+	}
+	// And an old wire payload WITHOUT the key decodes with Access == "".
+	var got TokenPayload
+	if err := json.Unmarshal([]byte(`{"username":"alice.ad","db_user":"app_ro","db_ip":"10.0.0.5","db_port":"3306","db_type":"mysql","ticket_id":"TCKT-1042"}`), &got); err != nil {
+		t.Fatalf("unmarshal legacy payload: %v", err)
+	}
+	if got.Access != "" {
+		t.Errorf("legacy payload decoded Access = %q, want \"\"", got.Access)
+	}
+}
+
 func TestTokenPayloadEmptyTicketIDOmitted(t *testing.T) {
 	p := TokenPayload{
 		Username: "alice.ad",

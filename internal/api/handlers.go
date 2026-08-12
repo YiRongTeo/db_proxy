@@ -101,6 +101,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	payload := models.TokenPayload{
 		Username: req.Username, DBUser: req.DBUser, DBIP: req.DBIP,
 		DBPort: req.DBPort, DBType: req.DBType, TicketID: req.TicketID,
+		Access: a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort),
 	}
 	ttl := time.Duration(a.cfg.TokenTTL) * time.Second
 	if err := a.vs.SetToken(r.Context(), token, payload, ttl); err != nil {
@@ -109,13 +110,28 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.log.Info("token issued", "username", payload.Username, "db_user", payload.DBUser,
-		"db_type", payload.DBType, "ticket", payload.TicketID)
+		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access)
 	writeJSON(w, http.StatusOK, models.TokenResponse{
 		Token:     token,
 		Host:      a.cfg.DataPlaneHost,
 		Port:      a.cfg.DataPlanePort,
 		ExpiresIn: a.cfg.TokenTTL,
 	})
+}
+
+// accessForPreset resolves the token's access level from the db_preset that
+// matches the requested target (Task 8.6 maker write-gating): a token issued
+// for a read-write preset carries access="write" and is subject to the data
+// plane's write gate (queries blocked unless a checker watches the session).
+// No matching preset → "" — the data plane treats absent access as read (no
+// gate), so tokens for ad-hoc targets stay ungated.
+func (a *api) accessForPreset(dbType, dbUser, dbIP, dbPort string) string {
+	for _, p := range a.cfg.DBPresets {
+		if p.DBType == dbType && p.DBUser == dbUser && p.DBIP == dbIP && p.DBPort == dbPort {
+			return p.Access
+		}
+	}
+	return ""
 }
 
 // handleKill queues a data-plane session kill (session required). The kill

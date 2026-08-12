@@ -81,12 +81,15 @@ type ControlConfig struct {
 // DBPreset is one selectable database target in the Maker portal.
 // json tags keep the /api/db-presets wire contract snake_case (spec §5);
 // mapstructure tags are used by viper when reading configs/control.yaml.
+// Access (Task 8.6) is the maker write-gate level: "read" presets never
+// gate, "write" presets require a checker watching the session.
 type DBPreset struct {
 	Name   string `mapstructure:"name" json:"name"`
 	DBType string `mapstructure:"db_type" json:"db_type"`
 	DBUser string `mapstructure:"db_user" json:"db_user"`
 	DBIP   string `mapstructure:"db_ip" json:"db_ip"`
 	DBPort string `mapstructure:"db_port" json:"db_port"`
+	Access string `mapstructure:"access" json:"access"` // read | write (Task 8.6)
 }
 
 // readValkey reads the valkey block through the SAME viper instance that read

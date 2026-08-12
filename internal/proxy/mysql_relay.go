@@ -13,9 +13,11 @@ import (
 	"zerotrust-proxy/internal/models"
 )
 
-// pipeClientToBackend: read client packets, sniff SQL, relay byte-exact.
-// br must be the same buffered reader used during protocol detection.
-func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend net.Conn, s *mysqlSession, tok *models.TokenPayload, clientAddr string) {
+// pipeClientToBackend: read client packets, sniff SQL, gate (Task 8.6),
+// relay byte-exact. br must be the same buffered reader used during
+// protocol detection. client is the session's client conn — the target for
+// the maker write-gate's synthesized ERR replies.
+func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.Conn, s *mysqlSession, tok *models.TokenPayload, clientAddr string) {
 	for {
 		seq, payload, err := readMySQLPacket(br)
 		if err != nil {
@@ -23,6 +25,18 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend net.Conn, s *
 		}
 		if len(payload) > 0 {
 			p.sniffCommand(s, payload[0], payload[1:], tok, clientAddr)
+		}
+		// Task 8.6 maker write-gate: check BEFORE forwarding, per command
+		// (never cached), fail-closed. A blocked command is answered with
+		// ERR 1045 to the CLIENT and NOT forwarded — the backend never sees
+		// it — and the sniffed event is published immediately as status=error
+		// so the audit trail shows the block.
+		if len(payload) > 0 {
+			if msg := p.checkWriteGate(s, payload[0]); msg != "" {
+				_ = writeMySQLPacket(client, seq+1, errPacket(1045, "42000", msg))
+				p.publishBlocked(s, msg)
+				continue
+			}
 		}
 		if err := writeMySQLPacket(backend, seq, payload); err != nil {
 			return
@@ -110,6 +124,60 @@ func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *m
 	s.pending = &ev
 	s.capture = &resultCapture{}
 	s.mu.Unlock()
+}
+
+// sqlExecCommands are the MySQL client commands that execute SQL on the
+// backend — the maker write-gate's gated set (Task 8.6): COM_QUERY,
+// COM_STMT_PREPARE, COM_STMT_EXECUTE. COM_INIT_DB (USE) changes only the
+// default schema and is deliberately not gated.
+func isSQLExecCommand(cmd byte) bool {
+	return cmd == cmdQuery || cmd == cmdPrepare || cmd == cmdExecute
+}
+
+// gatingMessage is the maker write-gate block text shown to the client and
+// recorded in the audit event.
+func gatingMessage(sid string) string {
+	return fmt.Sprintf("maker gating: no checker connected to session %s", sid)
+}
+
+// checkWriteGate implements the Task 8.6 maker write-gate decision: a
+// SQL-executing command on a write-access session is allowed only while a
+// checker watches the session (EXISTS watch:<sid>). Returns "" when the
+// command may proceed; otherwise the block message. The check runs PER
+// COMMAND — never cached — and FAILS CLOSED: a store error blocks the
+// command exactly like an absent watcher (the error is logged).
+func (p *MySQLProxy) checkWriteGate(s *mysqlSession, cmd byte) string {
+	if s.access != "write" || !isSQLExecCommand(cmd) {
+		return ""
+	}
+	watched, err := p.vs.WatchActive(context.Background(), s.id)
+	if err != nil {
+		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
+		return gatingMessage(s.id)
+	}
+	if !watched {
+		return gatingMessage(s.id)
+	}
+	return ""
+}
+
+// publishBlocked publishes the session's pending event immediately with
+// status=error and the gating message (Task 8.6): a command blocked by the
+// maker write-gate never reaches the backend, so no backend response will
+// ever complete the pending capture — the audit trail must still show the
+// block. The pending slot is cleared so the next command starts fresh.
+func (p *MySQLProxy) publishBlocked(s *mysqlSession, msg string) {
+	s.mu.Lock()
+	ev := s.pending
+	s.pending = nil
+	s.capture = nil
+	s.mu.Unlock()
+	if ev == nil {
+		return
+	}
+	ev.Status = "error"
+	ev.Error = msg
+	p.publishEvent(s, ev)
 }
 
 // publishPending attaches the captured response (status/error/columns/rows/

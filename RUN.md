@@ -226,6 +226,27 @@ Login: **admin / admin123** — dev-only defaults, change via `configs/control.y
 Checker is **monitor-only** in v1 (live audit; no approval/kill). UI tokens can only target the
 `db_presets` allowlist from `configs/control.yaml`.
 
+### 5.1 Maker write-gating (Task 8.6)
+
+A **write-access** maker token (`db_presets[].access: write` — the MySQL read-write preset) cannot
+run **ANY** SQL until a checker is watching the maker's session. Read-only tokens (`access: read` —
+MySQL read-only and PG read-only presets) are **never** gated — the gate applies only to write-access
+sessions.
+
+How it works:
+
+| Layer | Mechanism |
+|---|---|
+| Presence | A checker subscribed to the session's own channel (`sess:<sid>`) makes the WS hub keep `watch:<sid>` in Valkey: a 30 s lease refreshed every 10 s by the checker's heartbeat while connected, removed on disconnect or channel switch |
+| Gate | Before relaying any SQL-executing command (`COM_QUERY` 0x03 / `COM_STMT_PREPARE` 0x16 / `COM_STMT_EXECUTE` 0x17; PG `Q` / `P` / `E`) on a write-access session, the data plane checks `EXISTS watch:<sid>` — **per command, never cached** |
+| Blocked | No watcher (or store error — **fail closed**) → the client gets MySQL `ERR 1045` / PG `FATAL 28000` with the message **`maker gating: no checker connected to session <sid>`**; the statement is NOT forwarded, and the audit feed still shows the query with `status=error` + the gating message |
+| Re-enable | A checker watching the session again (subscribe to `sess:<sid>`) unblocks the **same** session — a block never kills the connection |
+
+Practical flow for a write-access maker: generate the token → a checker opens the session (Checker
+dashboard session selector, or any WS client subscribing to `sess:<sid>`) → INSERT/UPDATE/DELETE
+work. If the watcher is removed mid-session, the very next query is blocked until a checker watches
+the session again.
+
 ---
 
 ## 6. TLS mode & Valkey TLS / Sentinel (Phase 7 — optional)

@@ -1,0 +1,107 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"zerotrust-proxy/internal/config"
+	"zerotrust-proxy/internal/store"
+)
+
+// --- Task 8.6: token access from the db_presets -----------------------------
+
+// newPresetTestAPIServer is newTestAPIServer with the committed db_presets
+// wired into the config, so handleToken can resolve access levels.
+func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore) {
+	t.Helper()
+	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	if err != nil {
+		t.Fatalf("NewValkeyStoreDirect: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	cfg := &config.ControlConfig{
+		AuthUser:     "admin",
+		AuthPassword: "s3cret",
+		SessionTTL:   8,
+		TokenTTL:     60,
+		StaticDir:    t.TempDir(),
+		DBPresets: []config.DBPreset{
+			{Name: "MySQL read-only", DBType: "mysql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "read"},
+			{Name: "MySQL read-write", DBType: "mysql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "write"},
+			{Name: "PostgreSQL read-only", DBType: "postgres", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "5433", Access: "read"},
+		},
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewAPI(log, cfg, vs).Routes())
+	t.Cleanup(srv.Close)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar: %v", err)
+	}
+	return srv, &http.Client{Jar: jar}, vs
+}
+
+// issueToken posts a token request through the real endpoint and returns the
+// issued token string.
+func issueToken(t *testing.T, client *http.Client, base, body string) string {
+	t.Helper()
+	resp, err := client.Post(base+"/api/token", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/token: status %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+	var issued struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	if issued.Token == "" {
+		t.Fatal("token response: empty token")
+	}
+	return issued.Token
+}
+
+// TestTokenAccessFromPreset (Task 8.6): POST /api/token stamps the stored
+// payload with the matching preset's access level — write for the read-write
+// preset, read for the read-only presets, "" for targets no preset matches
+// (the data plane treats absent access as read).
+func TestTokenAccessFromPreset(t *testing.T) {
+	srv, client, vs := newPresetTestAPIServer(t)
+	loginViaAPI(t, client, srv.URL)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"read-write preset", `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-8-6"}`, "write"},
+		{"mysql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-8-6"}`, "read"},
+		{"pg read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"5433","db_type":"postgres","ticket_id":"T-8-6"}`, "read"},
+		{"no matching preset", `{"db_user":"some_user","db_ip":"10.1.2.3","db_port":"3306","db_type":"mysql","ticket_id":"T-8-6"}`, ""},
+	}
+	for _, tc := range cases {
+		token := issueToken(t, client, srv.URL, tc.body)
+		p, err := vs.GetDeleteToken(ctx, token)
+		if err != nil {
+			t.Fatalf("%s: GetDeleteToken(%q): %v", tc.name, token, err)
+		}
+		if p == nil {
+			t.Fatalf("%s: tok:%s missing", tc.name, token)
+		}
+		if p.Access != tc.want {
+			t.Errorf("%s: stored access = %q, want %q", tc.name, p.Access, tc.want)
+		}
+	}
+}
