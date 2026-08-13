@@ -2316,8 +2316,17 @@ Three checker-page fixes:
 
 Gates: ng test (ALL specs), npm build, go suite (unchanged but re-run), commit, report.
 
-## Phase 8 gate (addendum 2)
-All tasks reviewed; full suites green; amendment 15 verified end-to-end; ledger updated.
+## Task 8.16: Checker dashboard — legibility + spacing polish (user directive 2026-08-14)
+
+Two issues from hands-on use: (a) the session-details (context strip) font color is hard to read; (b) fields and select options need proper spacing so the details are visible at a glance.
+
+1. Readability: audit the checker SCSS (checker-dashboard.component.scss) — the session strip + toolbar + table styles on the dark theme. Fix the strip's label/value colors to readable contrast (compute the ratio vs the panel background; aim ≥4.5:1 for values, labels ≥3:1 — match the theme's established text tokens where available). Keep the theme consistent.
+2. Spacing: consistent gaps between toolbar fields (session selector, channel input, connect/stop, kill-connection, status tag), the strip fields (label/value pairs in a flex row with even spacing + wrapping), and nz-select options (dropdown option padding/height so session options are comfortable to scan). Details-at-a-glance: the toolbar should present selector + status + actions in one clean aligned row.
+3. Verification (DOM evidence — the browser harness on this box has no screenshots): load the SPA checker page (JS fetch login + pushState per the project's harness notes), select a session if a live one exists (or render a pending one via a stub if needed), and read getComputedStyle on the strip values + labels + an nz-select option + toolbar fields; compute + assert contrast ratios meet the targets; capture the values verbatim in the report. If live sessions are unavailable at gate time, verify with the unit-rendered fixture via the DOM the component tests produce (document which path was used).
+4. Tests: component spec assertions for the strip/toolbar classes if structural changes landed (keep minimal); ng test (ALL), npm build, go suite (re-run), commit, report.
+
+## Phase 8 gate (addendum 3)
+All tasks reviewed; full suites green; amendment 16 verified end-to-end; ledger updated.
 
 # Phase 9: MSSQL support (user directive 2026-08-13)
 
