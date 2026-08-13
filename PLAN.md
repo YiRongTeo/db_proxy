@@ -2335,8 +2335,17 @@ The enforcement works as required (a write maker is blocked while no checker wat
 4. RUN.md §5.1: latch semantics → re-open-on-watch wording.
 5. Gates: go suite, ng test, build, commit, report.
 
-## Phase 8 gate (addendum 4)
-All tasks reviewed; full suites green; amendment 17 verified end-to-end; ledger updated.
+## Task 8.18: Checker controls on the nz-row/nz-col grid (user directive 2026-08-14)
+
+The checker controls (session selector, channel input, connect/stop, kill-connection, status tag — the toolbar area) should use ng-zorro's `nz-row`/`nz-col` grid so they display properly at every width (responsive wrapping instead of the current single flex row, which can crowd on narrow screens).
+
+1. checker-dashboard.component.html: wrap the toolbar/controls in `nz-row` (`nzGutter`) with `nz-col` children using responsive spans (nzXs/nzSm/nzMd/nzLg) — session selector gets the widest span, the status tag + actions get stable spans, and controls wrap gracefully on narrow screens (nzXs full/半 width). Keep the session strip + table as they are unless a control-adjacent tweak is needed.
+2. checker-dashboard.component.scss: remove the now-redundant toolbar flex-gap rules (the grid handles spacing); keep alignment consistent (row heights, vertical centering via the col/nz-alignment or minimal css).
+3. Tests: component spec — assert the grid structure renders (nz-row/nz-col present with the right responsive spans for the selector; controls visible), no behavioral regressions (existing 45+ checker specs stay green).
+4. Gates: `cd web && npx ng test --watch=false` exit 0; `cd web && npm run build` exit 0; `go test -count=1 ./...` green. Commit, report.
+
+## Phase 8 gate (addendum 5)
+All tasks reviewed; full suites green; amendment 18 verified end-to-end; ledger updated.
 
 # Phase 9: MSSQL support (user directive 2026-08-13)
 
