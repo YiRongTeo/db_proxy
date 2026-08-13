@@ -11,6 +11,12 @@ valkey:
   addr: "127.0.0.1:6379"  # direct mode
   master_name: "mymaster" # sentinel mode
   sentinel_addrs: ["127.0.0.1:26379"]
+  # Sentinel's OWN auth (requirepass on the sentinel) — SEPARATE from
+  # `password` above, which is the MASTER's. Both can differ; sentinel
+  # connections present these, master/data connections present `password`.
+  # Env: ZT_VALKEY_SENTINEL_USERNAME / ZT_VALKEY_SENTINEL_PASSWORD.
+  sentinel_username: ""
+  sentinel_password: ""
   password: ""
   db: 0
   ssl:

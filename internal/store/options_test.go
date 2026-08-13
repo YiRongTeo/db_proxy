@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -367,4 +368,105 @@ func TestLiveSentinelRequiresPassword(t *testing.T) {
 		t.Fatalf("expected NOAUTH error from sentinel, got: %v", err)
 	}
 	t.Logf("without sentinel password: %v", err)
+}
+
+// TestLiveSentinelDistinctPasswords (Task 8.10, user directive 2026-08-13:
+// "config file only accepts one password for valkey, what if valkey password
+// is different from sentinel password") proves the two-password model end to
+// end against the auth-distinct dev infra: valkey-auth-master on :6390 runs
+// requirepass masterpw, and the auth sentinel on :26390 runs requirepass
+// sentinelpw while monitoring that master (RUN.md §6.3). valkey.password and
+// valkey.sentinel_password are INDEPENDENT: sentinel conns present the
+// sentinel password, master/data conns present the master password. Each
+// misconfiguration must fail at the step that owns the wrong credential.
+// Skips when the auth sentinel is not up yet.
+func TestLiveSentinelDistinctPasswords(t *testing.T) {
+	const sentinelAddr = "127.0.0.1:26390"
+	if !reachable(sentinelAddr, time.Second) {
+		t.Skipf("live auth-distinct sentinel not reachable at %s (RUN.md §6.3 starts it); skipping", sentinelAddr)
+	}
+
+	// roundTrip builds the store from opts and runs a SetToken /
+	// GetDeleteToken round trip on a fresh token, returning the first error.
+	roundTrip := func(t *testing.T, opts StoreOptions) error {
+		t.Helper()
+		s, err := NewValkeyStore(context.Background(), opts)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		token := uniqueToken(t)
+		cleanupKey(t, s, "tok:"+token)
+		want := models.TokenPayload{Username: "auth-distinct", DBType: "mysql"}
+		if err := s.SetToken(context.Background(), token, want, 30*time.Second); err != nil {
+			return err
+		}
+		got, err := s.GetDeleteToken(context.Background(), token)
+		if err != nil {
+			return err
+		}
+		if got == nil || *got != want {
+			return fmt.Errorf("round trip: got %+v, want %+v", got, want)
+		}
+		return nil
+	}
+
+	t.Run("distinct master and sentinel passwords, both correct", func(t *testing.T) {
+		if err := roundTrip(t, StoreOptions{
+			Addrs:            []string{sentinelAddr},
+			MasterName:       "mymaster",
+			Password:         "masterpw",   // master/data conns
+			SentinelPassword: "sentinelpw", // sentinel conns
+		}); err != nil {
+			t.Fatalf("round trip with distinct master/sentinel passwords: %v", err)
+		}
+	})
+
+	t.Run("missing sentinel password fails at the sentinel", func(t *testing.T) {
+		_, err := NewValkeyStore(context.Background(), StoreOptions{
+			Addrs:      []string{sentinelAddr},
+			MasterName: "mymaster",
+			Password:   "masterpw",
+			// SentinelPassword intentionally omitted.
+		})
+		if err == nil {
+			t.Fatal("expected error without SentinelPassword, got success")
+		}
+		if !strings.Contains(err.Error(), "NOAUTH") {
+			t.Fatalf("expected NOAUTH error from the sentinel, got: %v", err)
+		}
+		t.Logf("missing sentinel password: %v", err)
+	})
+
+	t.Run("wrong master password fails at the master", func(t *testing.T) {
+		_, err := NewValkeyStore(context.Background(), StoreOptions{
+			Addrs:            []string{sentinelAddr},
+			MasterName:       "mymaster",
+			Password:         "wrong-master-pw",
+			SentinelPassword: "sentinelpw",
+		})
+		if err == nil {
+			t.Fatal("expected error with wrong master password, got success")
+		}
+		if !strings.Contains(err.Error(), "WRONGPASS") {
+			t.Fatalf("expected WRONGPASS error from the master, got: %v", err)
+		}
+		t.Logf("wrong master password: %v", err)
+	})
+
+	t.Run("swapped passwords fail at the sentinel", func(t *testing.T) {
+		_, err := NewValkeyStore(context.Background(), StoreOptions{
+			Addrs:            []string{sentinelAddr},
+			MasterName:       "mymaster",
+			Password:         "sentinelpw", // master conns wrongly get the sentinel password
+			SentinelPassword: "masterpw",   // sentinel conns wrongly get the master password
+		})
+		if err == nil {
+			t.Fatal("expected error with swapped passwords, got success")
+		}
+		if !strings.Contains(err.Error(), "WRONGPASS") {
+			t.Fatalf("expected WRONGPASS error from the sentinel, got: %v", err)
+		}
+		t.Logf("swapped passwords: %v", err)
+	})
 }

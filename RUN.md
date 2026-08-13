@@ -419,9 +419,70 @@ valkey:
   mode: sentinel
   master_name: mymaster
   sentinel_addrs: ["127.0.0.1:26379"]
-  sentinel_password: sentinelpw   # sentinel conns only (Task 7.7)
-  # sentinel_username: ""          # optional, when the sentinel uses ACL users
+  # sentinel's OWN auth (requirepass on the sentinel) — SEPARATE from
+  # `password` below, which is the MASTER's (Task 8.10). Both can differ;
+  # sentinel conns use these, master/data conns use `password`.
+  sentinel_username: ""
+  sentinel_password: sentinelpw   # env: ZT_VALKEY_SENTINEL_PASSWORD
   password: ""                     # master/data conns — unchanged by sentinel auth
+```
+
+> **Two-password model (Task 8.10, verified live 2026-08-13):** `valkey.password` and
+> `valkey.sentinel_password` are INDEPENDENT credentials. `password` authenticates the
+> master/data connections; `sentinel_password` authenticates the SENTINEL itself (its
+> `requirepass`) — they can, and in the auth-distinct infra below do, differ. Each
+> misconfiguration fails at the step that owns the credential: missing sentinel password
+> → `NOAUTH` from the sentinel; wrong master password → `WRONGPASS` from the master;
+> swapped → `WRONGPASS` from the sentinel. The durable live test
+> `TestLiveSentinelDistinctPasswords` (internal/store, skips when :26390 is down) proves
+> all four cases against the infra below.
+
+### Auth-distinct infra (master and sentinel use DIFFERENT passwords)
+
+Docker Desktop (WSL2) networking pitfall: the container default gateway **172.17.0.1 is
+reachable from the container but NOT from the Windows host** — a sentinel monitoring
+`172.17.0.1:6390` can ping the master itself, but the host-side store can never dial the
+master address the sentinel returns. Use the WSL2 VM eth0 IP instead, which is reachable
+from BOTH the sentinel container and the host:
+
+```bash
+VMIP=$(wsl -d docker-desktop -- ip -4 addr show eth0 | grep -oP 'inet \K[\d.]+')
+# authenticated master (requirepass masterpw)
+docker run -d --name valkey-auth-master -p 6390:6390 \
+  valkey/valkey:8-alpine valkey-server --port 6390 --requirepass masterpw
+# sentinel conf: port 26390, monitors <VMIP>:6390, auth-pass masterpw, requirepass sentinelpw
+TMPD=$(mktemp -d)
+cat > "$TMPD/sentinel-auth.conf" <<EOF
+port 26390
+sentinel monitor mymaster $VMIP 6390 1
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 10000
+sentinel auth-pass mymaster masterpw
+requirepass sentinelpw
+EOF
+# auth-distinct sentinel — same cp-to-/tmp entrypoint workaround as above
+docker run -d --name valkey-auth-sentinel -p 26390:26390 \
+  -v "$TMPD/sentinel-auth.conf:/etc/sentinel.conf:ro" \
+  valkey/valkey:8-alpine sh -c 'cp /etc/sentinel.conf /tmp/sentinel.conf && exec valkey-sentinel /tmp/sentinel.conf'
+docker exec valkey-auth-master valkey-cli -p 6390 -a masterpw --no-auth-warning ping
+# expect: PONG
+docker exec valkey-auth-sentinel valkey-cli -p 26390 -a sentinelpw --no-auth-warning \
+  sentinel get-master-addr-by-name mymaster
+# expect: <VMIP> / 6390
+```
+
+> **host.docker.internal pitfall:** it does NOT resolve in the `valkey:8-alpine` image
+> without `--add-host host.docker.internal:host-gateway` — and even with that flag the
+> sentinel would hand the hostname back to host-side clients, which cannot resolve it.
+> The VM eth0 IP is the one address reachable from both the sentinel container and the
+> Windows host.
+
+Planes against the auth-distinct infra (distinct passwords on both legs):
+
+```bash
+ZT_VALKEY_MODE=sentinel ZT_VALKEY_MASTER_NAME=mymaster \
+ZT_VALKEY_SENTINEL_ADDRS='["127.0.0.1:26390"]' \
+ZT_VALKEY_PASSWORD=masterpw ZT_VALKEY_SENTINEL_PASSWORD=sentinelpw go run ./cmd/control
 ```
 
 ### 6.4 Planes in TLS mode (HTTPS + wire TLS + TLS Valkey)
