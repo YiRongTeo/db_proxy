@@ -13,6 +13,7 @@ import { FormsModule } from '@angular/forms';
 import { NzAlertModule } from 'ng-zorro-antd/alert';
 import { NzButtonModule } from 'ng-zorro-antd/button';
 import { NzCardModule } from 'ng-zorro-antd/card';
+import { NzGridModule } from 'ng-zorro-antd/grid';
 import { NzInputModule } from 'ng-zorro-antd/input';
 import { NzMessageService } from 'ng-zorro-antd/message';
 import { NzPopconfirmModule } from 'ng-zorro-antd/popconfirm';
@@ -82,6 +83,7 @@ export type FeedStatus = 'live-feed' | 'watching' | 'disconnected' | 'session-en
     NzAlertModule,
     NzButtonModule,
     NzCardModule,
+    NzGridModule,
     NzInputModule,
     NzPopconfirmModule,
     NzSelectModule,

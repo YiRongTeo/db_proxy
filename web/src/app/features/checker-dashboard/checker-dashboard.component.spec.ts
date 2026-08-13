@@ -1095,4 +1095,97 @@ describe('CheckerDashboardComponent', () => {
     const options = dropdown.querySelectorAll('.ant-select-item-option');
     expect(options.length).toBeGreaterThan(0);
   });
+
+  // ---- Task 8.18: toolbar controls on the nz-row/nz-col grid -----------------
+
+  it('renders the toolbar on the nz grid with responsive spans (selector the widest col)', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    const row = fixture.nativeElement.querySelector('.checker-controls nz-row') as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row.classList.contains('ant-row')).toBe(true);
+    // Vertical centering comes from the grid row itself (nzAlign="middle").
+    expect(row.classList.contains('ant-row-middle')).toBe(true);
+
+    const cols = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('.checker-controls nz-col'),
+    ) as HTMLElement[];
+    const colOf = (sel: string): HTMLElement => {
+      const col = cols.find((c) => c.querySelector(sel) !== null);
+      if (!col) throw new Error(`no nz-col containing "${sel}"`);
+      return col;
+    };
+
+    // Session selector: full-width rows below md, the WIDEST col on md/lg.
+    const sessionCol = colOf('.session-select');
+    expect(sessionCol.classList.contains('ant-col-xs-24')).toBe(true);
+    expect(sessionCol.classList.contains('ant-col-sm-24')).toBe(true);
+    expect(sessionCol.classList.contains('ant-col-md-13')).toBe(true);
+    expect(sessionCol.classList.contains('ant-col-lg-14')).toBe(true);
+
+    // Channel input + Connect/Stop: stable spans (narrower than the selector).
+    const channelCol = colOf('.channel-group');
+    expect(channelCol.classList.contains('ant-col-xs-24')).toBe(true);
+    expect(channelCol.classList.contains('ant-col-sm-24')).toBe(true);
+    expect(channelCol.classList.contains('ant-col-md-11')).toBe(true);
+    expect(channelCol.classList.contains('ant-col-lg-10')).toBe(true);
+
+    // Kill-connection: stable span (full row on xs, half row on sm).
+    const killCol = colOf('.kill-connection-btn');
+    expect(killCol.classList.contains('ant-col-xs-24')).toBe(true);
+    expect(killCol.classList.contains('ant-col-sm-8')).toBe(true);
+    expect(killCol.classList.contains('ant-col-md-6')).toBe(true);
+    expect(killCol.classList.contains('ant-col-lg-6')).toBe(true);
+
+    // Status tag + auto-scroll: half-width rows on xs, stable compact spans up.
+    const statusCol = colOf('.status-tag');
+    expect(statusCol.classList.contains('ant-col-xs-12')).toBe(true);
+    expect(statusCol.classList.contains('ant-col-sm-8')).toBe(true);
+    expect(statusCol.classList.contains('ant-col-md-6')).toBe(true);
+    expect(statusCol.classList.contains('ant-col-lg-6')).toBe(true);
+
+    const autoCol = colOf('.autoscroll-row');
+    expect(autoCol.classList.contains('ant-col-xs-12')).toBe(true);
+    expect(autoCol.classList.contains('ant-col-sm-8')).toBe(true);
+    expect(autoCol.classList.contains('ant-col-md-6')).toBe(true);
+    expect(autoCol.classList.contains('ant-col-lg-6')).toBe(true);
+
+    // The selector is strictly wider than the channel wherever they share a row.
+    expect(sessionCol.classList.contains('ant-col-md-13')).toBe(true);
+    expect(channelCol.classList.contains('ant-col-md-11')).toBe(true);
+    expect(sessionCol.classList.contains('ant-col-lg-14')).toBe(true);
+    expect(channelCol.classList.contains('ant-col-lg-10')).toBe(true);
+  });
+
+  it('shows channel input, connect/stop, kill-connection and the status tag on the grid', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    const grid = fixture.nativeElement.querySelector('.checker-controls') as HTMLElement;
+    expect(grid).not.toBeNull();
+
+    const input = grid.querySelector('#channel') as HTMLInputElement;
+    expect(input).not.toBeNull();
+    expect(input.disabled).toBe(false); // editable until the feed connects
+
+    // Connect/stop toggle: Stop while the optimistic flag is up (the socket
+    // was created on init), Connect after a disconnect.
+    const buttons = () =>
+      Array.from(grid.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(buttons()).toContain('Stop');
+    expect(buttons()).not.toContain('Connect');
+    fixture.componentInstance.stop();
+    fixture.detectChanges();
+    expect(buttons()).toContain('Connect');
+    expect(buttons()).not.toContain('Stop');
+
+    const kill = grid.querySelector('.kill-connection-btn') as HTMLButtonElement;
+    expect(kill).not.toBeNull();
+    expect(kill.disabled).toBe(true); // live-all mode
+
+    const tag = grid.querySelector('.status-tag') as HTMLElement;
+    expect(tag).not.toBeNull();
+    expect(tag.textContent?.trim()).toBe('disconnected');
+  });
 });

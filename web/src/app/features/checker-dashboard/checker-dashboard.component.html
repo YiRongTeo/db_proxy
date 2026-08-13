@@ -1,80 +1,97 @@
 <nz-card class="checker-card" nzTitle="Checker Dashboard" nzExtra="Live query feed">
+  <!-- Task 8.18: toolbar controls on the ng-zorro grid (nz-row/nz-col). The
+       session selector gets the widest col; channel, kill-connection, status
+       and auto-scroll keep stable spans; on narrow screens (nzXs) the controls
+       wrap to full/half-width rows so nothing crowds or overflows. -->
   <div class="checker-controls">
-    <div class="session-row">
-      <span class="channel-label">Session</span>
-      <nz-select
-        class="session-select"
-        nzDropdownClassName="checker-session-dropdown"
-        [ngModel]="selectedSession()"
-        (ngModelChange)="onSessionSelect($event)"
-      >
-        <nz-option nzValue="*" nzLabel="live (all)"></nz-option>
-        @for (s of sessions(); track s.session_id) {
-          <nz-option
-            [nzValue]="s.session_id"
-            [nzLabel]="sessionLabel(s)"
-            [nzCustomContent]="true"
+    <nz-row nzAlign="middle" [nzGutter]="[16, 12]">
+      <nz-col [nzXs]="24" [nzSm]="24" [nzMd]="13" [nzLg]="14">
+        <div class="session-row">
+          <span class="channel-label">Session</span>
+          <nz-select
+            class="session-select"
+            nzDropdownClassName="checker-session-dropdown"
+            [ngModel]="selectedSession()"
+            (ngModelChange)="onSessionSelect($event)"
           >
-            <span class="session-option-label">{{ sessionLabel(s) }}</span>
-            @if (isPending(s)) {
-              <nz-tag nzColor="gold" class="waiting-tag">waiting</nz-tag>
+            <nz-option nzValue="*" nzLabel="live (all)"></nz-option>
+            @for (s of sessions(); track s.session_id) {
+              <nz-option
+                [nzValue]="s.session_id"
+                [nzLabel]="sessionLabel(s)"
+                [nzCustomContent]="true"
+              >
+                <span class="session-option-label">{{ sessionLabel(s) }}</span>
+                @if (isPending(s)) {
+                  <nz-tag nzColor="gold" class="waiting-tag">waiting</nz-tag>
+                }
+              </nz-option>
             }
-          </nz-option>
-        }
-      </nz-select>
-      @if (selectedSession() !== '*') {
-        <nz-tag nzColor="geekblue" class="session-context-tag">
-          session: {{ shortenSid(selectedSession()) }} · {{ selectedSessionInfo()?.username ?? '—' }}
-        </nz-tag>
-      }
+          </nz-select>
+          @if (selectedSession() !== '*') {
+            <nz-tag nzColor="geekblue" class="session-context-tag">
+              session: {{ shortenSid(selectedSession()) }} · {{ selectedSessionInfo()?.username ?? '—' }}
+            </nz-tag>
+          }
+        </div>
+      </nz-col>
+
+      <nz-col [nzXs]="24" [nzSm]="24" [nzMd]="11" [nzLg]="10">
+        <div class="channel-row">
+          <span class="channel-label">Channel</span>
+          <nz-input-group nzCompact class="channel-group">
+            <input
+              id="channel"
+              name="channel"
+              nz-input
+              class="channel-input"
+              placeholder="* or username"
+              [ngModel]="channel()"
+              (ngModelChange)="channel.set($event)"
+              [disabled]="connected()"
+              (keydown.enter)="connect()"
+            />
+            @if (connected()) {
+              <button nz-button nzDanger (click)="stop()">Stop</button>
+            } @else {
+              <button nz-button nzType="primary" (click)="connect()">Connect</button>
+            }
+          </nz-input-group>
+        </div>
+      </nz-col>
+
       <!-- Task 8.15: ONE connection-kill for the SELECTED session (rows keep kill query only). -->
-      <button
-        class="kill-connection-btn"
-        nz-button
-        nzDanger
-        nz-popconfirm
-        [nzPopconfirmTitle]="'Kill connection for session ' + shortenSid(selectedSession()) + '?'"
-        [disabled]="selectedSession() === '*'"
-        (nzOnConfirm)="killSelectedConnection()"
-      >kill connection</button>
-    </div>
+      <nz-col [nzXs]="24" [nzSm]="8" [nzMd]="6" [nzLg]="6">
+        <button
+          class="kill-connection-btn"
+          nz-button
+          nzDanger
+          nz-popconfirm
+          [nzPopconfirmTitle]="'Kill connection for session ' + shortenSid(selectedSession()) + '?'"
+          [disabled]="selectedSession() === '*'"
+          (nzOnConfirm)="killSelectedConnection()"
+        >kill connection</button>
+      </nz-col>
 
-    <div class="channel-row">
-      <span class="channel-label">Channel</span>
-      <nz-input-group nzCompact class="channel-group">
-        <input
-          id="channel"
-          name="channel"
-          nz-input
-          class="channel-input"
-          placeholder="* or username"
-          [ngModel]="channel()"
-          (ngModelChange)="channel.set($event)"
-          [disabled]="connected()"
-          (keydown.enter)="connect()"
-        />
-        @if (connected()) {
-          <button nz-button nzDanger (click)="stop()">Stop</button>
-        } @else {
-          <button nz-button nzType="primary" (click)="connect()">Connect</button>
-        }
-      </nz-input-group>
-    </div>
+      <!-- Task 8.15: accurate status — derived from the real socket state + selection + session lifecycle. -->
+      <nz-col [nzXs]="12" [nzSm]="8" [nzMd]="6" [nzLg]="6">
+        <nz-tag class="status-tag" [nzColor]="statusColor()">
+          {{ statusLabel() }}
+        </nz-tag>
+      </nz-col>
 
-    <!-- Task 8.15: accurate status — derived from the real socket state + selection + session lifecycle. -->
-    <nz-tag class="status-tag" [nzColor]="statusColor()">
-      {{ statusLabel() }}
-    </nz-tag>
-
-    <div class="autoscroll-row">
-      <span class="channel-label">Auto-scroll</span>
-      <nz-switch
-        [ngModel]="autoScroll()"
-        (ngModelChange)="autoScroll.set($event)"
-        [nzCheckedChildren]="'on'"
-        [nzUnCheckedChildren]="'off'"
-      />
-    </div>
+      <nz-col [nzXs]="12" [nzSm]="8" [nzMd]="6" [nzLg]="6">
+        <div class="autoscroll-row">
+          <span class="channel-label">Auto-scroll</span>
+          <nz-switch
+            [ngModel]="autoScroll()"
+            (ngModelChange)="autoScroll.set($event)"
+            [nzCheckedChildren]="'on'"
+            [nzUnCheckedChildren]="'off'"
+          />
+        </div>
+      </nz-col>
+    </nz-row>
   </div>
 
   <!-- Task 8.15: session context strip — the session's constant fields move here
