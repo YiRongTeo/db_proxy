@@ -2280,8 +2280,34 @@ Alternative backend-credential source: fetch the DB password from an API per con
 3. NO credentials ever (house rule + resolver hygiene); no token values.
 4. Tests: capture the logger (slog with a buffer handler in tests) — query log line contains the context fields + SQL; with log_query_output=true also columns/rows; false → absent. Live: data plane log grep shows the query line with context, and with the flag on, the rows.
 
-## Phase 8 gate
-All tasks reviewed; full suites green; amendments 11 + 12 verified end-to-end; ledger updated.
+## Task 8.11: Token-time session listing (user directive 2026-08-13 — resolves the gating deadlock)
+
+The write-gate deadlock: the checker can only select a session AFTER the maker connects, but a write maker's first query is blocked (1045) when nobody watches yet — the client breaks before the checker can attach. RESOLUTION: sessions become visible at TOKEN ISSUE time.
+
+1. models: TokenPayload += `SessionID string json:"session_id,omitempty"` — the CONTROL PLANE generates `sid-<hex>` at issue time (all tokens, uniform); backward-compat round-trip tests.
+2. handleToken: generate + stamp the sid into the payload; AFTER a successful issue: write `sess:live:<sid>` = {session_id, username, db_user, db_type, db, status:"pending", started_at: now, last_seen: now} SETEX 60s + publish lifecycle event (Kind=session, Action="issued", same fields) to queries:<user> + queries:sess:<sid>.
+3. sessionRecord/SessionInfo: += `Status string json:"status,omitempty"` (pending|active) — pending from control, active from the data plane; /api/sessions passes it through; TS side in 8.12.
+4. Data plane: session sid = token.SessionID when present (fallback generate when empty — old tokens/tests); on session start OVERWRITE the sess:live record (status active, thread_id, started_at=now) + publish action=started (existing); on close DEL (existing). Pending records that never connect expire via the 60s TTL.
+5. Tests: unit (sid stamping, payload round trip); LIVE: issue write token → /api/sessions lists the PENDING session (status pending, exact fields) → checker subscribes sess:<sid> (watch key set) → maker connects → query runs (gate passes on the first command — the deadlock is gone); token issued but never connected → pending entry expires; data plane sid = token sid (assert via the started event's session_id matching the token's).
+
+## Task 8.12: Checker UI — pending sessions
+1. QueryEvent TS += action? already there (8.5) — add handling for action="issued": selector adds the session with a "waiting for maker" tag (status pending); action=started → tag becomes active; ended → removed.
+2. SessionInfo TS += status?; option label shows the waiting badge when pending.
+3. Tests: issued event adds a pending option with the badge; started upgrades it; ended removes; empty unchanged.
+
+## Task 8.13: Gate grace hold (complements the listing — maker-first no longer breaks)
+
+While a write session has NO watcher, blocked SQL commands WAIT up to `gate_wait_seconds` for a watcher instead of failing instantly; watcher arrives → the queued commands flush in order; timeout → reject with the existing 1045/28000 + audit event (status=error "maker gating: no checker within Ns").
+
+1. config: data.yaml `gate_wait_seconds` (default 20, 0 = reject immediately = today's behavior; env ZT_GATE_WAIT_SECONDS).
+2. Data plane (both relays): per-session gate state {waiting bool, queue [][]byte (bounded 16), timer}: on a blocked SQL command → if queue empty start the timer; append to queue (overflow → reject the new one immediately); when WatchActive turns true (checked by the timer tick or on the next command) → stop timer, flush the queue in order (forward each); on timeout → drain queue with 1045/28000 + audit events, mark the session fail-closed (subsequent commands rejected immediately — watchers arriving later do NOT unblock; the maker must reconnect).
+3. Tests: unit (queue bounds, timer, flush order, fail-closed latch); LIVE: (a) maker connects FIRST, runs a query → it WAITS (client still connected, no error yet) → checker attaches within the window → the query RUNS and returns rows (the original breakage fixed); (b) no watcher → 1045 after the window + audit event; (c) watch-before-connect still works (8.6 matrix intact); (d) ro exempt; (e) gate_wait_seconds=0 → immediate reject (old behavior).
+
+## Task 8.14: Gate — the resolved gating flow
+Full-stack matrix: (1) issue write token → pending session visible in /api/sessions + selector before any connect; (2) checker watches the pending session → maker connects → first query passes (deadlock gone); (3) maker connects first → query waits → watcher attaches → query runs; (4) no watcher → 1045 after the window, audit event; (5) pending expiry; (6) old flow (watch after connect within window) still works; (7) ro unaffected; (8) gates: go suite + ng test + build; (9) RUN.md §5.1 update (the resolved workflow: issue → select → connect, plus the grace window); (10) commit; (11) report.
+
+## Phase 8 gate (addendum)
+All tasks reviewed; full suites green; amendment 14 verified end-to-end; ledger updated.
 
 # Phase 9: MSSQL support (user directive 2026-08-13)
 
