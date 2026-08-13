@@ -9,7 +9,16 @@
       >
         <nz-option nzValue="*" nzLabel="live (all)"></nz-option>
         @for (s of sessions(); track s.session_id) {
-          <nz-option [nzValue]="s.session_id" [nzLabel]="sessionLabel(s)"></nz-option>
+          <nz-option
+            [nzValue]="s.session_id"
+            [nzLabel]="sessionLabel(s)"
+            [nzCustomContent]="true"
+          >
+            <span class="session-option-label">{{ sessionLabel(s) }}</span>
+            @if (isPending(s)) {
+              <nz-tag nzColor="gold" class="waiting-tag">waiting</nz-tag>
+            }
+          </nz-option>
         }
       </nz-select>
       @if (selectedSession() !== '*') {
@@ -88,7 +97,7 @@
                 <nz-tag [nzColor]="stmtColor(ev.stmt_type)">{{ ev.stmt_type }}</nz-tag>
               }
               @if (ev.action) {
-                <nz-tag [nzColor]="ev.action === 'started' ? 'green' : 'red'">{{ ev.action }}</nz-tag>
+                <nz-tag [nzColor]="actionColor(ev.action)">{{ ev.action }}</nz-tag>
               }
             </td>
             <td>{{ ev.username }}</td>

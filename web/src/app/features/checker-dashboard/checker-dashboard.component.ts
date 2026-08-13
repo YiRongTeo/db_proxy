@@ -108,6 +108,16 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   /** Lifecycle event ids already folded into the directory refresh (idempotency). */
   private readonly seenLifecycle = new Set<string>();
 
+  /**
+   * Optimistic "waiting for maker" entries folded in from action=issued
+   * lifecycle events (Task 8.12). A token becomes a visible session the
+   * moment it is issued — BEFORE the maker ever connects — so the checker
+   * can select it and arm the gate (subscribe to sess:<sid>) ahead of the
+   * connection; the /api/sessions re-pull then overlays the authoritative
+   * record on top. Removed on started/ended.
+   */
+  private readonly pendingOverrides = new Map<string, SessionInfo>();
+
   constructor() {
     // Auto-scroll: whenever the ring buffer grows (or the toggle flips on),
     // pin the viewport to the newest row.
@@ -117,17 +127,50 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
         this.scrollToBottom();
       }
     });
-    // Task 8.5: keep the session selector in sync with kind=session lifecycle
-    // events (action started/ended). The directory is re-pulled from the API
-    // so last_seen stays fresh; each lifecycle event is folded in exactly once.
+    // Task 8.5/8.12: keep the session selector in sync with kind=session
+    // lifecycle events (actions issued/started/ended — issued comes from the
+    // control plane at token-issue time). The directory is re-pulled from the
+    // API so last_seen stays fresh; each lifecycle event is folded in exactly
+    // once. issued additionally folds in an optimistic "waiting" entry so the
+    // gate can be armed before the maker connects (gating-deadlock fix 8.11).
     effect(() => {
       for (const ev of this.live.events()) {
         if (ev.kind !== 'session' || !ev.action || !ev.session_id) continue;
         if (this.seenLifecycle.has(ev.id)) continue;
         this.seenLifecycle.add(ev.id);
-        this.refreshSessions();
+        this.applyLifecycle(ev);
       }
     });
+  }
+
+  /**
+   * Fold one unseen session lifecycle event into the selector directory.
+   * issued → optimistic pending entry (waiting for maker); started → the
+   * pending override is dropped (the data plane record is active now);
+   * ended → override dropped and the directory re-pull removes the session.
+   */
+  private applyLifecycle(ev: QueryEvent): void {
+    const sid = ev.session_id!;
+    if (ev.action === 'issued') {
+      this.pendingOverrides.set(sid, this.pendingSession(ev));
+    } else if (ev.action === 'started' || ev.action === 'ended') {
+      this.pendingOverrides.delete(sid);
+    }
+    this.refreshSessions();
+  }
+
+  /** A minimal pending directory entry derived from an action=issued event. */
+  private pendingSession(ev: QueryEvent): SessionInfo {
+    return {
+      session_id: ev.session_id!,
+      username: ev.username,
+      db_user: ev.db_user,
+      db_type: ev.db_type,
+      db: ev.db ?? '',
+      started_at: ev.ts,
+      last_seen: ev.ts,
+      status: 'pending',
+    };
   }
 
   ngOnInit(): void {
@@ -143,10 +186,22 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     this.live.disconnect();
   }
 
-  /** Re-pull the session directory from /api/sessions (init + lifecycle events). */
+  /**
+   * Re-pull the session directory from /api/sessions (init + lifecycle events).
+   * The authoritative API list is overlaid with optimistic pending entries
+   * (action=issued) that the API may not have picked up yet, so a just-issued
+   * session stays selectable — and the gate arming — even if the re-pull
+   * races the control plane's record write (Task 8.12).
+   */
   refreshSessions(): void {
     this.api.sessions().subscribe({
-      next: (list) => this.sessions.set(list),
+      next: (list) => {
+        const byId = new Map(list.map((s) => [s.session_id, s]));
+        for (const [sid, pending] of this.pendingOverrides) {
+          if (!byId.has(sid)) byId.set(sid, pending);
+        }
+        this.sessions.set(Array.from(byId.values()));
+      },
       error: () => undefined, // keep the last known directory; the selector stays usable
     });
   }
@@ -158,9 +213,26 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     this.connect();
   }
 
-  /** Selector label: username · db_user · db · session_id (sid display truncated to 12 chars). */
+  /**
+   * Selector label: username · db_user · db · session_id (sid display
+   * truncated to 12 chars). Pending records carry no target db at issue
+   * time (Task 8.11) → rendered as a dash; the waiting badge itself is a
+   * separate nz-tag in the option template (see isPending).
+   */
   sessionLabel(s: SessionInfo): string {
-    return `${s.username} · ${s.db_user} · ${s.db} · ${this.shortenSid(s.session_id)}`;
+    return `${s.username} · ${s.db_user} · ${s.db || '—'} · ${this.shortenSid(s.session_id)}`;
+  }
+
+  /** True while the token is issued but the maker has not connected yet (Task 8.12). */
+  isPending(s: SessionInfo): boolean {
+    return s.status === 'pending';
+  }
+
+  /** Session lifecycle action tag color: issued=gold (waiting), started=green, ended=red. */
+  actionColor(action: string | undefined): string {
+    if (action === 'started') return 'green';
+    if (action === 'issued') return 'gold';
+    return 'red';
   }
 
   /** Truncate a session id for display (the full id stays in the option value). */

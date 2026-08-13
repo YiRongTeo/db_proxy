@@ -42,6 +42,8 @@ export interface LoginResponse {
 /**
  * One live data-plane session directory entry (internal/store.SessionInfo —
  * Task 8.4). ThreadID is intentionally not exposed; snake_case EXACT.
+ * status (Task 8.11): "pending" = token issued, maker not connected yet;
+ * "active" = data plane connected; absent on pre-8.11 records.
  */
 export interface SessionInfo {
   session_id: string;
@@ -51,6 +53,7 @@ export interface SessionInfo {
   db: string;
   started_at: string;
   last_seen: string;
+  status?: string; // pending | active (Task 8.11)
 }
 
 /** Response of POST /api/kill (202 — kill queued on the ctl:kill channel). */
@@ -83,7 +86,7 @@ export interface QueryEvent {
   rows?: string[][];
   truncated?: boolean;
   // Phase 8 enhancement fields (internal/models.QueryEvent — omitempty, may be absent).
-  action?: string; // started|ended — session lifecycle events (kind=session)
+  action?: string; // issued|started|ended — session lifecycle events (kind=session; issued = Task 8.11)
   db?: string; // client-requested target database
 }
 

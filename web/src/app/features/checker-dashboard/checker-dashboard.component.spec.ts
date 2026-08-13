@@ -69,8 +69,8 @@ function session(overrides: Partial<SessionInfo> = {}): SessionInfo {
   };
 }
 
-/** A kind=session lifecycle event as published by the data plane (Task 8.2). */
-function lifecycle(action: 'started' | 'ended', sid: string): QueryEvent {
+/** A kind=session lifecycle event as published by the control/data planes (Task 8.2/8.11). */
+function lifecycle(action: 'started' | 'issued' | 'ended', sid: string): QueryEvent {
   return {
     id: `life-${action}-${sid}`,
     ts: '2026-08-11T08:00:00Z',
@@ -652,5 +652,137 @@ describe('CheckerDashboardComponent', () => {
     expect(second.textContent).toContain('ended');
     // Lifecycle events carry no db_ip/db_port → the target cell shows a dash.
     expect(fixture.componentInstance.target(lifecycle('started', 'sess-1'))).toBe('—');
+  });
+
+  // ---- Task 8.12: pending sessions (gating-deadlock fix, frontend side) --------
+
+  it('adds a pending option with the waiting badge on action=issued, even before the API knows', async () => {
+    let directory: SessionInfo[] = []; // the /api/sessions re-pull has NOT caught up yet
+    api.sessions = vi.fn(() => of(directory));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+
+    fake.emit(lifecycle('issued', 'sess-pend1'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    // The optimistic entry survives even though the API returned an empty list.
+    expect(fixture.componentInstance.sessions().length).toBe(1);
+    expect(fixture.componentInstance.sessions()[0].status).toBe('pending');
+
+    const options = await openSelectorOptions(fixture);
+    const pending = options.find((o) => o.textContent?.includes('sess-pend1')) as HTMLElement;
+    expect(pending).toBeDefined();
+    expect(pending.textContent).toContain('waiting');
+    expect(pending.querySelector('.ant-tag-gold')).not.toBeNull(); // the waiting badge
+  });
+
+  it('action=started upgrades the pending session to active (waiting badge gone)', async () => {
+    let directory: SessionInfo[] = [session({ status: 'pending' })];
+    api.sessions = vi.fn(() => of(directory));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+
+    fake.emit(lifecycle('issued', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.sessions()[0].status).toBe('pending');
+
+    // The data plane overwrote the directory record (status active) before
+    // publishing started — the re-pull now returns the active shape.
+    directory = [session({ status: 'active' })];
+    fake.emit(lifecycle('started', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.sessions().length).toBe(1);
+    expect(fixture.componentInstance.sessions()[0].status).toBe('active');
+
+    const options = await openSelectorOptions(fixture);
+    const opt = options.find((o) => o.textContent?.includes('sess-abc123')) as HTMLElement;
+    expect(opt).toBeDefined();
+    expect(opt.textContent).not.toContain('waiting');
+    expect(opt.querySelector('.ant-tag-gold')).toBeNull();
+  });
+
+  it('action=ended removes a pending session from the selector', async () => {
+    let directory: SessionInfo[] = [session({ status: 'pending' })];
+    api.sessions = vi.fn(() => of(directory));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+
+    fake.emit(lifecycle('issued', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.sessions().length).toBe(1);
+
+    directory = [];
+    fake.emit(lifecycle('ended', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.sessions().length).toBe(0);
+    const labels = await selectorOptions(fixture);
+    expect(labels).toEqual(['live (all)']);
+  });
+
+  it('renders pending sessions from the API list with the waiting badge (active ones without)', async () => {
+    api.sessions = vi.fn(() =>
+      of([
+        session({ status: 'pending' }),
+        session({ session_id: 'sess-active1', status: 'active' }),
+      ]),
+    );
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const options = await openSelectorOptions(fixture);
+    const pending = options.find((o) => o.textContent?.includes('sess-abc123')) as HTMLElement;
+    expect(pending).toBeDefined();
+    expect(pending.textContent).toContain('waiting');
+    expect(pending.querySelector('.ant-tag-gold')).not.toBeNull();
+
+    const active = options.find((o) => o.textContent?.includes('sess-active1')) as HTMLElement;
+    expect(active).toBeDefined();
+    expect(active.textContent).not.toContain('waiting');
+    expect(active.querySelector('.ant-tag-gold')).toBeNull();
+  });
+
+  it('selecting a pending session arms the gate: subscribes to sess:<sid>', async () => {
+    api.sessions = vi.fn(() => of([session({ status: 'pending' })]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    const options = await openSelectorOptions(fixture);
+    const pending = options.find((o) => o.textContent?.includes('sess-abc123')) as HTMLElement;
+    pending.click();
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    expect(fixture.componentInstance.selectedSession()).toBe('sess-abc123');
+    expect(FakeWebSocket.instances[1]).toBeDefined();
+    expect(FakeWebSocket.instances[1].url).toContain(
+      `channel=${encodeURIComponent('sess:sess-abc123')}`,
+    );
+  });
+
+  it('maps issued lifecycle action tags to gold (started green, ended red)', () => {
+    const comp = TestBed.createComponent(CheckerDashboardComponent).componentInstance;
+    expect(comp.actionColor('issued')).toBe('gold');
+    expect(comp.actionColor('started')).toBe('green');
+    expect(comp.actionColor('ended')).toBe('red');
+    expect(comp.actionColor(undefined)).toBe('red');
   });
 });
