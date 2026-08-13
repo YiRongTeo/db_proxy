@@ -325,8 +325,11 @@ BEFORE any checker, blocked SQL is not rejected instantly — it WAITS for a wat
 | Fail-closed latch | After a timeout the session **latches**: every later gated command is rejected immediately with the same message — a watcher attaching LATER does **not** unblock it; the maker must reconnect |
 | Watch re-check | The watcher is re-checked on a 500 ms ticker AND on every new command arrival, so the unblock latency is at most one tick |
 
-Practical flow: issue the write token → maker connects and runs a query (it WAITS, client alive) →
-checker selects the session / subscribes to `sess:<sid>` within the window → the held query RUNS and
+Practical flow: issue the write token → the session shows up in `/api/sessions` and the Checker
+selector immediately as **pending** (before any connect) → the checker selects the pending session
+→ the maker connects → the first query passes (no deadlock, no wait). Maker-first still works too:
+issue the write token → maker connects and runs a query (it WAITS, client alive) → checker selects
+the pending session / subscribes to `sess:<sid>` within the window → the held query RUNS and
 returns rows. If no checker appears within `gate_wait_seconds`, the maker gets the 1045/28000
 rejection and must reconnect. Read-only sessions are never held (ro is exempt from the gate).
 
