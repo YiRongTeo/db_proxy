@@ -126,6 +126,12 @@ func main() {
 	// ZT_LOG_QUERY_OUTPUT).
 	mysqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	pgProxy.SetLogQueryOutput(cfg.LogQueryOutput)
+	// Task 8.13 maker write-gate grace hold: blocked SQL commands on an
+	// unwatched write session wait up to gate_wait_seconds for a checker
+	// instead of failing instantly (0 = reject immediately, the pre-8.13
+	// behavior; configs/data.yaml, ZT_GATE_WAIT_SECONDS).
+	mysqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
+	pgProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,
