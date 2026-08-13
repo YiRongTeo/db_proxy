@@ -4,6 +4,7 @@
       <span class="channel-label">Session</span>
       <nz-select
         class="session-select"
+        nzDropdownClassName="checker-session-dropdown"
         [ngModel]="selectedSession()"
         (ngModelChange)="onSessionSelect($event)"
       >

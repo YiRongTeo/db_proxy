@@ -1004,6 +1004,9 @@ describe('CheckerDashboardComponent', () => {
 
     const strip = fixture.nativeElement.querySelector('.session-strip') as HTMLElement;
     expect(strip).not.toBeNull();
+    // Task 8.16: strip keeps its label/value structure (legibility styling hooks).
+    expect(strip.querySelectorAll('.strip-label').length).toBe(1);
+    expect(strip.querySelectorAll('.strip-value').length).toBe(6); // username, db, dbType, target, ticket, sid
     const text = strip.textContent ?? '';
     expect(text).toContain('alice'); // username (directory)
     expect(text).toContain('appdb'); // db (directory)
@@ -1078,5 +1081,18 @@ describe('CheckerDashboardComponent', () => {
     ]);
     const empty = fixture.nativeElement.querySelector('tbody .cell-empty') as HTMLElement;
     expect(empty?.getAttribute('colspan')).toBe('10');
+  });
+
+  it('wires the checker session-dropdown class for option spacing (Task 8.16)', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    await openSelectorOptions(fixture);
+    const dropdown = document.querySelector('.checker-session-dropdown') as HTMLElement;
+    expect(dropdown).not.toBeNull();
+    const options = dropdown.querySelectorAll('.ant-select-item-option');
+    expect(options.length).toBeGreaterThan(0);
   });
 });
