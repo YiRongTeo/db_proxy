@@ -322,7 +322,7 @@ BEFORE any checker, blocked SQL is not rejected instantly — it WAITS for a wat
 | Wait | While a write session has NO watcher, SQL commands queue per session (bounded at **16** held commands; overflow rejects only the new command — the queue keeps waiting). The client stays connected with **no error and no response** |
 | Watcher arrives | Within the window → the queued commands flush **in order** to the backend exactly as the normal relay would send them; each command runs and returns its real result |
 | Window expires | No watcher → every held command is rejected to the client (MySQL `ERR 1045` / PG `FATAL 28000`) with **`maker gating: no checker connected within <N>s (session <sid>)`** and each gets an audit event (`status=error`) |
-| Fail-closed latch | After a timeout the session **latches**: every later gated command is rejected immediately with the same message — a watcher attaching LATER does **not** unblock it; the maker must reconnect |
+| Re-open on watch (Task 8.17) | A drain does **not** latch the session. Unwatched commands keep getting the grace wait + drain (1045/28000 + audit); the moment a checker **re-attaches** (`watch:<sid>` reappears), the gate re-opens and the maker's next command **flows** — no reconnect, the session survives |
 | Watch re-check | The watcher is re-checked on a 500 ms ticker AND on every new command arrival, so the unblock latency is at most one tick |
 
 Practical flow: issue the write token → the session shows up in `/api/sessions` and the Checker
@@ -331,7 +331,10 @@ selector immediately as **pending** (before any connect) → the checker selects
 issue the write token → maker connects and runs a query (it WAITS, client alive) → checker selects
 the pending session / subscribes to `sess:<sid>` within the window → the held query RUNS and
 returns rows. If no checker appears within `gate_wait_seconds`, the maker gets the 1045/28000
-rejection and must reconnect. Read-only sessions are never held (ro is exempt from the gate).
+rejection and stays blocked while unwatched — but when a checker re-attaches (e.g. the checker
+dropped and rejoins by subscribing to `sess:<sid>` again), the maker's **next** query runs
+immediately, on the **same connection**: the gate re-opens on watch, it never latches. Read-only
+sessions are never held (ro is exempt from the gate).
 
 ### 5.2 Checker sessions + two-level kill (Phase 8)
 

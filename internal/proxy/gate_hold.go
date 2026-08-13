@@ -18,10 +18,15 @@ import (
 // forwarded exactly as the normal forward path would); the window expiring
 // DRAINS the queue — every held command is rejected to the client (MySQL
 // ERR 1045 / PG FATAL 28000) with an audit event (status=error, "maker
-// gating: no checker connected within <N>s") — and LATCHES the session
-// fail-closed: every later gated command is rejected immediately with the
-// same error even when a watcher attaches afterwards; the maker must
-// reconnect.
+// gating: no checker connected within <N>s").
+//
+// Task 8.17 — the gate RE-OPENS on watcher re-attach. The 8.13 permanent
+// fail-closed latch is REMOVED: a drained session is NOT latched — the gate
+// re-evaluates per command, exactly as it does before any timeout.
+// Unwatched → a fresh grace wait (queue → drain/reject + audit); watched →
+// forward immediately (a re-attached checker clears the wait state; the
+// maker's next command flows without reconnecting). Enforcement is intact:
+// no command ever reaches the backend without a watcher at execution time.
 //
 // gate_wait_seconds = 0 (the proxy default — the pre-8.13 config value)
 // keeps the old behavior: blocked commands reject immediately.
@@ -41,7 +46,7 @@ const (
 	defaultGateWaitSeconds = 20
 )
 
-// gateTimeoutMessage is the Task 8.13 drain/latch block text, shown to the
+// gateTimeoutMessage is the Task 8.13 drain block text, shown to the
 // client and recorded in each audit event: the grace window expired with no
 // checker attached.
 func gateTimeoutMessage(sid string, seconds int) string {
@@ -65,11 +70,10 @@ type mysqlGateEntry struct {
 // the session's gateMu (a dedicated mutex — the session mu guards the
 // pending/capture slots and is never held across gate transitions).
 type mysqlGateState struct {
-	active  bool             // a grace wait is in progress (queue non-empty)
-	latched bool             // fail-closed latch: a wait timed out — every further gated command rejects
-	queue   []mysqlGateEntry // held commands, bounded (gateQueueMax)
-	stop    chan struct{}    // closed by whoever ends the wait (flush / drain / session close)
-	done    chan struct{}    // closed when the wait goroutine exits
+	active bool             // a grace wait is in progress (queue non-empty)
+	queue  []mysqlGateEntry // held commands, bounded (gateQueueMax)
+	stop   chan struct{}    // closed by whoever ends the wait (flush / drain / session close)
+	done   chan struct{}    // closed when the wait goroutine exits
 }
 
 // gateHold queues a gated (blocked) command for the grace window instead of
@@ -77,18 +81,13 @@ type mysqlGateState struct {
 // NOT reply and must NOT forward: the client's response comes later, either
 // the real backend result (watcher flush) or the drain ERR. Returns false
 // when the caller must reject the command immediately: the grace window is
-// disabled (gate_wait_seconds=0), the session is fail-closed latched, or
-// the queue is full (overflow rejects only the new command — the queue
-// keeps waiting).
+// disabled (gate_wait_seconds=0) or the queue is full (overflow rejects
+// only the new command — the queue keeps waiting).
 func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 	if p.gateWaitSeconds <= 0 {
 		return false
 	}
 	s.gateMu.Lock()
-	if s.gate.latched {
-		s.gateMu.Unlock()
-		return false
-	}
 	if !s.gate.active {
 		// First held command: start the wait (grace timer + watch ticker).
 		s.gate.active = true
@@ -116,8 +115,8 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 
 // gateWaitLoop is the per-wait goroutine: it re-checks for a watcher on a
 // short ticker (flushing the queue in order when one appears) and drains +
-// latches the session when the grace window expires. It exits as soon as
-// the wait is ended by any path (flush, drain, session close).
+// rejects the queue when the grace window expires. It exits as soon as the
+// wait is ended by any path (flush, drain, session close).
 func (p *MySQLProxy) gateWaitLoop(s *mysqlSession) {
 	defer close(s.gate.done)
 	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
@@ -174,8 +173,8 @@ func (p *MySQLProxy) gateFlush(s *mysqlSession) {
 
 // gateTimeout drains the queue when the grace window expires: every held
 // command is rejected to the client (ERR 1045 + the timeout message) with
-// an audit event, and the session is LATCHED fail-closed — watchers that
-// attach later do NOT unblock it; the maker must reconnect.
+// an audit event. The session is NOT latched (Task 8.17): a watcher that
+// attaches later re-opens the gate — the maker's next command flows.
 func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -183,7 +182,6 @@ func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 		return
 	}
 	s.gate.active = false
-	s.gate.latched = true
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
@@ -249,28 +247,23 @@ type pgGateEntry struct {
 // pgGateState is the per-session Task 8.13 grace-hold state for PG,
 // guarded by the session's gateMu. Mirrors mysqlGateState.
 type pgGateState struct {
-	active  bool
-	latched bool
-	queue   []pgGateEntry
-	stop    chan struct{}
-	done    chan struct{}
+	active bool
+	queue  []pgGateEntry
+	stop   chan struct{}
+	done   chan struct{}
 }
 
 // gatePGHold queues a gated (blocked) PG message for the grace window
 // instead of rejecting it. Returns true when the message was QUEUED — the
 // caller must NOT reply and must NOT forward. Returns false when the caller
-// must reject immediately (gate_wait_seconds=0, fail-closed latch, queue
-// overflow, or an Encode failure — the latter cannot happen in practice for
-// messages just decoded by pgproto3).
+// must reject immediately (gate_wait_seconds=0, queue overflow, or an
+// Encode failure — the latter cannot happen in practice for messages just
+// decoded by pgproto3).
 func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	if p.gateWaitSeconds <= 0 {
 		return false
 	}
 	s.gateMu.Lock()
-	if s.gate.latched {
-		s.gateMu.Unlock()
-		return false
-	}
 	if !s.gate.active {
 		s.gate.active = true
 		s.gate.stop = make(chan struct{})
@@ -353,7 +346,8 @@ func (p *PGProxy) gatePGFlush(s *pgSession) {
 	s.gateMu.Unlock()
 }
 
-// gatePGTimeout is the PG mirror of gateTimeout: drain + fail-closed latch.
+// gatePGTimeout is the PG mirror of gateTimeout: drain + reject the held
+// queue with audit events. Not latched — a later watcher re-opens the gate.
 func (p *PGProxy) gatePGTimeout(s *pgSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -361,7 +355,6 @@ func (p *PGProxy) gatePGTimeout(s *pgSession) {
 		return
 	}
 	s.gate.active = false
-	s.gate.latched = true
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)

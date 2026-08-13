@@ -33,8 +33,8 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 		// so the audit trail shows the block. Task 8.13 grace hold: with
 		// gate_wait_seconds > 0 a blocked command is QUEUED instead (no reply,
 		// no forward) — the client keeps waiting for a watcher (the queue
-		// flushes in order) or for the window to expire (drain + fail-closed
-		// latch).
+		// flushes in order) or for the window to expire (drain). Task 8.17:
+		// a drain does NOT latch — a re-attached watcher re-opens the gate.
 		if len(payload) > 0 {
 			if msg := p.checkWriteGate(s, payload[0]); msg != "" {
 				if p.gateHold(s, seq, payload) {
@@ -157,16 +157,6 @@ func gatingMessage(sid string) string {
 func (p *MySQLProxy) checkWriteGate(s *mysqlSession, cmd byte) string {
 	if s.access != "write" || !isSQLExecCommand(cmd) {
 		return ""
-	}
-	// Task 8.13 fail-closed latch: a grace wait that timed out leaves the
-	// session latched — every further gated command is rejected immediately
-	// with the timeout message, even when a watcher attaches later; the
-	// maker must reconnect.
-	s.gateMu.Lock()
-	latched := s.gate.latched
-	s.gateMu.Unlock()
-	if latched {
-		return gateTimeoutMessage(s.id, p.gateWaitSeconds)
 	}
 	watched, err := p.vs.WatchActive(context.Background(), s.id)
 	if err != nil {

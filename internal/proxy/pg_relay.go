@@ -44,7 +44,8 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 		// Task 8.13 grace hold: with gate_wait_seconds > 0 a blocked message
 		// is QUEUED instead (no reply, no forward) — the client keeps waiting
 		// for a watcher (the queue flushes in order) or for the window to
-		// expire (drain + fail-closed latch).
+		// expire (drain). Task 8.17: a drain does NOT latch — a re-attached
+		// watcher re-opens the gate.
 		if blockMsg := p.gatePGBlockMsg(msg, s); blockMsg != "" {
 			if p.gatePGHold(msg, s) {
 				continue
@@ -58,14 +59,13 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 	}
 }
 
-// gatePGBlockMsg implements the Task 8.6 maker write-gate DECISION (plus
-// the Task 8.13 fail-closed latch): a SQL-executing message (SimpleQuery
-// 'Q', Parse 'P', Execute 'E') on a write-access session is allowed only
-// while a checker watches the session (EXISTS watch:<sid>). Returns ""
-// when the message may proceed; otherwise the block message. Unwatched (or
-// store error — fail closed) → the 8.6 gating message; a latched session
-// (Task 8.13: a grace wait timed out) → the timeout message, even when a
-// watcher attaches later — the maker must reconnect.
+// gatePGBlockMsg implements the Task 8.6 maker write-gate DECISION: a
+// SQL-executing message (SimpleQuery 'Q', Parse 'P', Execute 'E') on a
+// write-access session is allowed only while a checker watches the session
+// (EXISTS watch:<sid>). Returns "" when the message may proceed; otherwise
+// the block message. Unwatched (or store error — fail closed) → the 8.6
+// gating message. The decision re-evaluates PER MESSAGE (Task 8.17): a
+// grace-wait drain does not latch — a re-attached watcher re-opens the gate.
 func (p *PGProxy) gatePGBlockMsg(msg pgproto3.FrontendMessage, s *pgSession) string {
 	if s.access != "write" {
 		return ""
@@ -74,12 +74,6 @@ func (p *PGProxy) gatePGBlockMsg(msg pgproto3.FrontendMessage, s *pgSession) str
 	case *pgproto3.Query, *pgproto3.Parse, *pgproto3.Execute:
 	default:
 		return ""
-	}
-	s.gateMu.Lock()
-	latched := s.gate.latched
-	s.gateMu.Unlock()
-	if latched {
-		return gateTimeoutMessage(s.id, p.gateWaitSeconds)
 	}
 	watched, err := p.vs.WatchActive(context.Background(), s.id)
 	if err != nil {
