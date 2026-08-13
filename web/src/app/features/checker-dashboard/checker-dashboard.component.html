@@ -26,6 +26,16 @@
           session: {{ shortenSid(selectedSession()) }} · {{ selectedSessionInfo()?.username ?? '—' }}
         </nz-tag>
       }
+      <!-- Task 8.15: ONE connection-kill for the SELECTED session (rows keep kill query only). -->
+      <button
+        class="kill-connection-btn"
+        nz-button
+        nzDanger
+        nz-popconfirm
+        [nzPopconfirmTitle]="'Kill connection for session ' + shortenSid(selectedSession()) + '?'"
+        [disabled]="selectedSession() === '*'"
+        (nzOnConfirm)="killSelectedConnection()"
+      >kill connection</button>
     </div>
 
     <div class="channel-row">
@@ -50,8 +60,9 @@
       </nz-input-group>
     </div>
 
-    <nz-tag [nzColor]="connected() ? 'success' : 'error'">
-      {{ connected() ? 'live' : 'disconnected' }}
+    <!-- Task 8.15: accurate status — derived from the real socket state + selection + session lifecycle. -->
+    <nz-tag class="status-tag" [nzColor]="statusColor()">
+      {{ statusLabel() }}
     </nz-tag>
 
     <div class="autoscroll-row">
@@ -65,6 +76,25 @@
     </div>
   </div>
 
+  <!-- Task 8.15: session context strip — the session's constant fields move here
+       so the table can drop its constant columns in session mode. -->
+  @if (sessionContext(); as ctx) {
+    <div class="session-strip">
+      <span class="strip-label">Session</span>
+      <span class="strip-value">{{ ctx.username }}</span>
+      <span class="strip-sep">·</span>
+      <span class="strip-value">{{ ctx.db }}</span>
+      <span class="strip-sep">·</span>
+      <span class="strip-value">{{ ctx.dbType }}</span>
+      <span class="strip-sep">·</span>
+      <span class="strip-value strip-mono">{{ ctx.target }}</span>
+      <span class="strip-sep">·</span>
+      <span class="strip-value">{{ ctx.ticket }}</span>
+      <span class="strip-sep">·</span>
+      <span class="strip-value strip-mono">{{ ctx.sidShort }}</span>
+    </div>
+  }
+
   <div #scrollHost class="table-scroll-host">
     <nz-table
       class="checker-table"
@@ -77,10 +107,12 @@
         <tr>
           <th nzWidth="160px">Ts</th>
           <th nzWidth="170px">Kind</th>
-          <th nzWidth="120px">Username</th>
-          <th nzWidth="80px">DB</th>
-          <th nzWidth="180px">Target</th>
-          <th nzWidth="130px">Ticket</th>
+          @if (selectedSession() === '*') {
+            <th nzWidth="120px">Username</th>
+            <th nzWidth="80px">DB</th>
+            <th nzWidth="180px">Target</th>
+            <th nzWidth="130px">Ticket</th>
+          }
           <th nzWidth="90px">Status</th>
           <th nzWidth="80px">Output</th>
           <th nzWidth="100px">Kill</th>
@@ -100,10 +132,12 @@
                 <nz-tag [nzColor]="actionColor(ev.action)">{{ ev.action }}</nz-tag>
               }
             </td>
-            <td>{{ ev.username }}</td>
-            <td>{{ ev.db_type }}</td>
-            <td class="cell-mono">{{ target(ev) }}</td>
-            <td>{{ ev.ticket_id || '—' }}</td>
+            @if (selectedSession() === '*') {
+              <td>{{ ev.username }}</td>
+              <td>{{ ev.db_type }}</td>
+              <td class="cell-mono">{{ target(ev) }}</td>
+              <td>{{ ev.ticket_id || '—' }}</td>
+            }
             <td>
               @if (ev.status === 'ok') {
                 <nz-tag nzColor="success">ok</nz-tag>
@@ -137,16 +171,8 @@
                     nzSize="small"
                     nz-popconfirm
                     [nzPopconfirmTitle]="'Kill query on ' + ev.session_id + '?'"
-                    (nzOnConfirm)="kill(ev, 'query')"
+                    (nzOnConfirm)="killQuery(ev)"
                   >kill query</button>
-                  <button
-                    nz-button
-                    nzSize="small"
-                    nzDanger
-                    nz-popconfirm
-                    [nzPopconfirmTitle]="'Kill connection ' + ev.session_id + '?'"
-                    (nzOnConfirm)="kill(ev, 'connection')"
-                  >kill connection</button>
                 }
               } @else {
                 —
@@ -156,7 +182,7 @@
           </tr>
           @if (expanded() === ev.id) {
             <tr [nzExpand]="true" class="output-row">
-              <td colspan="10" class="output-cell">
+              <td [attr.colspan]="tableColspan()" class="output-cell">
                 @if (ev.truncated) {
                   <nz-alert
                     class="output-alert"
@@ -194,7 +220,7 @@
           }
         } @empty {
           <tr>
-            <td colspan="10" class="cell-empty">
+            <td [attr.colspan]="tableColspan()" class="cell-empty">
               No events yet — connect to a channel to watch queries live.
             </td>
           </tr>

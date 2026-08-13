@@ -47,6 +47,15 @@ export interface OutputColumn {
 }
 
 /**
+ * The checker's ACCURATE relation to the live feed (Task 8.15):
+ * - 'live-feed':     WS open, watching all channels (live-all mode).
+ * - 'watching':      WS open, a session is selected and its feed is active.
+ * - 'disconnected':  WS closed/errored (or still connecting).
+ * - 'session-ended': WS open, watching a session whose ended event arrived.
+ */
+export type FeedStatus = 'live-feed' | 'watching' | 'disconnected' | 'session-ended';
+
+/**
  * Checker Dashboard: live query feed over /ws/checker.
  * Auto-connects to the `*` channel on init; the operator can switch to a
  * single username channel, stop/reconnect, and toggle auto-scroll. The
@@ -56,6 +65,14 @@ export interface OutputColumn {
  * status tag (ok/error with the error message as tooltip), an expandable
  * READ-ONLY result table (columns from event.columns, cells as plain text),
  * and a kill button (nz-popconfirm → POST /api/kill) for live sessions.
+ *
+ * Task 8.15 (checker UX): the status tag is DERIVED from the real socket
+ * state (LiveQueryService.connectState — not the optimistic `connected`
+ * flag) + the selected session + session-ended lifecycle events. Connection
+ * kills move to ONE toolbar button acting on the selected session; rows keep
+ * only kill-query. In session mode a context strip above the table carries
+ * the session's constant fields and the table drops its constant columns so
+ * SQL gets the width.
  */
 @Component({
   selector: 'app-checker-dashboard',
@@ -86,6 +103,7 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   readonly autoScroll = signal(true);
 
   readonly events = this.live.events;
+  /** Legacy optimistic socket flag — keeps the Connect/Stop toggle behavior. */
   readonly connected = this.live.connected;
 
   /** Event id whose output table is expanded (single-row expansion). */
@@ -104,6 +122,76 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   readonly selectedSessionInfo = computed(
     () => this.sessions().find((s) => s.session_id === this.selectedSession()) ?? null,
   );
+
+  /** True while watching a session whose action=ended event has arrived (Task 8.15). */
+  readonly sessionEnded = signal(false);
+
+  /**
+   * Accurate feed status (Task 8.15): derived from the REAL socket state
+   * (connectState — openObserver-driven, generation-guarded) rather than the
+   * optimistic `connected` flag, which went stale on stop-during-handshake
+   * (rxjs 7.8 complete() no-op pre-open) and on channel switches (a late
+   * complete/error from the superseded socket flipped the shared flag).
+   */
+  readonly feedStatus = computed<FeedStatus>(() => {
+    if (this.live.connectState() !== 'open') return 'disconnected';
+    if (this.selectedSession() !== '*') {
+      return this.sessionEnded() ? 'session-ended' : 'watching';
+    }
+    return 'live-feed';
+  });
+
+  /** Status tag text: "live feed", "watching sid · username", "session ended", "disconnected". */
+  readonly statusLabel = computed(() => {
+    switch (this.feedStatus()) {
+      case 'live-feed':
+        return 'live feed';
+      case 'watching':
+        return `watching ${this.shortenSid(this.selectedSession())} · ${this.selectedSessionInfo()?.username ?? '—'}`;
+      case 'session-ended':
+        return 'session ended';
+      default:
+        return 'disconnected';
+    }
+  });
+
+  /** Status tag color: success while the feed relation is live, red on session-ended, error otherwise. */
+  readonly statusColor = computed(() => {
+    switch (this.feedStatus()) {
+      case 'session-ended':
+        return 'red';
+      case 'disconnected':
+        return 'error';
+      default:
+        return 'success';
+    }
+  });
+
+  /**
+   * Session context strip data (Task 8.15): the selected session's constant
+   * fields, merged from the directory record (selectedSessionInfo/pending
+   * overrides) and the first feed event for that session — lifecycle events
+   * carry no target address and ticket_id only appears on query events, so
+   * the event fills those gaps. Null in live-all mode.
+   */
+  readonly sessionContext = computed(() => {
+    if (this.selectedSession() === '*') return null;
+    const sid = this.selectedSession();
+    const info = this.selectedSessionInfo();
+    const first = this.live.events().find((e) => e.session_id === sid) ?? null;
+    return {
+      sid,
+      sidShort: this.shortenSid(sid),
+      username: info?.username ?? first?.username ?? '—',
+      db: info?.db ?? first?.db ?? '—',
+      dbType: info?.db_type ?? first?.db_type ?? '—',
+      target: first ? this.target(first) : '—',
+      ticket: first?.ticket_id ?? '—',
+    };
+  });
+
+  /** Table colspan: 10 columns in live-all mode, 6 in session mode (constant columns removed). */
+  readonly tableColspan = computed(() => (this.selectedSession() === '*' ? 10 : 6));
 
   /** Lifecycle event ids already folded into the directory refresh (idempotency). */
   private readonly seenLifecycle = new Set<string>();
@@ -148,6 +236,8 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
    * issued → optimistic pending entry (waiting for maker); started → the
    * pending override is dropped (the data plane record is active now);
    * ended → override dropped and the directory re-pull removes the session.
+   * An ended event for the SELECTED session flips the derived status to
+   * 'session-ended' (Task 8.15); started/issued for it clear that state.
    */
   private applyLifecycle(ev: QueryEvent): void {
     const sid = ev.session_id!;
@@ -155,6 +245,9 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
       this.pendingOverrides.set(sid, this.pendingSession(ev));
     } else if (ev.action === 'started' || ev.action === 'ended') {
       this.pendingOverrides.delete(sid);
+    }
+    if (sid === this.selectedSession()) {
+      this.sessionEnded.set(ev.action === 'ended');
     }
     this.refreshSessions();
   }
@@ -209,6 +302,9 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   /** Selector change: '*' keeps the all-queries pattern; a session narrows the feed to sess:<sid>. */
   onSessionSelect(sid: string): void {
     this.selectedSession.set(sid);
+    // Re-watching: 'session-ended' only re-triggers on a fresh ended event
+    // for the selected session (Task 8.15).
+    this.sessionEnded.set(false);
     this.channel.set(sid === '*' ? '*' : `sess:${sid}`);
     this.connect();
   }
@@ -283,25 +379,47 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   }
 
   /**
-   * Popconfirm confirm handler: POST /api/kill with the requested mode.
-   * mode=connection marks the row killed on 202 (the backend session is
-   * gone); mode=query only aborts the in-flight query — the row stays live
-   * and the operator sees a "query kill dispatched" confirmation.
+   * Per-row popconfirm confirm handler (Task 8.15): POST /api/kill with
+   * mode=query only — connection kills moved to the toolbar button acting on
+   * the selected session. A query kill aborts the in-flight query; the row
+   * stays live and the operator sees a "query kill dispatched" confirmation.
    */
-  kill(ev: QueryEvent, mode: 'query' | 'connection'): void {
+  killQuery(ev: QueryEvent): void {
     if (!ev.session_id) return;
-    this.api.killSession(ev.session_id, mode).subscribe({
+    this.api.killSession(ev.session_id, 'query').subscribe({
       next: () => {
-        if (mode === 'connection') {
-          this.killed.update((m) => ({ ...m, [ev.id]: true }));
-          this.message.success(`kill queued for session ${ev.session_id}`);
-        } else {
-          this.message.success(`query kill dispatched for session ${ev.session_id}`);
-        }
+        this.message.success(`query kill dispatched for session ${ev.session_id}`);
       },
       error: (err: { status?: number }) => {
         const detail = err?.status ? `HTTP ${err.status}` : 'network error';
         this.message.error(`kill failed for session ${ev.session_id}: ${detail}`);
+      },
+    });
+  }
+
+  /**
+   * Toolbar kill-connection (Task 8.15): POST /api/kill with mode=connection
+   * for the SELECTED session. On 202 every buffered row of that session is
+   * marked killed (red tag + disabled) — the connection is gone, so its rows
+   * are dead too.
+   */
+  killSelectedConnection(): void {
+    const sid = this.selectedSession();
+    if (sid === '*') return;
+    this.api.killSession(sid, 'connection').subscribe({
+      next: () => {
+        this.killed.update((m) => {
+          const next = { ...m };
+          for (const ev of this.live.events()) {
+            if (ev.session_id === sid) next[ev.id] = true;
+          }
+          return next;
+        });
+        this.message.success(`kill queued for session ${sid}`);
+      },
+      error: (err: { status?: number }) => {
+        const detail = err?.status ? `HTTP ${err.status}` : 'network error';
+        this.message.error(`kill failed for session ${sid}: ${detail}`);
       },
     });
   }

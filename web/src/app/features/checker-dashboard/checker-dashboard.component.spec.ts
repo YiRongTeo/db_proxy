@@ -34,6 +34,10 @@ class FakeWebSocket {
     this.onopen?.({} as Event);
   }
 
+  fail() {
+    this.onerror?.({} as Event);
+  }
+
   emit(event: QueryEvent) {
     this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
   }
@@ -112,6 +116,18 @@ async function confirmKill(fixture: ComponentFixture<CheckerDashboardComponent>,
   fixture.detectChanges();
 }
 
+/** Open the toolbar kill-connection popconfirm and click its OK (confirm) button. */
+async function confirmToolbarKill(fixture: ComponentFixture<CheckerDashboardComponent>) {
+  const trigger = fixture.nativeElement.querySelector('.kill-connection-btn') as HTMLButtonElement;
+  trigger.click();
+  fixture.detectChanges();
+  await fixture.whenStable();
+  const ok = document.querySelectorAll('.ant-popover-buttons button')[1] as HTMLButtonElement;
+  ok.click();
+  await fixture.whenStable();
+  fixture.detectChanges();
+}
+
 /** Open the session selector dropdown and return its option elements. */
 async function openSelectorOptions(
   fixture: ComponentFixture<CheckerDashboardComponent>,
@@ -161,17 +177,25 @@ describe('CheckerDashboardComponent', () => {
     service.socketCtor = FakeWebSocket as unknown as new (url: string) => WebSocket;
   });
 
-  it('auto-connects to the default * channel on init and shows the live tag', () => {
+  it('auto-connects to the default * channel on init and shows the live-feed tag once open', () => {
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
 
     const fake = FakeWebSocket.instances[0];
     expect(fake).toBeDefined();
     expect(fake.url).toMatch(/\/ws\/checker\?channel=\*$/); // '*' is not escaped by encodeURIComponent
-    expect(service.connected()).toBe(true);
+    expect(service.connected()).toBe(true); // legacy optimistic flag flips immediately
 
-    const tag = fixture.nativeElement.querySelector('.ant-tag') as HTMLElement;
-    expect(tag.textContent?.trim()).toContain('live');
+    // The status tag is DERIVED from the REAL socket state (Task 8.15): it
+    // stays disconnected until the socket actually opens — no more stale
+    // "live" while the feed is not up.
+    expect(service.connectState()).toBe('closed');
+    fake.open();
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('live feed');
+    expect(service.connectState()).toBe('open');
   });
 
   it('renders one row per event with kind tag, target and monospace SQL', async () => {
@@ -209,8 +233,26 @@ describe('CheckerDashboardComponent', () => {
     fixture.detectChanges();
 
     expect(service.connected()).toBe(false);
-    const tag = fixture.nativeElement.querySelector('.ant-tag') as HTMLElement;
-    expect(tag.textContent?.trim()).toContain('disconnected');
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('disconnected');
+  });
+
+  it('Stop during the handshake still flips the status to disconnected (no stale live)', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    // Socket created but never opened — pre-8.15 rxjs 7.8 complete() is a
+    // no-op here, so the socket's complete/error callbacks never fired and
+    // `connected` stayed true → the tag read "live" with no feed at all.
+    expect(FakeWebSocket.instances[0]).toBeDefined();
+    expect(service.connected()).toBe(true); // legacy optimistic flag (the bug's fuel)
+
+    fixture.componentInstance.stop();
+    fixture.detectChanges();
+
+    expect(service.connected()).toBe(false);
+    expect(service.connectState()).toBe('closed');
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('disconnected');
   });
 
   it('reconnecting from the form channel switches the feed and resets the buffer', () => {
@@ -422,7 +464,7 @@ describe('CheckerDashboardComponent', () => {
 
   // ---- Task 6.7/8.5: kill column --------------------------------------------------
 
-  it('hides the kill buttons when the event has no session_id', async () => {
+  it('hides the row kill button when the event has no session_id (toolbar button still disabled in live-all)', async () => {
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
     FakeWebSocket.instances[0].open();
@@ -434,10 +476,12 @@ describe('CheckerDashboardComponent', () => {
     const row = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
     expect(row.querySelector('button[nz-popconfirm]')).toBeNull();
     expect(row.textContent).not.toContain('kill query');
-    expect(row.textContent).not.toContain('kill connection');
+    const toolbar = fixture.nativeElement.querySelector('.kill-connection-btn') as HTMLButtonElement;
+    expect(toolbar).not.toBeNull();
+    expect(toolbar.disabled).toBe(true);
   });
 
-  it('renders two kill buttons; query kill calls killSession(sid, "query") and keeps the row live', async () => {
+  it('renders only a kill-query button per row; query kill calls killSession(sid, "query") and keeps the row live', async () => {
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
     FakeWebSocket.instances[0].open();
@@ -448,10 +492,9 @@ describe('CheckerDashboardComponent', () => {
 
     const row = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
     const queryBtn = buttonByText(row, 'kill query');
-    const connBtn = buttonByText(row, 'kill connection');
     expect(queryBtn).toBeDefined();
-    expect(connBtn).toBeDefined();
-    expect(connBtn.classList.contains('ant-btn-dangerous')).toBe(true);
+    // Per-row connection kill is gone — the toolbar button owns it (Task 8.15).
+    expect(row.textContent).not.toContain('kill connection');
     expect(api.killSession).not.toHaveBeenCalled();
 
     await confirmKill(fixture, 'kill query');
@@ -460,59 +503,74 @@ describe('CheckerDashboardComponent', () => {
     expect(api.killSession).toHaveBeenCalledWith('sess-9', 'query');
     expect(message.success).toHaveBeenCalledWith(expect.stringContaining('query kill dispatched'));
 
-    // Query kill leaves the row live: no killed tag, both buttons still enabled.
+    // Query kill leaves the row live: no killed tag, the button stays enabled.
     const after = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
     expect(after.textContent).not.toContain('killed');
     expect(buttonByText(after, 'kill query').disabled).toBe(false);
-    expect(buttonByText(after, 'kill connection').disabled).toBe(false);
   });
 
-  it('connection kill calls killSession(sid, "connection") and marks the row killed on 202', async () => {
+  it('toolbar kill connection acts on the SELECTED session and marks its rows killed on 202', async () => {
+    api.sessions = vi.fn(() => of([session()]));
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
+    await fixture.whenStable();
     FakeWebSocket.instances[0].open();
 
-    FakeWebSocket.instances[0].emit(event({ session_id: 'sess-9' }));
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[1];
+    expect(fake).toBeDefined();
+    fake.open();
+
+    fake.emit(event({ id: 'evt-a', session_id: 'sess-abc123', sql: 'SELECT 1' }));
+    fake.emit(event({ id: 'evt-b', session_id: 'sess-abc123', sql: 'SELECT 2' }));
     await fixture.whenStable();
     fixture.detectChanges();
 
-    await confirmKill(fixture, 'kill connection');
+    await confirmToolbarKill(fixture);
 
     expect(api.killSession).toHaveBeenCalledTimes(1);
-    expect(api.killSession).toHaveBeenCalledWith('sess-9', 'connection');
-    expect(message.success).toHaveBeenCalledWith(expect.stringContaining('sess-9'));
+    expect(api.killSession).toHaveBeenCalledWith('sess-abc123', 'connection');
+    expect(message.success).toHaveBeenCalledWith(expect.stringContaining('sess-abc123'));
 
-    const after = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
-    const killedTag = Array.from(after.querySelectorAll('nz-tag')).find(
-      (t) => t.textContent?.trim() === 'killed',
-    );
-    expect(killedTag).toBeDefined();
-    expect((killedTag as HTMLElement).classList.contains('ant-tag-red')).toBe(true);
-    // The popconfirm triggers are gone and the kill button is disabled.
-    expect(after.querySelector('button[nz-popconfirm]')).toBeNull();
-    const killBtn = Array.from(after.querySelectorAll('button')).find(
-      (b) => b.textContent?.trim() === 'kill',
-    ) as HTMLButtonElement;
-    expect(killBtn.disabled).toBe(true);
+    // Every buffered row of the killed session shows the red killed state.
+    const rows = fixture.nativeElement.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(2);
+    for (const row of Array.from(rows)) {
+      const el = row as HTMLElement;
+      const killedTag = Array.from(el.querySelectorAll('nz-tag')).find(
+        (t) => t.textContent?.trim() === 'killed',
+      );
+      expect(killedTag).toBeDefined();
+      expect((killedTag as HTMLElement).classList.contains('ant-tag-red')).toBe(true);
+      expect(el.querySelector('button[nz-popconfirm]')).toBeNull();
+    }
   });
 
-  it('kill failure shows an error message and leaves the row killable', async () => {
+  it('toolbar kill failure shows an error message and leaves the session killable', async () => {
     api.killSession = vi.fn(() => throwError(() => ({ status: 502 })));
+    api.sessions = vi.fn(() => of([session()]));
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
-    FakeWebSocket.instances[0].open();
+    await fixture.whenStable();
 
-    FakeWebSocket.instances[0].emit(event({ session_id: 'sess-7' }));
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].emit(event({ id: 'evt-1', session_id: 'sess-abc123' }));
     await fixture.whenStable();
     fixture.detectChanges();
 
-    await confirmKill(fixture, 'kill connection');
+    await confirmToolbarKill(fixture);
 
-    expect(api.killSession).toHaveBeenCalledWith('sess-7', 'connection');
-    expect(message.error).toHaveBeenCalledWith(expect.stringContaining('sess-7'));
+    expect(api.killSession).toHaveBeenCalledWith('sess-abc123', 'connection');
+    expect(message.error).toHaveBeenCalledWith(expect.stringContaining('sess-abc123'));
     const row = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
-    expect(row.querySelector('button[nz-popconfirm]')).not.toBeNull(); // still killable
     expect(row.textContent).not.toContain('killed');
+    const btn = fixture.nativeElement.querySelector('.kill-connection-btn') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false); // still killable
   });
 
   // ---- Task 8.5: session selector -------------------------------------------------
@@ -784,5 +842,241 @@ describe('CheckerDashboardComponent', () => {
     expect(comp.actionColor('started')).toBe('green');
     expect(comp.actionColor('ended')).toBe('red');
     expect(comp.actionColor(undefined)).toBe('red');
+  });
+
+  // ---- Task 8.15: accurate status transitions ------------------------------------
+
+  it('derives watching status when a session is selected and its feed is open', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('watching sess-abc123 · alice');
+    expect(tag.classList.contains('ant-tag-success')).toBe(true);
+    expect(fixture.componentInstance.feedStatus()).toBe('watching');
+  });
+
+  it('flips to disconnected when the socket errors', async () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.feedStatus()).toBe('live-feed');
+
+    fake.fail();
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('disconnected');
+    expect(service.connected()).toBe(false);
+    expect(service.connectState()).toBe('error');
+  });
+
+  it('flips to disconnected when the server closes the socket cleanly', async () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    FakeWebSocket.instances[0].open();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.feedStatus()).toBe('live-feed');
+
+    FakeWebSocket.instances[0].close(); // server-side close → rxjs complete
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('disconnected');
+    expect(service.connectState()).toBe('closed');
+  });
+
+  it('flips to session ended when the watched session ends', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.feedStatus()).toBe('watching');
+
+    FakeWebSocket.instances[1].emit(lifecycle('ended', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('session ended');
+    expect(tag.classList.contains('ant-tag-red')).toBe(true);
+    expect(fixture.componentInstance.feedStatus()).toBe('session-ended');
+  });
+
+  it('returns to live feed when switching back to live (all) after a session ended', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].emit(lifecycle('ended', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.feedStatus()).toBe('session-ended');
+
+    fixture.componentInstance.onSessionSelect('*');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[2].open();
+    fixture.detectChanges();
+
+    const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
+    expect(tag.textContent?.trim()).toBe('live feed');
+    expect(fixture.componentInstance.feedStatus()).toBe('live-feed');
+  });
+
+  it('a late close from a superseded socket does not clobber the new feed status', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.feedStatus()).toBe('watching');
+
+    // The OLD socket's close event arrives late — the generation guard must
+    // keep it from flipping the shared state while the new feed is up.
+    FakeWebSocket.instances[0].close();
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.feedStatus()).toBe('watching');
+    expect(service.connected()).toBe(true);
+    expect(service.connectState()).toBe('open');
+  });
+
+  // ---- Task 8.15: toolbar kill-connection -----------------------------------------
+
+  it('toolbar kill connection is disabled in live-all mode', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    const btn = fixture.nativeElement.querySelector('.kill-connection-btn') as HTMLButtonElement;
+    expect(btn).not.toBeNull();
+    expect(btn.disabled).toBe(true);
+  });
+
+  // ---- Task 8.15: session context strip + constant-column removal ----------------
+
+  it('renders the session context strip with directory + event fields in session mode', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    FakeWebSocket.instances[1].emit(
+      event({ id: 'evt-1', session_id: 'sess-abc123', ticket_id: 'OPS-1234' }),
+    );
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const strip = fixture.nativeElement.querySelector('.session-strip') as HTMLElement;
+    expect(strip).not.toBeNull();
+    const text = strip.textContent ?? '';
+    expect(text).toContain('alice'); // username (directory)
+    expect(text).toContain('appdb'); // db (directory)
+    expect(text).toContain('mysql'); // db_type (directory)
+    expect(text).toContain('app@10.0.0.5:3306'); // target (first event)
+    expect(text).toContain('OPS-1234'); // ticket_id (query events only)
+    expect(text).toContain('sess-abc123'); // session id (short)
+  });
+
+  it('renders the strip from directory info with dashes when no event has arrived yet', async () => {
+    api.sessions = vi.fn(() => of([session({ status: 'pending' })]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const strip = fixture.nativeElement.querySelector('.session-strip') as HTMLElement;
+    expect(strip).not.toBeNull();
+    const text = strip.textContent ?? '';
+    expect(text).toContain('alice');
+    expect(text).toContain('appdb');
+    expect(text).toContain('mysql');
+    expect(text.match(/—/g)?.length).toBe(2); // target + ticket: no events yet
+  });
+
+  it('hides the session context strip in live-all mode', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('.session-strip')).toBeNull();
+  });
+
+  it('removes the constant columns from the table in session mode', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const headers = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('thead th'),
+    ).map((th) => th.textContent?.trim());
+    expect(headers).toEqual(['Ts', 'Kind', 'Status', 'Output', 'Kill', 'SQL']);
+    const empty = fixture.nativeElement.querySelector('tbody .cell-empty') as HTMLElement;
+    expect(empty?.getAttribute('colspan')).toBe('6'); // empty row spans session-mode width
+  });
+
+  it('keeps the constant columns in live-all mode', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    const headers = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('thead th'),
+    ).map((th) => th.textContent?.trim());
+    expect(headers).toEqual([
+      'Ts',
+      'Kind',
+      'Username',
+      'DB',
+      'Target',
+      'Ticket',
+      'Status',
+      'Output',
+      'Kill',
+      'SQL',
+    ]);
+    const empty = fixture.nativeElement.querySelector('tbody .cell-empty') as HTMLElement;
+    expect(empty?.getAttribute('colspan')).toBe('10');
   });
 });

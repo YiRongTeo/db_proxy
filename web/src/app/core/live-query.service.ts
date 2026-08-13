@@ -12,12 +12,34 @@ import { QueryEvent } from './api.service';
  * config key (it constructs the socket with `new WebSocketCtor(url)`); the
  * `webSocketFactory` config key does not exist in this version. The
  * `socketCtor` field below is the test seam wired through `WebSocketCtor`.
+ *
+ * Task 8.15 seam: `connectState` is the ACCURATE socket state, driven by real
+ * socket events (openObserver / error / complete), never by optimism. The
+ * legacy `connected` signal keeps its documented optimistic semantics
+ * (true right after connect()) for the Connect/Stop button, but it is now
+ * also explicitly cleared in disconnect() — previously it could only flip
+ * false via the socket's error/complete callbacks, which rxjs 7.8 never fires
+ * for a socket closed before it opened (AnonymousSubject.complete() is a
+ * no-op while the destination is still the pre-open ReplaySubject), leaving
+ * the tag stale "live" after Stop during the handshake. A generation counter
+ * additionally guards every callback so a LATE error/complete/open from a
+ * superseded socket (channel switch) can never clobber the new socket's state.
  */
 @Injectable({ providedIn: 'root' })
 export class LiveQueryService implements OnDestroy {
   private socket: WebSocketSubject<QueryEvent> | null = null;
+
+  /** Bumped on every connect/disconnect; callbacks from older sockets are ignored. */
+  private generation = 0;
+
   readonly events = signal<QueryEvent[]>([]);
+
+  /** Legacy optimistic socket flag (true right after connect(), see class doc). */
   readonly connected = signal(false);
+
+  /** Real socket state (Task 8.15): driven by socket events, not connect() optimism. */
+  readonly connectState = signal<'closed' | 'open' | 'error'>('closed');
+
   private limit = 500; // ring-buffer cap
 
   /** Test seam: custom WebSocket constructor (defaults to the global WebSocket). */
@@ -25,11 +47,24 @@ export class LiveQueryService implements OnDestroy {
 
   connect(channel: string) {
     this.disconnect();
+    const gen = ++this.generation;
     const url = `${location.origin.replace(/^http/, 'ws')}/ws/checker?channel=${encodeURIComponent(channel)}`;
     // rxjs 7.8.2 ignores withCredentials at runtime (cookies ride along on
     // same-origin WebSockets automatically) and its type omits the key; keep it
     // per the service contract and widen the type so the intent is explicit.
-    const config: WebSocketSubjectConfig<QueryEvent> & { withCredentials: boolean } = { url, withCredentials: true };
+    const config: WebSocketSubjectConfig<QueryEvent> & { withCredentials: boolean } = {
+      url,
+      withCredentials: true,
+      // The real "socket opened" notification (rxjs fires openObserver.next
+      // from its onopen handler). The subscription's next() only sees messages,
+      // so without this the service could never tell open from connecting.
+      openObserver: {
+        next: () => {
+          if (gen !== this.generation) return; // superseded socket — ignore
+          this.connectState.set('open');
+        },
+      },
+    };
     if (this.socketCtor) {
       config.WebSocketCtor = this.socketCtor;
     }
@@ -45,15 +80,30 @@ export class LiveQueryService implements OnDestroy {
           if (a.some((x) => x.id === e.id)) return a;
           return [...a.slice(-this.limit + 1), e];
         }),
-      error: () => this.connected.set(false),
-      complete: () => this.connected.set(false),
+      error: () => {
+        if (gen !== this.generation) return;
+        this.connected.set(false);
+        this.connectState.set('error');
+      },
+      complete: () => {
+        if (gen !== this.generation) return;
+        this.connected.set(false);
+        this.connectState.set('closed');
+      },
     });
     this.connected.set(true);
   }
 
   disconnect() {
-    this.socket?.complete(); // spec: complete on navigation away (no leaks)
+    this.generation++; // supersede any in-flight callbacks from the old socket
+    const socket = this.socket;
     this.socket = null;
+    socket?.complete(); // spec: complete on navigation away (no leaks)
+    // Explicit state flip — the socket's complete/error callbacks may never
+    // fire (pre-open close is a no-op in rxjs 7.8; see class doc), so the
+    // signals must not depend on them for the disconnect path.
+    this.connected.set(false);
+    this.connectState.set('closed');
   }
 
   ngOnDestroy() { this.disconnect(); }

@@ -61,6 +61,45 @@
   white-space: nowrap;
 }
 
+/* Task 8.15: session context strip — constant session fields above the table
+   (the table drops those columns in session mode so SQL gets the width). */
+.session-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--nz-border-color, #1f2937);
+  border-left: 3px solid var(--nz-primary-color, #0ea5e9);
+  border-radius: 8px;
+  background: rgba(14, 165, 233, 0.06);
+  font-size: 12px;
+  color: var(--nz-text-color-secondary, #94a3b8);
+}
+
+.strip-label {
+  color: var(--nz-primary-color, #0ea5e9);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 4px;
+}
+
+.strip-value {
+  color: #e2e8f0;
+  white-space: nowrap;
+}
+
+.strip-mono {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.strip-sep {
+  color: #475569;
+}
+
+
 .table-scroll-host {
   height: 55vh;
   overflow: auto;
