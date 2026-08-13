@@ -2306,8 +2306,18 @@ While a write session has NO watcher, blocked SQL commands WAIT up to `gate_wait
 ## Task 8.14: Gate — the resolved gating flow
 Full-stack matrix: (1) issue write token → pending session visible in /api/sessions + selector before any connect; (2) checker watches the pending session → maker connects → first query passes (deadlock gone); (3) maker connects first → query waits → watcher attaches → query runs; (4) no watcher → 1045 after the window, audit event; (5) pending expiry; (6) old flow (watch after connect within window) still works; (7) ro unaffected; (8) gates: go suite + ng test + build; (9) RUN.md §5.1 update (the resolved workflow: issue → select → connect, plus the grace window); (10) commit; (11) report.
 
-## Phase 8 gate (addendum)
-All tasks reviewed; full suites green; amendment 14 verified end-to-end; ledger updated.
+## Task 8.15: Checker UX — accurate connection status, single kill-connection button, session context strip (user directive 2026-08-14)
+
+Three checker-page fixes:
+
+1. **Accurate connection status** (the bug): the page's status tag ("live"/"disconnected") tracks `live.connected` — the WS SOCKET — not the checker's actual relation to the selected session. ROOT-CAUSE to confirm: `stop()` and channel-switches leave the socket state stale (the tag can read "live" while the per-session feed is gone, or stay "disconnected" after reconnect). FIX: a derived status with the accurate semantics — `connected` = WS open AND (live-all mode OR a session is selected and its feed is active); update on WS open/error/complete, stop(), channel selection/switch, and session ended (watching a session that ended → reflect "session ended" state). Render: "connected · live feed", "connected · watching sid-xxxx" (with the session's username), "disconnected", "session ended". LiveQueryService changes only where the seam needs an explicit close/status event; the component owns the derived state. Tests: status transitions for connect/stop/switch/WS-drop/session-ended.
+2. **Kill-connection above the table**: remove the per-row "kill connection" button; add ONE button above the table (in the toolbar area) acting on the SELECTED session (nz-popconfirm, danger, "kill connection"), disabled when no session is selected (live-all mode). Rows keep only "kill query". The killed-session row-state (red tag) still applies when the connection kill lands on the selected session.
+3. **Session context strip**: when a session is selected (not live-all), render a strip ABOVE the table with the session's constant fields — username, db (target database), db_type, target (ip:port), ticket_id, session_id (shortened) — sourced from the session info (selectedSessionInfo()) and/or the first event; REMOVE those constant columns (username/db_type/target/ticket_id — and the db column if present) from the TABLE in session mode so the SQL column gets the space; keep the columns in live-all mode (rows vary). Tests: strip renders the right values in session mode; columns absent in session mode, present in live-all mode.
+
+Gates: ng test (ALL specs), npm build, go suite (unchanged but re-run), commit, report.
+
+## Phase 8 gate (addendum 2)
+All tasks reviewed; full suites green; amendment 15 verified end-to-end; ledger updated.
 
 # Phase 9: MSSQL support (user directive 2026-08-13)
 
