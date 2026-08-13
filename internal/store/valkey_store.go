@@ -308,13 +308,16 @@ func (s *ValkeyStore) WatchTTL(ctx context.Context, sid string) (time.Duration, 
 // decoded from the data plane's sess:live:<sid> records. ThreadID is
 // intentionally NOT exposed: it is a backend-internal connection identifier
 // (MySQL CONNECTION_ID / PG backend pid), not part of the control-plane
-// surface.
+// surface. Status (Task 8.11) is "pending" for a token issued but not yet
+// connected (control plane) or "active" once the data plane session is
+// established; empty for records written before 8.11.
 type SessionInfo struct {
 	SessionID string    `json:"session_id"`
 	Username  string    `json:"username"`
 	DBUser    string    `json:"db_user"`
 	DBType    string    `json:"db_type"`
 	DB        string    `json:"db"`
+	Status    string    `json:"status,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	LastSeen  time.Time `json:"last_seen"`
 }

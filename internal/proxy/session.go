@@ -15,7 +15,11 @@ const sessionLiveTTL = 60 * time.Second
 // entry the checker lists (username, session_id, db, db_user). ThreadID is
 // the backend's connection identifier: MySQL CONNECTION_ID() for a mysql
 // session, pg_backend_pid() for a postgres session. 0 means capture failed —
-// the session still works; kill-query just has no query context.
+// the session still works; kill-query just has no query context. Status
+// (Task 8.11) is "pending" for the CONTROL PLANE's token-issue record (the
+// session is listed before the maker connects — the gating deadlock fix) or
+// "active" once the data plane establishes the session and overwrites the
+// record.
 type sessionRecord struct {
 	SessionID string    `json:"session_id"`
 	Username  string    `json:"username"`
@@ -23,13 +27,16 @@ type sessionRecord struct {
 	DBType    string    `json:"db_type"`
 	DB        string    `json:"db"`
 	ThreadID  int64     `json:"thread_id"`
+	Status    string    `json:"status,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	LastSeen  time.Time `json:"last_seen"`
 }
 
 // buildSessionRecord marshals a session directory record; nil on failure
-// (practically impossible for these field types).
-func buildSessionRecord(sid, username, dbUser, dbType, db string, threadID int64, startedAt, lastSeen time.Time) []byte {
+// (practically impossible for these field types). status is "active" from
+// the data plane (every write here is an established session); the control
+// plane writes its own "pending" records at token issue (Task 8.11).
+func buildSessionRecord(sid, username, dbUser, dbType, db string, threadID int64, startedAt, lastSeen time.Time, status string) []byte {
 	raw, err := json.Marshal(sessionRecord{
 		SessionID: sid,
 		Username:  username,
@@ -37,6 +44,7 @@ func buildSessionRecord(sid, username, dbUser, dbType, db string, threadID int64
 		DBType:    dbType,
 		DB:        db,
 		ThreadID:  threadID,
+		Status:    status,
 		StartedAt: startedAt,
 		LastSeen:  lastSeen,
 	})

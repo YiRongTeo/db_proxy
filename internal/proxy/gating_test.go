@@ -698,3 +698,136 @@ func TestPGWriteGateBlocksUnwatched(t *testing.T) {
 	}
 	waitPGDone(t, done)
 }
+
+// --- Task 8.11: token-time session listing (the gating-deadlock fix) --------
+// The deadlock: a write maker's first query is blocked (1045) when no
+// checker watches yet, but the checker can only select a session AFTER the
+// maker connects — the client breaks before the checker can attach.
+// RESOLUTION: the session id is stamped into the TOKEN at issue time, so
+// the checker can watch sess:<sid> (from the pending listing) BEFORE the
+// maker connects. These tests prove: the data plane adopts the token's sid,
+// the FIRST command passes the gate when the watcher attached pre-connect,
+// and the directory record flips to status=active under that sid.
+
+// TestMySQLWriteGateFirstQueryPassesWithTokenSid (Task 8.11 live): a write
+// token carrying its session id, watched BEFORE the maker connects → the
+// maker's FIRST query passes (no 1045 — the deadlock is gone). Also asserts
+// the started event's session_id equals the token's sid and the directory
+// record flips to active.
+func TestMySQLWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	marker := fmt.Sprintf("gate-marker-%d", time.Now().UnixNano())
+	cleanupMarkerRow(t, marker)
+
+	sid := models.NewSessionID()
+	rwToken, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	if err := vs.SetToken(ctx, rwToken, models.TokenPayload{Username: "gate-811", DBUser: "rw_user",
+		DBIP: "127.0.0.1", DBPort: "3307", DBType: "mysql", TicketID: "T-8-11", Access: "write",
+		SessionID: sid}, time.Minute); err != nil {
+		t.Fatalf("SetToken(rw): %v", err)
+	}
+	userCh := subscribePG(t, vs, "queries:gate-811")
+	ln, _ := startGatingProxy(t, vs, gatingCreds)
+
+	// The checker attaches BEFORE the maker connects — exactly what the
+	// token-time pending listing enables (watch:<sid> from the pending
+	// entry, before the session exists).
+	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+		t.Fatalf("SetWatch: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	rwClient := dialTestMySQLSession(t, ln, rwToken)
+	started := recvSessionEvent(t, userCh)
+	if started.SessionID != sid {
+		t.Fatalf("started event session_id = %q, want the token's sid %q", started.SessionID, sid)
+	}
+
+	// FIRST query: the gate passes — no 1045 on the first command.
+	insert := append([]byte{cmdQuery}, "INSERT INTO demo_items (name) VALUES ('"+marker+"')"...)
+	if err := writeMySQLPacket(rwClient, 0, insert); err != nil {
+		t.Fatalf("write INSERT: %v", err)
+	}
+	readMySQLOKPacket(t, rwClient)
+	ev := recvQueryEvent(t, userCh)
+	if ev.Status != "ok" || ev.StmtType != "insert" || ev.SessionID != sid {
+		t.Errorf("first-query event = status %q stmt_type %q session %q, want ok/insert/%s",
+			ev.Status, ev.StmtType, ev.SessionID, sid)
+	}
+
+	// The directory record flipped to active under the token's sid.
+	rec := findSessionRecord(t, vs, sid)
+	if rec == nil {
+		t.Fatalf("session %s not listed after connect", sid)
+	}
+	if rec.Status != "active" {
+		t.Errorf("session record status = %q, want active", rec.Status)
+	}
+	if rec.ThreadID <= 0 {
+		t.Errorf("thread_id = %d, want the backend CONNECTION_ID() (> 0)", rec.ThreadID)
+	}
+
+	// Cleanup the marker row (watcher still present → allowed).
+	del := append([]byte{cmdQuery}, "DELETE FROM demo_items WHERE name = '"+marker+"'"...)
+	if err := writeMySQLPacket(rwClient, 0, del); err != nil {
+		t.Fatalf("write DELETE: %v", err)
+	}
+	readMySQLOKPacket(t, rwClient)
+	rwClient.Close()
+}
+
+// TestPGWriteGateFirstQueryPassesWithTokenSid (Task 8.11 PG mirror): the
+// same flow — token-sid session, watcher attached before connect, first
+// query passes the gate, started event carries the token's sid, record
+// status=active.
+func TestPGWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	sid := models.NewSessionID()
+	token := fmt.Sprintf("pggate811_%d", time.Now().UnixNano())
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "pg-gate-811", DBUser: "ro_user",
+		DBIP: "127.0.0.1", DBPort: "5433", DBType: "postgres", TicketID: "T-8-11", Access: "write",
+		SessionID: sid}, 5*time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	userCh := subscribePG(t, vs, "queries:pg-gate-811")
+	ln, done := startTestPGProxyWithCreds(t, vs, &bytes.Buffer{}, pgLiveCreds, 1)
+
+	// Checker attaches BEFORE the maker connects.
+	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+		t.Fatalf("SetWatch: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	front := pgDialDB(t, ln, token, false, "appdb")
+	pgReadUntilReady(t, front)
+	started := recvSessionEvent(t, userCh)
+	if started.SessionID != sid {
+		t.Fatalf("started event session_id = %q, want the token's sid %q", started.SessionID, sid)
+	}
+
+	// FIRST query passes the gate.
+	pgExecQuery(t, front, "SELECT 1")
+	ev := recvQueryEvent(t, userCh)
+	if ev.Status != "ok" || ev.SessionID != sid {
+		t.Errorf("first-query event = status %q session %q, want ok/%s", ev.Status, ev.SessionID, sid)
+	}
+
+	// The directory record flipped to active under the token's sid.
+	rec := findSessionRecord(t, vs, sid)
+	if rec == nil {
+		t.Fatalf("session %s not listed after connect", sid)
+	}
+	if rec.Status != "active" {
+		t.Errorf("session record status = %q, want active", rec.Status)
+	}
+
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
+	}
+	waitPGDone(t, done)
+}

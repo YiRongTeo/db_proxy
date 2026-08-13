@@ -294,6 +294,15 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
 		return
 	}
+	// Task 8.11: the session id comes from the TOKEN when present — the
+	// control plane stamps it at issue time so checkers can watch the
+	// session BEFORE the maker connects (the gating-deadlock fix). Tokens
+	// without one (pre-8.11 tokens / tests) fall back to generating it
+	// here, preserving the old behavior.
+	sid := tok.SessionID
+	if sid == "" {
+		sid = models.NewSessionID()
+	}
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
@@ -302,7 +311,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// told the session is up) and the session is entered in the directory
 	// with a started lifecycle event.
 	s := &mysqlSession{
-		id:        "sid-" + newEventID(),
+		id:        sid,
 		db:        database,
 		threadID:  captureMySQLThreadID(backend, p.log),
 		startedAt: time.Now().UTC(),

@@ -269,7 +269,7 @@ func (p *PGProxy) publishEvent(s *pgSession, ev *models.QueryEvent) {
 	_ = p.vs.Publish(ctx, "queries:sess:"+ev.SessionID, raw)
 	s.mu.Lock()
 	s.lastSeen = time.Now().UTC()
-	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen)
+	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
 	if rec != nil {
 		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
@@ -302,7 +302,7 @@ func (p *PGProxy) publishEvent(s *pgSession, ev *models.QueryEvent) {
 func (p *PGProxy) refreshSessionLive(s *pgSession, tok *models.TokenPayload) {
 	s.mu.Lock()
 	s.lastSeen = time.Now().UTC()
-	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen)
+	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
 	if rec == nil {
 		return

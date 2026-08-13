@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -12,6 +14,24 @@ import (
 
 // maxBodyBytes caps JSON request bodies at 1 MB.
 const maxBodyBytes = 1 << 20
+
+// sessionPendingTTL is the lifetime of a sess:live:<sid> record written at
+// TOKEN ISSUE time (Task 8.11): a token whose maker never connects expires
+// from the session directory on its own. Mirrors the data plane's
+// sessionLiveTTL heartbeat so pending and active records share one cadence.
+const sessionPendingTTL = 60 * time.Second
+
+// newEventID returns a random 64-bit hex id for control-plane lifecycle
+// events (mirrors the data plane's event id format). rand.Read cannot fail
+// in practice on supported platforms; the zero fallback keeps the id
+// non-empty in that pathological case.
+func newEventID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "0000000000000000"
+	}
+	return hex.EncodeToString(b)
+}
 
 // handleHealth reports Control Plane + Valkey liveness.
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -98,10 +118,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
+	// Task 8.11: stamp the session id at ISSUE time so the session is
+	// visible to checkers (status "pending") before the maker connects —
+	// the gating-deadlock fix. The data plane adopts this id on connect.
 	payload := models.TokenPayload{
 		Username: req.Username, DBUser: req.DBUser, DBIP: req.DBIP,
 		DBPort: req.DBPort, DBType: req.DBType, TicketID: req.TicketID,
-		Access: a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort),
+		Access:    a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort),
+		SessionID: models.NewSessionID(),
 	}
 	ttl := time.Duration(a.cfg.TokenTTL) * time.Second
 	if err := a.vs.SetToken(r.Context(), token, payload, ttl); err != nil {
@@ -109,14 +133,88 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
+	// The token is stored; now list the session at issue time (pending
+	// directory record + action=issued lifecycle event). Best-effort — a
+	// directory/pubsub hiccup must not fail an already-stored token, but
+	// it IS logged.
+	a.recordPendingSession(r.Context(), &payload)
 	a.log.Info("token issued", "username", payload.Username, "db_user", payload.DBUser,
-		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access)
+		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access,
+		"session_id", payload.SessionID)
 	writeJSON(w, http.StatusOK, models.TokenResponse{
 		Token:     token,
 		Host:      a.cfg.DataPlaneHost,
 		Port:      a.cfg.DataPlanePort,
 		ExpiresIn: a.cfg.TokenTTL,
 	})
+}
+
+// pendingSessionRecord is the CONTROL PLANE's sess:live:<sid> payload
+// (Task 8.11): the session directory entry for a just-issued token, visible
+// to checkers BEFORE the maker ever connects. DB is unknown at issue time
+// (the client requests it in the handshake) and is therefore omitted; the
+// data plane overwrites the record with the full active shape when the
+// session starts.
+type pendingSessionRecord struct {
+	SessionID string    `json:"session_id"`
+	Username  string    `json:"username"`
+	DBUser    string    `json:"db_user"`
+	DBType    string    `json:"db_type"`
+	DB        string    `json:"db,omitempty"`
+	Status    string    `json:"status"`
+	StartedAt time.Time `json:"started_at"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// recordPendingSession makes a just-issued token's session visible to
+// checkers at TOKEN ISSUE time (Task 8.11): it writes the sess:live:<sid>
+// directory entry with status "pending" (sessionPendingTTL — a token whose
+// maker never connects expires on its own) and publishes the action=issued
+// lifecycle event to queries:<user> AND queries:sess:<sid> (the same fan-out
+// the data plane uses for started/ended; like them, it deliberately skips
+// the ticket channel). Best-effort: the token itself is already stored — a
+// directory/pubsub failure is logged, never fatal to the issue.
+func (a *api) recordPendingSession(ctx context.Context, p *models.TokenPayload) {
+	now := time.Now().UTC()
+	rec, err := json.Marshal(pendingSessionRecord{
+		SessionID: p.SessionID,
+		Username:  p.Username,
+		DBUser:    p.DBUser,
+		DBType:    p.DBType,
+		Status:    "pending",
+		StartedAt: now,
+		LastSeen:  now,
+	})
+	if err != nil {
+		a.log.Error("pending session record marshal", "err", err)
+		return
+	}
+	if err := a.vs.SetSessionLive(ctx, p.SessionID, rec, sessionPendingTTL); err != nil {
+		a.log.Error("pending session record store", "err", err, "session_id", p.SessionID)
+	}
+	ev := models.QueryEvent{
+		ID:        newEventID(),
+		Ts:        now,
+		Kind:      "session",
+		Action:    "issued",
+		Username:  p.Username,
+		DBUser:    p.DBUser,
+		DBType:    p.DBType,
+		SessionID: p.SessionID,
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		a.log.Error("issued event marshal", "err", err)
+		return
+	}
+	if err := a.vs.Publish(ctx, "queries:"+ev.Username, raw); err != nil {
+		a.log.Error("issued event publish", "err", err, "channel", "queries:"+ev.Username)
+	}
+	if err := a.vs.Publish(ctx, "queries:sess:"+ev.SessionID, raw); err != nil {
+		a.log.Error("issued event publish", "err", err, "channel", "queries:sess:"+ev.SessionID)
+	}
+	a.log.Info("session issued", "username", ev.Username, "db_user", ev.DBUser,
+		"db_type", ev.DBType, "session_id", ev.SessionID)
 }
 
 // accessForPreset resolves the token's access level from the db_preset that

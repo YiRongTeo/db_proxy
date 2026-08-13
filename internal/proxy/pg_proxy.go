@@ -297,6 +297,15 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	defer front.Close()
 
+	// Task 8.11: the session id comes from the TOKEN when present — the
+	// control plane stamps it at issue time so checkers can watch the
+	// session BEFORE the maker connects (the gating-deadlock fix). Tokens
+	// without one (pre-8.11 tokens / tests) fall back to generating it
+	// here, preserving the old behavior.
+	sid := tok.SessionID
+	if sid == "" {
+		sid = models.NewSessionID()
+	}
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
@@ -304,7 +313,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// backend pid is captured NOW (backend idle) and the session is
 	// entered in the directory with a started lifecycle event.
 	s := &pgSession{
-		id:        "sid-" + newEventID(),
+		id:        sid,
 		db:        sm.Parameters["database"],
 		threadID:  capturePGThreadID(front, p.log),
 		startedAt: time.Now().UTC(),

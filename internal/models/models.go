@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"time"
+)
 
 // TokenPayload is the routing payload bound to a single-use token.
 // Stored in Valkey at tok:<token> with a 5-minute TTL.
@@ -12,6 +16,27 @@ type TokenPayload struct {
 	DBType   string `json:"db_type"`             // "mysql" | "postgres"
 	TicketID string `json:"ticket_id,omitempty"` // optional maker-checker grouping
 	Access   string `json:"access,omitempty"`    // "read" | "write" (Task 8.6 maker write-gating); absent = read
+	// SessionID (Task 8.11) is the session directory id stamped by the
+	// CONTROL PLANE at issue time, so the session is visible to checkers
+	// (status "pending") BEFORE the maker ever connects — the gating
+	// deadlock fix. The data plane adopts it as its session id; tokens
+	// without it (pre-8.11 / tests) fall back to generating one.
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// NewSessionID returns a random session id in the sid-<hex> form shared by
+// the Control Plane (stamped into tokens at issue time — Task 8.11) and the
+// Data Plane (fallback when a token carries no sid). The form mirrors the
+// data plane's legacy "sid-" + 16-hex generation so old and new ids are
+// indistinguishable on the wire. rand.Read cannot fail in practice on
+// supported platforms; the zero fallback keeps the id well-formed in that
+// pathological case.
+func NewSessionID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "sid-0000000000000000"
+	}
+	return "sid-" + hex.EncodeToString(b)
 }
 
 // TokenResponse is returned by POST /api/token.

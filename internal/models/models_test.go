@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -92,6 +93,66 @@ func TestTokenPayloadEmptyTicketIDOmitted(t *testing.T) {
 	}
 	if strings.Contains(string(data), "ticket_id") {
 		t.Errorf("expected ticket_id to be omitted, got %s", data)
+	}
+}
+
+func TestTokenPayloadSessionIDRoundTrip(t *testing.T) {
+	// Task 8.11: the control-plane-stamped session id round-trips through
+	// JSON alongside the access level.
+	roundTrip(t, TokenPayload{
+		Username:  "alice.ad",
+		DBUser:    "app_rw",
+		DBIP:      "10.0.0.5",
+		DBPort:    "3306",
+		DBType:    "mysql",
+		TicketID:  "TCKT-1042",
+		Access:    "write",
+		SessionID: "sid-0123456789abcdef",
+	})
+}
+
+func TestTokenPayloadEmptySessionIDOmitted(t *testing.T) {
+	// Task 8.11 backward compatibility: a payload without a session id
+	// (pre-8.11 tokens / old tests) must marshal WITHOUT the session_id
+	// key, and an old wire payload without the key decodes with
+	// SessionID == "" — the data plane then falls back to generating one.
+	p := TokenPayload{
+		Username: "alice.ad",
+		DBUser:   "app_ro",
+		DBIP:     "10.0.0.5",
+		DBPort:   "3306",
+		DBType:   "mysql",
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "session_id") {
+		t.Errorf("expected session_id to be omitted, got %s", data)
+	}
+	// And an old wire payload WITHOUT the key decodes with SessionID == "".
+	var got TokenPayload
+	if err := json.Unmarshal([]byte(`{"username":"alice.ad","db_user":"app_ro","db_ip":"10.0.0.5","db_port":"3306","db_type":"mysql","ticket_id":"TCKT-1042"}`), &got); err != nil {
+		t.Fatalf("unmarshal legacy payload: %v", err)
+	}
+	if got.SessionID != "" {
+		t.Errorf("legacy payload decoded SessionID = %q, want \"\"", got.SessionID)
+	}
+}
+
+func TestNewSessionIDFormat(t *testing.T) {
+	// Task 8.11: the shared sid generator produces the sid-<hex> form the
+	// data plane already used (sid- prefix + 16 hex chars) and unique ids.
+	a := NewSessionID()
+	if !strings.HasPrefix(a, "sid-") || len(a) != 4+16 {
+		t.Errorf("NewSessionID() = %q, want sid- prefix + 16 hex chars", a)
+	}
+	if _, err := hex.DecodeString(a[4:]); err != nil {
+		t.Errorf("NewSessionID() suffix %q is not hex: %v", a[4:], err)
+	}
+	b := NewSessionID()
+	if a == b {
+		t.Errorf("NewSessionID() returned the same id twice: %q", a)
 	}
 }
 

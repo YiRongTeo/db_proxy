@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -444,5 +445,98 @@ func TestListSessionsParsed(t *testing.T) {
 	}
 	if got == nil || len(got) != 0 {
 		t.Fatalf("ListSessionsParsed on empty directory = %#v (nil=%v), want non-nil empty slice", got, got == nil)
+	}
+}
+
+// TestListSessionsParsedStatus (Task 8.11): the session-directory record's
+// status field (pending|active) passes through ListSessionsParsed into
+// SessionInfo — pending for the control plane's token-issue record, active
+// for the data plane's established session. Records without the key
+// (pre-8.11) decode with Status == "" (backward compat).
+func TestListSessionsParsedStatus(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	pendSid := uniqueSid(t)
+	actSid := uniqueSid(t)
+	legSid := uniqueSid(t)
+	for _, k := range []string{"sess:live:" + pendSid, "sess:live:" + actSid, "sess:live:" + legSid} {
+		cleanupKey(t, s, k)
+	}
+
+	pend := []byte(`{"session_id":"` + pendSid + `","username":"alice","db_user":"rw_user","db_type":"mysql","status":"pending","started_at":"` +
+		now.Format(time.RFC3339Nano) + `","last_seen":"` + now.Format(time.RFC3339Nano) + `"}`)
+	act := []byte(`{"session_id":"` + actSid + `","username":"bob","db_user":"ro_user","db_type":"postgres","db":"appdb","thread_id":42,"status":"active","started_at":"` +
+		now.Format(time.RFC3339Nano) + `","last_seen":"` + now.Format(time.RFC3339Nano) + `"}`)
+	leg := []byte(`{"session_id":"` + legSid + `","username":"carol","db_user":"ro_user","db_type":"mysql","db":"appdb","thread_id":7,"started_at":"` +
+		now.Format(time.RFC3339Nano) + `","last_seen":"` + now.Format(time.RFC3339Nano) + `"}`)
+	for _, rec := range [][]byte{pend, act, leg} {
+		var r struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(rec, &r); err != nil {
+			t.Fatalf("test record: %v", err)
+		}
+		if err := s.SetSessionLive(ctx, r.SessionID, rec, 60*time.Second); err != nil {
+			t.Fatalf("SetSessionLive(%s): %v", r.SessionID, err)
+		}
+	}
+
+	got, err := s.ListSessionsParsed(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionsParsed: %v", err)
+	}
+	statusOf := map[string]string{}
+	for _, si := range got {
+		statusOf[si.SessionID] = si.Status
+	}
+	if statusOf[pendSid] != "pending" {
+		t.Errorf("pending record status = %q, want pending (all: %v)", statusOf[pendSid], statusOf)
+	}
+	if statusOf[actSid] != "active" {
+		t.Errorf("active record status = %q, want active (all: %v)", statusOf[actSid], statusOf)
+	}
+	if statusOf[legSid] != "" {
+		t.Errorf("legacy record status = %q, want \"\" (backward compat)", statusOf[legSid])
+	}
+}
+
+// TestSessionLivePendingExpiry (Task 8.11): a pending session record whose
+// token never connects expires via its TTL — the production issue-time TTL
+// is 60s; a 2s TTL here proves the mechanism without waiting.
+func TestSessionLivePendingExpiry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
+
+	rec := []byte(`{"session_id":"` + sid + `","username":"alice","db_user":"rw_user","db_type":"mysql","status":"pending"}`)
+	if err := s.SetSessionLive(ctx, sid, rec, 2*time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
+	}
+	// Listed right after issue…
+	recs, err := s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions right after issue: %v", err)
+	}
+	found := false
+	for _, r := range recs {
+		if bytes.Contains(r, []byte(`"session_id":"`+sid+`"`)) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pending record %s not listed right after issue (%d records)", sid, len(recs))
+	}
+	// …and gone after the TTL elapses (a token never connected).
+	time.Sleep(2500 * time.Millisecond)
+	recs, err = s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after TTL: %v", err)
+	}
+	for _, r := range recs {
+		if bytes.Contains(r, []byte(`"session_id":"`+sid+`"`)) {
+			t.Fatalf("pending record %s still listed after TTL expiry", sid)
+		}
 	}
 }
