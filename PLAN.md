@@ -2325,8 +2325,18 @@ Two issues from hands-on use: (a) the session-details (context strip) font color
 3. Verification (DOM evidence — the browser harness on this box has no screenshots): load the SPA checker page (JS fetch login + pushState per the project's harness notes), select a session if a live one exists (or render a pending one via a stub if needed), and read getComputedStyle on the strip values + labels + an nz-select option + toolbar fields; compute + assert contrast ratios meet the targets; capture the values verbatim in the report. If live sessions are unavailable at gate time, verify with the unit-rendered fixture via the DOM the component tests produce (document which path was used).
 4. Tests: component spec assertions for the strip/toolbar classes if structural changes landed (keep minimal); ng test (ALL), npm build, go suite (re-run), commit, report.
 
-## Phase 8 gate (addendum 3)
-All tasks reviewed; full suites green; amendment 16 verified end-to-end; ledger updated.
+## Task 8.17: Gate re-opens when a watcher re-attaches (user directive 2026-08-14 — "when checker leaves/drops from a write session, maker cannot run any queries")
+
+The enforcement works as required (a write maker is blocked while no checker watches — that IS the requirement). The sharp edge: 8.13's permanent fail-closed LATCH means once the timeout trips, even a checker who RETURNS cannot unblock the maker — they must reconnect and lose their session. FIX: remove the permanent latch; the gate re-opens when the watch key reappears.
+
+1. gate_hold.go (both state machines): the timeout drain keeps rejecting queued commands + audit events (unchanged); REMOVE the permanent latch flag — the gate re-evaluates per command: unwatched → grace wait then reject (existing machinery); watched → forward immediately (the wait state only ever engages while unwatched; a re-attached watcher clears it).
+2. Semantics preserved: no command ever reaches the backend without a watcher at execution time ("cannot trigger any queries unless a checker is connected" stays fully enforced).
+3. Tests: rewrite the two latch tests (TestMySQLGateHoldFailClosedLatch, TestPGGateHoldTimeoutDrainAndLatch) → assert the NEW behavior: rejected while unwatched (post-timeout), then watcher re-attach → NEXT command flows without a reconnect; LIVE: checker leaves mid-session → maker's query waits + 1045 (enforcement intact) → checker rejoins (sess:<sid> subscribe) → maker's next query RUNS (the reported scenario resolved); also: maker query during the absence still never reaches the backend (row-absent proof).
+4. RUN.md §5.1: latch semantics → re-open-on-watch wording.
+5. Gates: go suite, ng test, build, commit, report.
+
+## Phase 8 gate (addendum 4)
+All tasks reviewed; full suites green; amendment 17 verified end-to-end; ledger updated.
 
 # Phase 9: MSSQL support (user directive 2026-08-13)
 
