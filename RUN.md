@@ -313,6 +313,23 @@ dashboard session selector, or any WS client subscribing to `sess:<sid>`) → IN
 work. If the watcher is removed mid-session, the very next query is blocked until a checker watches
 the session again.
 
+**Grace window (Task 8.13 — maker-first no longer breaks).** When a write-access maker connects
+BEFORE any checker, blocked SQL is not rejected instantly — it WAITS for a watcher:
+
+| Aspect | Behavior |
+|---|---|
+| Config | `data.yaml` `gate_wait_seconds` (default **20**, env `ZT_GATE_WAIT_SECONDS`; **0 = reject immediately** = the pre-8.13 behavior above) |
+| Wait | While a write session has NO watcher, SQL commands queue per session (bounded at **16** held commands; overflow rejects only the new command — the queue keeps waiting). The client stays connected with **no error and no response** |
+| Watcher arrives | Within the window → the queued commands flush **in order** to the backend exactly as the normal relay would send them; each command runs and returns its real result |
+| Window expires | No watcher → every held command is rejected to the client (MySQL `ERR 1045` / PG `FATAL 28000`) with **`maker gating: no checker connected within <N>s (session <sid>)`** and each gets an audit event (`status=error`) |
+| Fail-closed latch | After a timeout the session **latches**: every later gated command is rejected immediately with the same message — a watcher attaching LATER does **not** unblock it; the maker must reconnect |
+| Watch re-check | The watcher is re-checked on a 500 ms ticker AND on every new command arrival, so the unblock latency is at most one tick |
+
+Practical flow: issue the write token → maker connects and runs a query (it WAITS, client alive) →
+checker selects the session / subscribes to `sess:<sid>` within the window → the held query RUNS and
+returns rows. If no checker appears within `gate_wait_seconds`, the maker gets the 1045/28000
+rejection and must reconnect. Read-only sessions are never held (ro is exempt from the gate).
+
 ### 5.2 Checker sessions + two-level kill (Phase 8)
 
 **Session directory.** Every connection through the data plane is recorded in Valkey under

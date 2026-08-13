@@ -50,3 +50,12 @@ credentials:                  # Data Plane owns DB credentials (zero-trust); key
 # columns, row_count, rows (capped 100 rows/512 chars/64KB by capture) and the
 # truncated flag. Default false: context-only lines, result payload off.
 log_query_output: false
+# Task 8.13 gate grace hold (user directive 2026-08-14): while a write
+# session has NO watcher, blocked SQL commands WAIT up to gate_wait_seconds
+# for a checker to attach instead of failing instantly — a maker who connects
+# BEFORE the checker no longer breaks; the held commands flush in order when
+# the watcher arrives, and the session latches fail-closed if the window
+# expires (the maker must reconnect). 0 = reject immediately (the pre-8.13
+# behavior). Negative values fall back to the default (20).
+# Env: ZT_GATE_WAIT_SECONDS.
+gate_wait_seconds: 20

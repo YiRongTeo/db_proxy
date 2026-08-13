@@ -204,6 +204,14 @@ type DataConfig struct {
 	// ticket, db_user, db, db_type, stmt_type, status, session_id, sql) —
 	// only the result payload is gated behind the flag.
 	LogQueryOutput bool
+	// GateWaitSeconds (yaml gate_wait_seconds, env ZT_GATE_WAIT_SECONDS;
+	// Task 8.13) is the maker write-gate GRACE WINDOW: while a write
+	// session has NO watcher, blocked SQL commands WAIT up to this many
+	// seconds for a checker to attach instead of failing instantly (a maker
+	// who connects BEFORE the checker no longer breaks). Default 20.
+	// 0 = reject immediately (the pre-8.13 behavior). Negative values fall
+	// back to the default.
+	GateWaitSeconds int
 	// CredentialsSource selects where the backend DB password comes from:
 	// "config" (default — the committed credentials list below) or "api"
 	// (per-connect fetch from CredentialsAPI; Task 8.7).
@@ -238,6 +246,11 @@ func LoadData(path string) (*DataConfig, error) {
 		// Task 8.8: query log lines carry context only by default; the
 		// captured result payload (rows) is opt-in via log_query_output.
 		"log_query_output": false,
+		// Task 8.13: the maker write-gate grace window — blocked SQL
+		// commands on an unwatched write session wait this long for a
+		// checker instead of failing instantly (default 20; 0 = reject
+		// immediately, the pre-8.13 behavior; negative → default).
+		"gate_wait_seconds": 20,
 	}); err != nil {
 		return nil, err
 	}
@@ -260,6 +273,13 @@ func LoadData(path string) (*DataConfig, error) {
 			return nil, fmt.Errorf("credentials_source=api requires credentials_api.url")
 		}
 	}
+	// Task 8.13: negative gate_wait_seconds is a config error in spirit —
+	// the window cannot be negative — so it falls back to the default (20)
+	// rather than failing the plane's boot.
+	gateWait := v.GetInt("gate_wait_seconds")
+	if gateWait < 0 {
+		gateWait = 20
+	}
 	cfg := &DataConfig{
 		ListenAddr:        v.GetString("listen.addr"),
 		DetectDelayMS:     v.GetInt("listen.detect_delay_ms"),
@@ -267,6 +287,7 @@ func LoadData(path string) (*DataConfig, error) {
 		TLS:               tlsCfg,
 		Valkey:            readValkey(v),
 		LogQueryOutput:    v.GetBool("log_query_output"),
+		GateWaitSeconds:   gateWait,
 		CredentialsSource: source,
 		CredentialsAPI:    apiCfg,
 		Credentials:       map[string]string{},

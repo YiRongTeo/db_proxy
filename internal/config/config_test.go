@@ -173,6 +173,9 @@ func TestLoadData(t *testing.T) {
 	if cfg.LogQueryOutput {
 		t.Errorf("LogQueryOutput = true, want false (default: context-only query logs)")
 	}
+	if got := cfg.GateWaitSeconds; got != 20 {
+		t.Errorf("GateWaitSeconds = %d, want 20 (Task 8.13 grace-window default)", got)
+	}
 	if got := cfg.Valkey.Mode; got != "direct" {
 		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
@@ -722,6 +725,124 @@ log_query_output: true
 		}
 		if cfg.LogQueryOutput {
 			t.Error("LogQueryOutput = true, want false (ZT_LOG_QUERY_OUTPUT=false)")
+		}
+	})
+}
+
+// --- Task 8.13: gate_wait_seconds -----------------------------------------
+
+// TestGateWaitSecondsConfig: gate_wait_seconds parses onto the struct;
+// absent defaults to 20; 0 means reject-immediately; a negative value falls
+// back to the default (the window cannot be negative).
+func TestGateWaitSecondsConfig(t *testing.T) {
+	t.Run("yaml value parses", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: 7
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 7 {
+			t.Errorf("GateWaitSeconds = %d, want 7 (gate_wait_seconds: 7)", cfg.GateWaitSeconds)
+		}
+	})
+
+	t.Run("absent defaults 20", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 20 {
+			t.Errorf("GateWaitSeconds = %d, want 20 (default grace window)", cfg.GateWaitSeconds)
+		}
+	})
+
+	t.Run("zero means reject immediately", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: 0
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 0 {
+			t.Errorf("GateWaitSeconds = %d, want 0 (reject immediately)", cfg.GateWaitSeconds)
+		}
+	})
+
+	t.Run("negative falls back to default", func(t *testing.T) {
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: -3
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 20 {
+			t.Errorf("GateWaitSeconds = %d, want 20 (negative clamped to default)", cfg.GateWaitSeconds)
+		}
+	})
+}
+
+// TestGateWaitSecondsEnvOverride: ZT_GATE_WAIT_SECONDS overrides the file
+// value (viper convention: prefix ZT_, single key — no dots to replace).
+func TestGateWaitSecondsEnvOverride(t *testing.T) {
+	t.Run("env beats file", func(t *testing.T) {
+		t.Setenv("ZT_GATE_WAIT_SECONDS", "5")
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: 20
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 5 {
+			t.Errorf("GateWaitSeconds = %d, want 5 (ZT_GATE_WAIT_SECONDS=5)", cfg.GateWaitSeconds)
+		}
+	})
+
+	t.Run("env zero beats file", func(t *testing.T) {
+		t.Setenv("ZT_GATE_WAIT_SECONDS", "0")
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: 20
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 0 {
+			t.Errorf("GateWaitSeconds = %d, want 0 (ZT_GATE_WAIT_SECONDS=0 → immediate reject)", cfg.GateWaitSeconds)
+		}
+	})
+
+	t.Run("env negative falls back to default", func(t *testing.T) {
+		t.Setenv("ZT_GATE_WAIT_SECONDS", "-1")
+		path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+gate_wait_seconds: 20
+`)
+		cfg, err := LoadData(path)
+		if err != nil {
+			t.Fatalf("LoadData(%q) error: %v", path, err)
+		}
+		if cfg.GateWaitSeconds != 20 {
+			t.Errorf("GateWaitSeconds = %d, want 20 (negative env clamped to default)", cfg.GateWaitSeconds)
 		}
 	})
 }

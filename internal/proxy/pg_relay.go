@@ -41,7 +41,15 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 		// (never cached), fail-closed. A blocked message is answered to the
 		// CLIENT (FATAL 28000) and NOT forwarded; the sniffed event is
 		// published immediately as status=error so the audit trail shows it.
-		if p.gatePGMessage(be, msg, s) {
+		// Task 8.13 grace hold: with gate_wait_seconds > 0 a blocked message
+		// is QUEUED instead (no reply, no forward) — the client keeps waiting
+		// for a watcher (the queue flushes in order) or for the window to
+		// expire (drain + fail-closed latch).
+		if blockMsg := p.gatePGBlockMsg(msg, s); blockMsg != "" {
+			if p.gatePGHold(msg, s) {
+				continue
+			}
+			p.gatePGReject(be, msg, s, blockMsg)
 			continue
 		}
 		if err := front.f.Send(msg); err != nil { // relay unchanged
@@ -50,41 +58,65 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 	}
 }
 
-// gatePGMessage implements the Task 8.6 maker write-gate on the PG relay:
-// a SQL-executing message (SimpleQuery 'Q', Parse 'P', Execute 'E') on a
-// write-access session is allowed only while a checker watches the session
-// (EXISTS watch:<sid>). Returns true when the message was BLOCKED — the
-// caller must not forward it. Unwatched (or store error — fail closed) →
-// ErrorResponse FATAL 28000 with the gating message is sent to the client;
-// SimpleQuery also gets the trailing ReadyForQuery a simple-query response
-// always ends with, while extended-protocol messages (P/E) get the bare
-// ErrorResponse — the client's Sync (relayed) draws the backend's
-// ReadyForQuery.
-func (p *PGProxy) gatePGMessage(be *pgproto3.Backend, msg pgproto3.FrontendMessage, s *pgSession) bool {
+// gatePGBlockMsg implements the Task 8.6 maker write-gate DECISION (plus
+// the Task 8.13 fail-closed latch): a SQL-executing message (SimpleQuery
+// 'Q', Parse 'P', Execute 'E') on a write-access session is allowed only
+// while a checker watches the session (EXISTS watch:<sid>). Returns ""
+// when the message may proceed; otherwise the block message. Unwatched (or
+// store error — fail closed) → the 8.6 gating message; a latched session
+// (Task 8.13: a grace wait timed out) → the timeout message, even when a
+// watcher attaches later — the maker must reconnect.
+func (p *PGProxy) gatePGBlockMsg(msg pgproto3.FrontendMessage, s *pgSession) string {
 	if s.access != "write" {
-		return false
+		return ""
 	}
-	var gated bool
 	switch msg.(type) {
 	case *pgproto3.Query, *pgproto3.Parse, *pgproto3.Execute:
-		gated = true
+	default:
+		return ""
 	}
-	if !gated {
-		return false
+	s.gateMu.Lock()
+	latched := s.gate.latched
+	s.gateMu.Unlock()
+	if latched {
+		return gateTimeoutMessage(s.id, p.gateWaitSeconds)
 	}
 	watched, err := p.vs.WatchActive(context.Background(), s.id)
 	if err != nil {
 		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
-	} else if watched {
-		return false
+		return gatingMessage(s.id)
 	}
-	blockMsg := gatingMessage(s.id)
+	if !watched {
+		return gatingMessage(s.id)
+	}
+	return ""
+}
+
+// gatePGReject sends the Task 8.6 block response for an immediately
+// rejected message: ErrorResponse FATAL 28000 with the block message is
+// sent to the client; SimpleQuery also gets the trailing ReadyForQuery a
+// simple-query response always ends with, while extended-protocol messages
+// (P/E) get the bare ErrorResponse — the client's Sync (relayed) draws the
+// backend's ReadyForQuery. The sniffed event is published immediately as
+// status=error.
+func (p *PGProxy) gatePGReject(be *pgproto3.Backend, msg pgproto3.FrontendMessage, s *pgSession, blockMsg string) {
 	_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000", Message: blockMsg})
 	if _, ok := msg.(*pgproto3.Query); ok {
 		_ = be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	}
 	p.publishBlocked(s, blockMsg)
-	return true
+}
+
+// gatePGMessage is the full immediate-path gate (decision + client reply +
+// audit): returns true when the message was BLOCKED — the caller must not
+// forward it. Used by the relay when the message is NOT held, and by tests
+// driving the 8.6 block behavior directly.
+func (p *PGProxy) gatePGMessage(be *pgproto3.Backend, msg pgproto3.FrontendMessage, s *pgSession) bool {
+	if blockMsg := p.gatePGBlockMsg(msg, s); blockMsg != "" {
+		p.gatePGReject(be, msg, s, blockMsg)
+		return true
+	}
+	return false
 }
 
 // publishBlocked publishes the session's pending event immediately with

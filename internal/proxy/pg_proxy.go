@@ -34,6 +34,14 @@ type pgSession struct {
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
+
+	// Task 8.13 grace hold: the client-side Backend (drain replies) and
+	// the backend pgFrontend (flush forwards held messages), plus the
+	// mutex-guarded gate state.
+	be     *pgproto3.Backend
+	front  *pgFrontend
+	gateMu sync.Mutex
+	gate   pgGateState
 }
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the
@@ -64,6 +72,15 @@ type PGProxy struct {
 	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
 	logQueryOutput bool
 
+	// gateWaitSeconds (Task 8.13) is the maker write-gate GRACE WINDOW:
+	// blocked SQL messages on an unwatched write session wait up to this
+	// many seconds for a checker instead of failing instantly. 0 (the
+	// proxy default — tests construct proxies directly) = reject
+	// immediately, the pre-8.13 behavior; the deployed plane is wired from
+	// config gate_wait_seconds (ZT_GATE_WAIT_SECONDS, default 20) via
+	// SetGateWaitSeconds.
+	gateWaitSeconds int
+
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 }
@@ -84,6 +101,19 @@ func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tls
 // The context fields (username, ticket_id, db_user, db, db_type, stmt_type,
 // status, session_id, sql) are logged ALWAYS, regardless of the flag.
 func (p *PGProxy) SetLogQueryOutput(on bool) { p.logQueryOutput = on }
+
+// SetGateWaitSeconds configures the maker write-gate grace window (Task
+// 8.13, seconds): while a write session has NO watcher, blocked SQL
+// messages wait up to this long for a checker to attach instead of failing
+// instantly. 0 = reject immediately (the pre-8.13 behavior). Negative
+// values are clamped to the default (20). Wired from config
+// gate_wait_seconds (ZT_GATE_WAIT_SECONDS).
+func (p *PGProxy) SetGateWaitSeconds(seconds int) {
+	if seconds < 0 {
+		seconds = defaultGateWaitSeconds
+	}
+	p.gateWaitSeconds = seconds
+}
 
 // registerSession adds a session to the registry so it can be killed by id
 // (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself
@@ -314,6 +344,8 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// entered in the directory with a started lifecycle event.
 	s := &pgSession{
 		id:        sid,
+		be:        be,
+		front:     front,
 		db:        sm.Parameters["database"],
 		threadID:  capturePGThreadID(front, p.log),
 		startedAt: time.Now().UTC(),
@@ -324,11 +356,14 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
-	// Deferred in this order so teardown is: flushPendingOnClose (any
-	// unanswered query publishes first, re-arming the heartbeat) → finish
-	// session (DelSessionLive + ended event) → unregister.
+	// Deferred in this order so teardown is: closePGGateWait (Task 8.13 —
+	// any grace-held messages drain with the timeout rejection and the
+	// wait goroutine is cleaned up) → flushPendingOnClose (any unanswered
+	// query publishes first, re-arming the heartbeat) → finish session
+	// (DelSessionLive + ended event) → unregister.
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
+	defer p.closePGGateWait(s)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,

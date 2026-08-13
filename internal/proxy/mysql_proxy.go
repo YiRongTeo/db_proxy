@@ -33,6 +33,14 @@ type mysqlSession struct {
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
+
+	// Task 8.13 grace hold: the client/backend conns for the wait
+	// goroutine's flush (forward held commands to the backend) and drain
+	// (reply ERR 1045 to the client), plus the mutex-guarded gate state.
+	client  net.Conn
+	backend net.Conn
+	gateMu  sync.Mutex
+	gate    mysqlGateState
 }
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
@@ -56,6 +64,15 @@ type MySQLProxy struct {
 	// db, db_type, stmt_type, status, session_id, sql — but never the
 	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
 	logQueryOutput bool
+
+	// gateWaitSeconds (Task 8.13) is the maker write-gate GRACE WINDOW:
+	// blocked SQL commands on an unwatched write session wait up to this
+	// many seconds for a checker instead of failing instantly. 0 (the
+	// proxy default — tests construct proxies directly) = reject
+	// immediately, the pre-8.13 behavior; the deployed plane is wired from
+	// config gate_wait_seconds (ZT_GATE_WAIT_SECONDS, default 20) via
+	// SetGateWaitSeconds.
+	gateWaitSeconds int
 
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
@@ -83,6 +100,19 @@ func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, 
 // The context fields (username, ticket_id, db_user, db, db_type, stmt_type,
 // status, session_id, sql) are logged ALWAYS, regardless of the flag.
 func (p *MySQLProxy) SetLogQueryOutput(on bool) { p.logQueryOutput = on }
+
+// SetGateWaitSeconds configures the maker write-gate grace window (Task
+// 8.13, seconds): while a write session has NO watcher, blocked SQL
+// commands wait up to this long for a checker to attach instead of failing
+// instantly. 0 = reject immediately (the pre-8.13 behavior). Negative
+// values are clamped to the default (20). Wired from config
+// gate_wait_seconds (ZT_GATE_WAIT_SECONDS).
+func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
+	if seconds < 0 {
+		seconds = defaultGateWaitSeconds
+	}
+	p.gateWaitSeconds = seconds
+}
 
 // bufferedConn is a net.Conn whose reads drain a bufio.Reader before
 // touching the underlying conn. The SSLRequest reader may buffer client
@@ -312,6 +342,8 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// with a started lifecycle event.
 	s := &mysqlSession{
 		id:        sid,
+		client:    client,
+		backend:   backend,
 		db:        database,
 		threadID:  captureMySQLThreadID(backend, p.log),
 		startedAt: time.Now().UTC(),
@@ -322,11 +354,14 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
-	// Deferred in this order so teardown is: flushPendingOnClose (any
-	// unanswered query publishes first, re-arming the heartbeat) → finish
-	// session (DelSessionLive + ended event) → unregister.
+	// Deferred in this order so teardown is: closeGateWait (Task 8.13 —
+	// any grace-held commands drain with the timeout rejection and the
+	// wait goroutine is cleaned up) → flushPendingOnClose (any unanswered
+	// query publishes first, re-arming the heartbeat) → finish session
+	// (DelSessionLive + ended event) → unregister.
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
+	defer p.closeGateWait(s)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,

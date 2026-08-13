@@ -30,9 +30,16 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 		// (never cached), fail-closed. A blocked command is answered with
 		// ERR 1045 to the CLIENT and NOT forwarded — the backend never sees
 		// it — and the sniffed event is published immediately as status=error
-		// so the audit trail shows the block.
+		// so the audit trail shows the block. Task 8.13 grace hold: with
+		// gate_wait_seconds > 0 a blocked command is QUEUED instead (no reply,
+		// no forward) — the client keeps waiting for a watcher (the queue
+		// flushes in order) or for the window to expire (drain + fail-closed
+		// latch).
 		if len(payload) > 0 {
 			if msg := p.checkWriteGate(s, payload[0]); msg != "" {
+				if p.gateHold(s, seq, payload) {
+					continue
+				}
 				_ = writeMySQLPacket(client, seq+1, errPacket(1045, "42000", msg))
 				p.publishBlocked(s, msg)
 				continue
@@ -150,6 +157,16 @@ func gatingMessage(sid string) string {
 func (p *MySQLProxy) checkWriteGate(s *mysqlSession, cmd byte) string {
 	if s.access != "write" || !isSQLExecCommand(cmd) {
 		return ""
+	}
+	// Task 8.13 fail-closed latch: a grace wait that timed out leaves the
+	// session latched — every further gated command is rejected immediately
+	// with the timeout message, even when a watcher attaches later; the
+	// maker must reconnect.
+	s.gateMu.Lock()
+	latched := s.gate.latched
+	s.gateMu.Unlock()
+	if latched {
+		return gateTimeoutMessage(s.id, p.gateWaitSeconds)
 	}
 	watched, err := p.vs.WatchActive(context.Background(), s.id)
 	if err != nil {
