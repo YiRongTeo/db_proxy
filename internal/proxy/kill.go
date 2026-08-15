@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"time"
+
+	"zerotrust-proxy/internal/metrics"
 )
 
 // SessionKiller is the data-plane kill interface: force-close a live session
@@ -49,11 +51,20 @@ type Killer struct {
 	mysql SessionKiller
 	pg    SessionKiller
 	mssql SessionKiller // Task 9.2: TDS sessions (kill-query N/A until 9.4)
+
+	// metrics (Task 9.8): kills.total is recorded here — the ctl:kill
+	// handler — per APPLIED kill (successful KillSession/KillQuery), by
+	// mode. nil = metrics disabled (every call a no-op).
+	metrics *metrics.Metrics
 }
 
 func NewKiller(mysql, pg, mssql SessionKiller) *Killer {
 	return &Killer{mysql: mysql, pg: pg, mssql: mssql}
 }
+
+// SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
+// config metrics.enabled=false) keeps every instrument call a no-op.
+func (k *Killer) SetMetrics(m *metrics.Metrics) { k.metrics = m }
 
 // KillSession tries the MySQL registry first, then the PostgreSQL registry,
 // then the MSSQL registry, and reports whether any plane had the session.
@@ -128,11 +139,13 @@ func (k *Killer) HandleKill(msg []byte) (line, sid string) {
 	switch mode {
 	case KillModeQuery:
 		if k.KillQuery(sid) {
+			k.metrics.KillsTotal(KillModeQuery)
 			return "query killed", sid
 		}
 		return "kill: unknown session", sid
 	case KillModeConnection:
 		if k.KillSession(sid) {
+			k.metrics.KillsTotal(KillModeConnection)
 			return "session killed", sid
 		}
 		return "kill: unknown session", sid

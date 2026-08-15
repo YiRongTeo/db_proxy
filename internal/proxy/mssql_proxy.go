@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
@@ -70,6 +71,11 @@ type MSSQLProxy struct {
 	logQueryOutput  bool
 	gateWaitSeconds int
 
+	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
+	// disabled (config metrics.enabled=false): every instrument call is a
+	// no-op — the disabled hot path costs one nil check per site.
+	metrics *metrics.Metrics
+
 	mu       sync.Mutex
 	sessions map[string]*mssqlSession // active sessions — kill registry (Task 6.4 parity)
 }
@@ -95,6 +101,10 @@ func (p *MSSQLProxy) SetGateWaitSeconds(seconds int) {
 	}
 	p.gateWaitSeconds = seconds
 }
+
+// SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
+// config metrics.enabled=false) keeps every instrument call a no-op.
+func (p *MSSQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
 // tdsTLSConn is the 0x12-wrapping seam for the TDS 8.0 TLS upgrade. TLS
 // handshake records travel inside PRELOGIN (0x12) TDS packets: the client
@@ -377,15 +387,23 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		return
 	}
 	if tok == nil {
+		// Task 9.8: GETDEL nil is ambiguous — absent, expired, or already
+		// consumed (single-use) — so the reason collapses to "invalid"
+		// (the store cannot distinguish; mirrors the log line below).
+		p.metrics.TokensRejected("invalid")
+		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Warn("invalid or expired token", "client", clientAddr)
 		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s'.", token)))
 		return
 	}
 	if tok.DBType != "mssql" {
+		p.metrics.TokensRejected("wrong_db_type")
+		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
 		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token not valid for this protocol.", token)))
 		return
 	}
+	p.metrics.TokensValidated()
 
 	// 6. backend session: client-side TDS against the real SQL Server with
 	// a REWRITTEN login7 (real db_user, resolver password under the
@@ -393,6 +411,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// leg is TLS when the data plane is (the backend accepts both).
 	backend, backendBR, loginResp, loginOK, envDB, err := connectMSSQLBackend(ctx, tok, p.creds, li, p.tlsCfg != nil)
 	if err != nil {
+		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
 		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token)))
 		return
@@ -443,6 +462,9 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
+	p.metrics.ConnectionsTotal("mssql", "ok")
+	p.metrics.ConnectionsActiveInc("mssql")
+	defer p.metrics.ConnectionsActiveDec("mssql")
 	defer p.unregisterSession(s.id)
 	// Deferred in this order so teardown is: closeMSSQLGateWait (Task 9.4 —
 	// any grace-held commands drain with the timeout rejection) → flush-
@@ -483,6 +505,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	client.Close()
 	backend.Close()
 	<-done
+	p.metrics.SessionDuration("mssql", time.Since(s.startedAt))
 	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }
 

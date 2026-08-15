@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -257,6 +258,19 @@ type CredentialsAPIConfig struct {
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 }
 
+// MetricsConfig is the OTel/Prometheus scrape endpoint block (Task 9.8,
+// user directive 2026-08-15). metrics.enabled (default false) turns on the
+// data plane's OTel instruments and serves them at http://listen<path>
+// (defaults 0.0.0.0:9464 and /metrics) in the Prometheus text format.
+// Disabled = zero overhead: the proxies' metrics wrapper stays nil and every
+// call site is a no-op. Env: ZT_METRICS_ENABLED / ZT_METRICS_LISTEN /
+// ZT_METRICS_PATH.
+type MetricsConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Listen  string `mapstructure:"listen"`
+	Path    string `mapstructure:"path"`
+}
+
 // DataConfig mirrors configs/data.yaml.
 type DataConfig struct {
 	ListenAddr    string
@@ -290,6 +304,11 @@ type DataConfig struct {
 	// to its password. Used only in config mode. The Data Plane owns DB
 	// credentials (zero-trust).
 	Credentials map[string]string
+	// Metrics is the OTel/Prometheus scrape endpoint block (Task 9.8):
+	// enabled=false (default) keeps the proxies' metrics wrapper nil (zero
+	// overhead); enabled=true serves the instruments at listen+path and
+	// fails fast at load on a malformed listen address.
+	Metrics MetricsConfig
 }
 
 // LoadData reads the Data Plane config (configs/data.yaml).
@@ -318,6 +337,14 @@ func LoadData(path string) (*DataConfig, error) {
 		// checker instead of failing instantly (default 20; 0 = reject
 		// immediately, the pre-8.13 behavior; negative → default).
 		"gate_wait_seconds": 20,
+		// Task 9.8: OTel metrics for Prometheus scraping — DISABLED by
+		// default (zero overhead; the proxies' metrics wrapper stays
+		// nil). When enabled the data plane serves the instruments at
+		// metrics.listen + metrics.path (defaults 0.0.0.0:9464 /metrics);
+		// a malformed listen address is a load error (fail fast).
+		"metrics.enabled": false,
+		"metrics.listen":  "0.0.0.0:9464",
+		"metrics.path":    "/metrics",
 	}); err != nil {
 		return nil, err
 	}
@@ -347,6 +374,23 @@ func LoadData(path string) (*DataConfig, error) {
 	if gateWait < 0 {
 		gateWait = 20
 	}
+	// Task 9.8: metrics block — disabled by default. When enabled the
+	// listen address must parse as host:port and the path must be
+	// non-empty; both fail fast so a plane that cannot serve its scrape
+	// endpoint never starts silently.
+	mcfg := MetricsConfig{
+		Enabled: v.GetBool("metrics.enabled"),
+		Listen:  v.GetString("metrics.listen"),
+		Path:    v.GetString("metrics.path"),
+	}
+	if mcfg.Enabled {
+		if _, _, err := net.SplitHostPort(mcfg.Listen); err != nil {
+			return nil, fmt.Errorf("metrics.enabled=true: bad metrics.listen %q: %w", mcfg.Listen, err)
+		}
+		if mcfg.Path == "" {
+			return nil, fmt.Errorf("metrics.enabled=true requires metrics.path")
+		}
+	}
 	cfg := &DataConfig{
 		ListenAddr:        v.GetString("listen.addr"),
 		DetectDelayMS:     v.GetInt("listen.detect_delay_ms"),
@@ -358,6 +402,7 @@ func LoadData(path string) (*DataConfig, error) {
 		CredentialsSource: source,
 		CredentialsAPI:    apiCfg,
 		Credentials:       map[string]string{},
+		Metrics:           mcfg,
 	}
 	var creds []struct {
 		Key      string `mapstructure:"key"`

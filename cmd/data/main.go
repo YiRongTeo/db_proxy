@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/logging"
+	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/proxy"
 	"zerotrust-proxy/internal/store"
 )
@@ -141,6 +143,41 @@ func main() {
 	mysqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	pgProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	mssqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
+	// Task 9.8 OTel metrics: enabled (configs/data.yaml metrics block,
+	// ZT_METRICS_ENABLED) builds the Prometheus-backed meter wrapper and
+	// wires it into every instrumented site; disabled (default) leaves the
+	// wrapper nil and every call site a no-op.
+	m, err := metrics.New(cfg.Metrics.Enabled)
+	if err != nil {
+		log.Error("metrics", "err", err)
+		os.Exit(1)
+	}
+	mysqlProxy.SetMetrics(m)
+	pgProxy.SetMetrics(m)
+	mssqlProxy.SetMetrics(m)
+	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
+	killer.SetMetrics(m)
+
+	// Task 9.8 metrics endpoint: when enabled, serve the Prometheus scrape
+	// on its own goroutine (configs/data.yaml metrics block,
+	// ZT_METRICS_LISTEN + ZT_METRICS_PATH; defaults 0.0.0.0:9464
+	// /metrics). The config layer already fail-fasted on a malformed
+	// listen address; a bind failure here is fatal too — a configured
+	// scrape endpoint that cannot serve must not silently degrade
+	// observability. Shutdown is graceful: srv.Shutdown on the way out.
+	var metricsSrv *http.Server
+	if m != nil {
+		mux := http.NewServeMux()
+		mux.Handle(cfg.Metrics.Path, m.Handler())
+		metricsSrv = &http.Server{Addr: cfg.Metrics.Listen, Handler: mux}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics http", "err", err)
+				os.Exit(1)
+			}
+		}()
+		log.Info("metrics endpoint", "addr", cfg.Metrics.Listen, "path", cfg.Metrics.Path)
+	}
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,
@@ -149,7 +186,6 @@ func main() {
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
-	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
 
 	l, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -214,6 +250,11 @@ func main() {
 	// returns nil via ctx.Err(). Cancel first, then close.
 	cancel()
 	_ = l.Close()
+	if metricsSrv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutdownCancel()
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}
 
 	// Bound the shutdown wait at 5s.
 	select {

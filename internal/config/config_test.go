@@ -983,3 +983,119 @@ gate_wait_seconds: 20
 		}
 	})
 }
+
+// --- Task 9.8 metrics block -------------------------------------------------
+
+// TestMetricsDisabledByDefault: metrics.enabled defaults to false (zero
+// overhead — the proxies' metrics wrapper stays nil); listen/path defaults
+// are the committed 0.0.0.0:9464 /metrics.
+func TestMetricsDisabledByDefault(t *testing.T) {
+	cfg, err := LoadData(dataYAML)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", dataYAML, err)
+	}
+	if cfg.Metrics.Enabled {
+		t.Error("Metrics.Enabled = true, want false (disabled by default)")
+	}
+	if cfg.Metrics.Listen != "0.0.0.0:9464" {
+		t.Errorf("Metrics.Listen = %q, want %q", cfg.Metrics.Listen, "0.0.0.0:9464")
+	}
+	if cfg.Metrics.Path != "/metrics" {
+		t.Errorf("Metrics.Path = %q, want %q", cfg.Metrics.Path, "/metrics")
+	}
+}
+
+// TestMetricsParsesEnabled: an enabled metrics block (file values, not
+// defaults) lands on the struct field for field.
+func TestMetricsParsesEnabled(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+metrics:
+  enabled: true
+  listen: "127.0.0.1:9464"
+  path: "/prom"
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	m := cfg.Metrics
+	if !m.Enabled || m.Listen != "127.0.0.1:9464" || m.Path != "/prom" {
+		t.Errorf("Metrics = %+v, want enabled=true listen=127.0.0.1:9464 path=/prom", m)
+	}
+}
+
+// TestMetricsEnvOverride: ZT_METRICS_ENABLED/_LISTEN/_PATH override the
+// file (viper convention: prefix ZT_, dots → underscores).
+func TestMetricsEnvOverride(t *testing.T) {
+	t.Setenv("ZT_METRICS_ENABLED", "true")
+	t.Setenv("ZT_METRICS_LISTEN", "10.1.2.3:9999")
+	t.Setenv("ZT_METRICS_PATH", "/scrape")
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v", path, err)
+	}
+	m := cfg.Metrics
+	if !m.Enabled || m.Listen != "10.1.2.3:9999" || m.Path != "/scrape" {
+		t.Errorf("Metrics = %+v, want enabled=true listen=10.1.2.3:9999 path=/scrape", m)
+	}
+}
+
+// TestMetricsFailFastBadListen: enabled=true with a malformed metrics.listen
+// is a load error naming the field — a plane that cannot serve its scrape
+// endpoint must never start silently.
+func TestMetricsFailFastBadListen(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+metrics:
+  enabled: true
+  listen: "not-a-host-port"
+`)
+	_, err := LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for bad metrics.listen, got nil")
+	}
+	if !strings.Contains(err.Error(), "metrics.listen") {
+		t.Errorf("error %q missing the metrics.listen hint", err.Error())
+	}
+}
+
+// TestMetricsFailFastEmptyPath: enabled=true with an empty metrics.path is a
+// load error.
+func TestMetricsFailFastEmptyPath(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+metrics:
+  enabled: true
+  path: ""
+`)
+	_, err := LoadData(path)
+	if err == nil {
+		t.Fatal("LoadData: want error for empty metrics.path, got nil")
+	}
+	if !strings.Contains(err.Error(), "metrics.path") {
+		t.Errorf("error %q missing the metrics.path hint", err.Error())
+	}
+}
+
+// TestMetricsDisabledSkipsValidation: disabled (the default) tolerates a
+// malformed listen — the block is inert until enabled.
+func TestMetricsDisabledSkipsValidation(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+metrics:
+  enabled: false
+  listen: "garbage"
+`)
+	if _, err := LoadData(path); err != nil {
+		t.Fatalf("LoadData(%q) error: %v, want nil (disabled block inert)", path, err)
+	}
+}

@@ -65,3 +65,14 @@ log_query_output: false
 # behavior). Negative values fall back to the default (20).
 # Env: ZT_GATE_WAIT_SECONDS.
 gate_wait_seconds: 20
+# Task 9.8 metrics (user directive 2026-08-15): OpenTelemetry instruments
+# for the data plane, exposed on an HTTP endpoint a Prometheus server can
+# scrape. DISABLED by default — zero overhead (the proxies' metrics wrapper
+# stays nil, every call site a no-op). When enabled, the plane serves the
+# Prometheus text format at http://<listen><path> (default
+# http://0.0.0.0:9464/metrics) — point a Prometheus job at that URL.
+# Env: ZT_METRICS_ENABLED / ZT_METRICS_LISTEN / ZT_METRICS_PATH.
+metrics:
+  enabled: false
+  listen: "0.0.0.0:9464"
+  path: "/metrics"

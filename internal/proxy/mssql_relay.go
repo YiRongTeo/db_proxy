@@ -161,6 +161,8 @@ func (p *MSSQLProxy) publishMSSQLBlocked(s *mssqlSession, msg string) {
 	}
 	ev.Status = "error"
 	ev.Error = msg
+	p.metrics.GateBlocks(ev.DBType)
+	p.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
 	p.publishEvent(s, ev)
 }
 
@@ -297,6 +299,11 @@ func (p *MSSQLProxy) publishPending(s *mssqlSession, capture *mssqlResultCapture
 	}
 	s.mu.Unlock()
 	if ev != nil {
+		// Task 9.8: one query event = one queries.total increment, with
+		// the command's latency (sniffed → response completed) recorded
+		// on the query.duration histogram.
+		p.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
+		p.metrics.QueryDuration(ev.DBType, time.Since(ev.Ts))
 		p.publishEvent(s, ev)
 	}
 }

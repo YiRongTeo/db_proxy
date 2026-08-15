@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
@@ -74,6 +75,11 @@ type MySQLProxy struct {
 	// SetGateWaitSeconds.
 	gateWaitSeconds int
 
+	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
+	// disabled (config metrics.enabled=false): every instrument call is a
+	// no-op — the disabled hot path costs one nil check per site.
+	metrics *metrics.Metrics
+
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
 }
@@ -113,6 +119,10 @@ func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
 	}
 	p.gateWaitSeconds = seconds
 }
+
+// SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
+// config metrics.enabled=false) keeps every instrument call a no-op.
+func (p *MySQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
 // bufferedConn is a net.Conn whose reads drain a bufio.Reader before
 // touching the underlying conn. The SSLRequest reader may buffer client
@@ -301,19 +311,28 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		return
 	}
 	if tok == nil {
+		// Task 9.8: GETDEL nil is ambiguous — absent, expired, or already
+		// consumed (single-use) — so the reason collapses to "invalid"
+		// (the store cannot distinguish; mirrors the log line below).
+		p.metrics.TokensRejected("invalid")
+		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Warn("invalid or expired token", "client", clientAddr)
 		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "invalid or expired token"))
 		return
 	}
 	if tok.DBType != "mysql" {
+		p.metrics.TokensRejected("wrong_db_type")
+		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
 		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "token not valid for this protocol"))
 		return
 	}
+	p.metrics.TokensValidated()
 
 	// 4. backend connection (real credentials, client-requested database)
 	backend, err := connectMySQLBackend(ctx, tok, p.creds, database)
 	if err != nil {
+		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
 		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "backend unavailable"))
 		return
@@ -353,6 +372,9 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
+	p.metrics.ConnectionsTotal("mysql", "ok")
+	p.metrics.ConnectionsActiveInc("mysql")
+	defer p.metrics.ConnectionsActiveDec("mysql")
 	defer p.unregisterSession(s.id)
 	// Deferred in this order so teardown is: closeGateWait (Task 8.13 —
 	// any grace-held commands drain with the timeout rejection and the
@@ -393,5 +415,6 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	client.Close()
 	backend.Close()
 	<-done
+	p.metrics.SessionDuration("mysql", time.Since(s.startedAt))
 	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }

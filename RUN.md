@@ -404,6 +404,74 @@ docker exec mysql-test mysql -h127.0.0.1 -P3306 -uroot -proot_pw \
 Issue a token (§3), connect (§4), attach a checker WS (§5.2) — the row walks
 pending → active → checker set → NULL on detach → ended when the client disconnects.
 
+### 2.6 OTel metrics / Prometheus scrape endpoint (Task 9.8)
+
+The Data Plane exposes OpenTelemetry instruments in the Prometheus text format on an
+HTTP endpoint a Prometheus server can scrape. **Disabled by default** (`metrics.enabled:
+false`) — the proxies' metrics wrapper stays nil and every call site is a no-op (zero
+overhead). Enable it in `configs/data.yaml` or via env:
+
+```yaml
+# configs/data.yaml — Task 9.8 metrics block
+metrics:
+  enabled: false          # ZT_METRICS_ENABLED — false = zero overhead (no-op call sites)
+  listen: "0.0.0.0:9464"  # ZT_METRICS_LISTEN — scrape endpoint bind
+  path: "/metrics"        # ZT_METRICS_PATH   — scrape path
+```
+
+```bash
+ZT_METRICS_ENABLED=true go run ./cmd/data    # logs: msg="metrics endpoint" addr="0.0.0.0:9464" path="/metrics"
+```
+
+The endpoint serves the meter's instruments **and** the standard Go runtime/process
+collectors (`go_*`, `process_*`) from the same default gatherer — exactly what a real
+Prometheus server scrapes. Point a job at it:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: zt-data
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+```
+
+Scrape check (expect 200 + `zerotrust_proxy_*` families):
+
+```bash
+curl -s http://127.0.0.1:9464/metrics | grep -E "^(# HELP zerotrust_proxy|zerotrust_proxy_)" | head
+```
+
+Instruments (all under the `zerotrust_proxy` namespace, meter `zerotrust.proxy`):
+
+| Family | Type | Labels | Meaning |
+|---|---|---|---|
+| `tokens_validated_total` | counter | — | Tokens accepted by GETDEL + protocol match |
+| `tokens_rejected_total` | counter | `reason` (invalid\|expired\|consumed\|wrong_db_type) | Token validation rejections |
+| `connections_total` | counter | `db_type`, `result` (ok\|rejected) | Connection attempts by outcome |
+| `connections_active` | updowncounter | `db_type` | Currently established sessions |
+| `queries_total` | counter | `db_type`, `stmt_type`, `status` | Query events published by the relay — **including blocked commands** (see below) |
+| `gate_blocks_total` | counter | `db_type` | SQL commands blocked by the maker write-gate |
+| `kills_total` | counter | `mode` (query\|connection) | Kill operations applied |
+| `session_duration_seconds` | histogram | `db_type` | Session lifetime (established → teardown) |
+| `query_duration_seconds` | histogram | `db_type` | Query latency (sniffed → response completed) |
+
+**Blocked-command semantics (Task 9.8 round 4):** a command blocked by the maker
+write-gate never reaches the backend, but it IS a published query event with
+`status="error"` — so every blocked-command path (immediate reject AND grace-wait drain,
+all three protocols: MySQL `publishBlocked`/`gateRejectEntries`, PostgreSQL
+`publishBlocked`/`gatePGRejectEntries`, MSSQL `publishBlocked`/`gateMSSQLRejectEntries`)
+increments **both** `gate_blocks_total{db_type}` and
+`queries_total{db_type, stmt_type, status="error"}`. A gated `INSERT` therefore shows up
+as `queries_total{db_type="mysql",stmt_type="insert",status="error"} 1` alongside
+`gate_blocks_total{db_type="mysql"} 1` — the audit view and the metrics view never
+diverge.
+
+Live-verified deltas (round 4, `cmd/data/zz_live_metrics_test.go`): one `SELECT 1` from
+the go-mysql client → `tokens_validated_total +1`, `queries_total{select,ok} +1`,
+`connections_total{ok} +1`, `connections_active 0→1→0`; `ctl:kill` → `kills_total{mode=connection}
++1`; gated `INSERT` → `gate_blocks_total{mysql} +1` AND `queries_total{insert,error} +1`;
+bogus token → `tokens_rejected_total{reason=invalid} +1`, `connections_total{rejected} +1`.
+
 ---
 
 ## 3. Issue a token (curl)

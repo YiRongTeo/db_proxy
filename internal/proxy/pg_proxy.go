@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
+	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
@@ -81,6 +82,11 @@ type PGProxy struct {
 	// SetGateWaitSeconds.
 	gateWaitSeconds int
 
+	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
+	// disabled (config metrics.enabled=false): every instrument call is a
+	// no-op — the disabled hot path costs one nil check per site.
+	metrics *metrics.Metrics
+
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 }
@@ -114,6 +120,10 @@ func (p *PGProxy) SetGateWaitSeconds(seconds int) {
 	}
 	p.gateWaitSeconds = seconds
 }
+
+// SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
+// config metrics.enabled=false) keeps every instrument call a no-op.
+func (p *PGProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
 // registerSession adds a session to the registry so it can be killed by id
 // (Task 6.4 wires the ctl:kill channel to KillSession; the registry itself
@@ -293,17 +303,25 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		return
 	}
 	if tok == nil {
+		// Task 9.8: GETDEL nil is ambiguous — absent, expired, or already
+		// consumed (single-use) — so the reason collapses to "invalid"
+		// (the store cannot distinguish; mirrors the log line below).
+		p.metrics.TokensRejected("invalid")
+		p.metrics.ConnectionsTotal("postgres", "rejected")
 		p.log.Warn("invalid or expired token", "client", clientAddr)
 		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
 			Message: "invalid or expired token"})
 		return
 	}
 	if tok.DBType != "postgres" {
+		p.metrics.TokensRejected("wrong_db_type")
+		p.metrics.ConnectionsTotal("postgres", "rejected")
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
 		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
 			Message: "token not valid for this protocol"})
 		return
 	}
+	p.metrics.TokensValidated()
 
 	// welcome the client — auth is complete
 	_ = be.Send(&pgproto3.AuthenticationOk{})
@@ -320,6 +338,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// an empty/missing value falls back to the default backend database.
 	front, err := connectPostgresBackend(ctx, tok, p.creds, sm.Parameters["database"])
 	if err != nil {
+		p.metrics.ConnectionsTotal("postgres", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
 		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
 			Message: "backend unavailable"})
@@ -355,6 +374,9 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		closer:    func() { client.Close(); front.Close() },
 	}
 	p.registerSession(s)
+	p.metrics.ConnectionsTotal("postgres", "ok")
+	p.metrics.ConnectionsActiveInc("postgres")
+	defer p.metrics.ConnectionsActiveDec("postgres")
 	defer p.unregisterSession(s.id)
 	// Deferred in this order so teardown is: closePGGateWait (Task 8.13 —
 	// any grace-held messages drain with the timeout rejection and the
@@ -396,5 +418,6 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	client.Close()
 	front.Close()
 	<-done
+	p.metrics.SessionDuration("postgres", time.Since(s.startedAt))
 	p.log.Info("session closed", "username", tok.Username, "client", clientAddr)
 }

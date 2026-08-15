@@ -227,6 +227,8 @@ func (p *MySQLProxy) gateRejectEntries(s *mysqlSession, entries []mysqlGateEntry
 		lastEv = e.ev
 		e.ev.Status = "error"
 		e.ev.Error = msg
+		p.metrics.GateBlocks(e.ev.DBType)
+		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
 		p.publishEvent(s, e.ev)
 	}
 }
@@ -401,6 +403,8 @@ func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg s
 		lastEv = e.ev
 		e.ev.Status = "error"
 		e.ev.Error = msg
+		p.metrics.GateBlocks(e.ev.DBType)
+		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
 		p.publishEvent(s, e.ev)
 	}
 }
@@ -599,6 +603,8 @@ func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGate
 		lastEv = e.ev
 		e.ev.Status = "error"
 		e.ev.Error = msg
+		p.metrics.GateBlocks(e.ev.DBType)
+		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
 		p.publishEvent(s, e.ev)
 	}
 }
