@@ -741,6 +741,133 @@ log_query_output: true
 
 // --- Task 8.13: gate_wait_seconds -----------------------------------------
 
+// --- Task 9.7: audit.mysql block --------------------------------------------
+
+// TestAuditMySQLDefaultsOff: the committed control.yaml keeps session audit
+// DISABLED — no DB dependency unless enabled — with the dev-target defaults
+// (host/port = mysql-test container, database zt_audit).
+func TestAuditMySQLDefaultsOff(t *testing.T) {
+	cfg, err := LoadControl(controlYAML)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", controlYAML, err)
+	}
+	if cfg.Audit.MySQL.Enabled {
+		t.Error("Audit.MySQL.Enabled = true, want false (disabled by default)")
+	}
+	if got := cfg.Audit.MySQL.Database; got != "zt_audit" {
+		t.Errorf("Audit.MySQL.Database = %q, want %q", got, "zt_audit")
+	}
+	if got := cfg.Audit.MySQL.Host; got != "127.0.0.1" {
+		t.Errorf("Audit.MySQL.Host = %q, want %q", got, "127.0.0.1")
+	}
+	if got := cfg.Audit.MySQL.Port; got != "3307" {
+		t.Errorf("Audit.MySQL.Port = %q, want %q", got, "3307")
+	}
+}
+
+// TestAuditMySQLParsesEnabled: an enabled audit.mysql block lands on the
+// struct field for field.
+func TestAuditMySQLParsesEnabled(t *testing.T) {
+	path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+audit:
+  mysql:
+    enabled: true
+    host: "10.0.0.9"
+    port: "3306"
+    user: "audit_w"
+    password: "s3cret"
+    database: "zt_audit_prod"
+`)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
+	}
+	m := cfg.Audit.MySQL
+	if !m.Enabled || m.Host != "10.0.0.9" || m.Port != "3306" || m.User != "audit_w" ||
+		m.Password != "s3cret" || m.Database != "zt_audit_prod" {
+		t.Errorf("Audit.MySQL = %+v, want enabled host=10.0.0.9 port=3306 user=audit_w database=zt_audit_prod", m)
+	}
+}
+
+// TestAuditMySQLFailFasts: enabled with ANY required connection field
+// explicitly EMPTY is a load error naming the field — an audit writer that
+// cannot connect must never start silently. (Absent keys fall back to the
+// committed defaults — host/port/database — so only explicit empty values
+// trip the guard, which is exactly the fail-fast the dispatch demands.)
+func TestAuditMySQLFailFasts(t *testing.T) {
+	fields := []string{"host", "port", "user", "password", "database"}
+	for _, tc := range fields {
+		t.Run(tc, func(t *testing.T) {
+			lines := []string{
+				"audit:",
+				"  mysql:",
+				"    enabled: true",
+				`    host: "127.0.0.1"`,
+				`    port: "3307"`,
+				`    user: "root"`,
+				`    password: "root_pw"`,
+				`    database: "zt_audit"`,
+			}
+			for i, l := range lines {
+				if strings.HasPrefix(strings.TrimSpace(l), tc+":") {
+					lines[i] = "    " + tc + ": \"\""
+				}
+			}
+			path := writeTempConfig(t, strings.Join(lines, "\n")+"\n")
+			_, err := LoadControl(path)
+			if err == nil {
+				t.Fatalf("LoadControl: want error when audit.mysql.%s is empty, got nil", tc)
+			}
+			if !strings.Contains(err.Error(), "audit.mysql."+tc) {
+				t.Errorf("error %q missing the audit.mysql.%s hint", err.Error(), tc)
+			}
+		})
+	}
+}
+
+// TestAuditMySQLEnvOverride: the ZT_AUDIT_MYSQL_* env names override the file
+// (viper convention: prefix ZT_, dots → underscores).
+func TestAuditMySQLEnvOverride(t *testing.T) {
+	t.Setenv("ZT_AUDIT_MYSQL_ENABLED", "true")
+	t.Setenv("ZT_AUDIT_MYSQL_HOST", "env-host")
+	t.Setenv("ZT_AUDIT_MYSQL_PORT", "3399")
+	t.Setenv("ZT_AUDIT_MYSQL_USER", "env-user")
+	t.Setenv("ZT_AUDIT_MYSQL_PASSWORD", "env-pw")
+	t.Setenv("ZT_AUDIT_MYSQL_DATABASE", "env_audit")
+	path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+`)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
+	}
+	m := cfg.Audit.MySQL
+	if !m.Enabled || m.Host != "env-host" || m.Port != "3399" || m.User != "env-user" ||
+		m.Password != "env-pw" || m.Database != "env_audit" {
+		t.Errorf("Audit.MySQL = %+v, want env-overridden block", m)
+	}
+}
+
+// TestAuditMySQLEnabledMissingEnvFailsFast: enabled via env alone (no file
+// block) with the required fields unset is a load error, not a silent start.
+func TestAuditMySQLEnabledMissingEnvFailsFast(t *testing.T) {
+	t.Setenv("ZT_AUDIT_MYSQL_ENABLED", "true")
+	path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+`)
+	_, err := LoadControl(path)
+	if err == nil {
+		t.Fatal("LoadControl: want error for enabled audit without credentials, got nil")
+	}
+	if !strings.Contains(err.Error(), "audit.mysql.user") {
+		t.Errorf("error %q missing the audit.mysql.user hint", err.Error())
+	}
+}
+
 // TestGateWaitSecondsConfig: gate_wait_seconds parses onto the struct;
 // absent defaults to 20; 0 means reject-immediately; a negative value falls
 // back to the default (the window cannot be negative).

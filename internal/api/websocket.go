@@ -62,13 +62,19 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	// Task 8.6 watch presence: channel sess:<sid> → watch:<sid>. A malformed
 	// channel (empty session id, or a sid with whitespace) holds NO key.
+	// Task 9.7 audit: on attach the hub ALSO records the checker's username
+	// (from the WS session) in the audit row — the Data Plane never learns
+	// it.
 	watchSid := ""
 	if strings.HasPrefix(channel, "sess:") {
-		if sid := strings.TrimPrefix(channel, "sess:"); sid != "" && !strings.ContainsAny(sid, " \t\r\n") {
+		if sid := strings.TrimPrefix(channel, "sess:"); sid != "" && !strings.ContainsAny(sid, " 	\r\n") {
 			watchSid = sid
 		}
 	}
 	if watchSid != "" {
+		if sess := sessionFrom(r); sess != nil {
+			a.auditChecker(r.Context(), watchSid, sess.Username)
+		}
 		if err := a.vs.SetWatch(ctx, watchSid, a.watchTTLOrDefault()); err != nil {
 			a.log.Warn("watch set failed", "session_id", watchSid, "err", err)
 		}
@@ -95,6 +101,9 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err := a.vs.DelWatch(context.Background(), watchSid); err != nil {
 				a.log.Warn("watch clear failed", "session_id", watchSid, "err", err)
 			}
+			// Task 9.7 audit: watcher gone → checker_username = NULL
+			// (mirrors the watch:<sid> deletion).
+			a.auditChecker(context.Background(), watchSid, "")
 		}()
 	}
 

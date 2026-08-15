@@ -67,3 +67,20 @@ valkey:
     cert_file: ""
     key_file: ""
     skip_verify: false
+# Task 9.7 session audit (user directive 2026-08-15): the Control Plane
+# persists every session to MySQL — maker username, ticket, db target,
+# checker username when present, status (pending|active|ended), timestamps.
+# DISABLED by default (no DB dependency unless enabled). When enabled the
+# writer auto-creates the zt_audit database + sessions table at startup and
+# fail-fasts if the database is unreachable; runtime write failures are
+# logged and NEVER break the token/connect flow.
+# Env: ZT_AUDIT_MYSQL_ENABLED / ZT_AUDIT_MYSQL_HOST / ZT_AUDIT_MYSQL_PORT /
+# ZT_AUDIT_MYSQL_USER / ZT_AUDIT_MYSQL_PASSWORD / ZT_AUDIT_MYSQL_DATABASE.
+audit:
+  mysql:
+    enabled: false
+    host: "127.0.0.1"
+    port: "3307"
+    user: "root"            # dev container root (RUN.md §1.2); needs CREATE DATABASE — use a dedicated user in prod
+    password: "root_pw"     # dev only (same class as configs/data.yaml plaintext); override via ZT_AUDIT_MYSQL_PASSWORD
+    database: "zt_audit"

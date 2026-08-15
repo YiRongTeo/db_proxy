@@ -14,6 +14,7 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/go-sql-driver/mysql v1.10.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.0 // indirect

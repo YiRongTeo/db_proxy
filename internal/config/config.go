@@ -76,6 +76,29 @@ type ControlConfig struct {
 	DBPresets     []DBPreset
 	TLS           *CertConfig
 	Valkey        ValkeyConfig
+	Audit         AuditConfig
+}
+
+// MySQLAuditConfig is the optional session-audit MySQL block (Task 9.7,
+// user directive 2026-08-15): when audit.mysql.enabled is true the Control
+// Plane — the writer that sees lifecycle events via the hub and knows the
+// checker identity on watch attach/detach — persists every session (maker
+// username, ticket, db target, checker username when present, status
+// pending|active|ended, timestamps) to zt_audit.sessions. Disabled by
+// default: NO database dependency unless enabled. Enabled REQUIRES
+// host+port+user+password+database (fail-fast at load, naming the field).
+type MySQLAuditConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Host     string `mapstructure:"host"`
+	Port     string `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	Database string `mapstructure:"database"`
+}
+
+// AuditConfig groups the Control Plane audit sinks (currently only MySQL).
+type AuditConfig struct {
+	MySQL MySQLAuditConfig `mapstructure:"mysql"`
 }
 
 // DBPreset is one selectable database target in the Maker portal.
@@ -144,6 +167,37 @@ func readTLS(v *viper.Viper) (*CertConfig, error) {
 	return &CertConfig{Enabled: true, CertFile: cert, KeyFile: key}, nil
 }
 
+// readAudit reads the audit block through the same viper instance that read
+// the file (env overrides + defaults resolve consistently). When
+// audit.mysql.enabled is true, ALL connection fields must be present —
+// enabled without host/port/user/password/database is a load error naming
+// the missing field, so an audit writer that cannot connect never starts
+// silently (mirrors the credentials_source=api fail-fast).
+func readAudit(v *viper.Viper) (AuditConfig, error) {
+	a := AuditConfig{MySQL: MySQLAuditConfig{
+		Enabled:  v.GetBool("audit.mysql.enabled"),
+		Host:     v.GetString("audit.mysql.host"),
+		Port:     v.GetString("audit.mysql.port"),
+		User:     v.GetString("audit.mysql.user"),
+		Password: v.GetString("audit.mysql.password"),
+		Database: v.GetString("audit.mysql.database"),
+	}}
+	if a.MySQL.Enabled {
+		for _, f := range []struct{ name, val string }{
+			{"audit.mysql.host", a.MySQL.Host},
+			{"audit.mysql.port", a.MySQL.Port},
+			{"audit.mysql.user", a.MySQL.User},
+			{"audit.mysql.password", a.MySQL.Password},
+			{"audit.mysql.database", a.MySQL.Database},
+		} {
+			if f.val == "" {
+				return AuditConfig{}, fmt.Errorf("audit.mysql.enabled=true requires %s", f.name)
+			}
+		}
+	}
+	return a, nil
+}
+
 // LoadControl reads the Control Plane config (configs/control.yaml).
 func LoadControl(path string) (*ControlConfig, error) {
 	v := viper.New()
@@ -151,10 +205,22 @@ func LoadControl(path string) (*ControlConfig, error) {
 		"http.addr": ":8080", "api.token_ttl_seconds": 300,
 		"auth.session_ttl_hours": 8, "valkey.addr": "127.0.0.1:6379",
 		"valkey.mode": "direct",
+		// Task 9.7 session audit: OFF by default (no DB dependency unless
+		// enabled); database defaults to zt_audit, host/port to the dev
+		// mysql-test container. Env: ZT_AUDIT_MYSQL_ENABLED/_HOST/_PORT/
+		// _USER/_PASSWORD/_DATABASE.
+		"audit.mysql.enabled":  false,
+		"audit.mysql.host":     "127.0.0.1",
+		"audit.mysql.port":     "3307",
+		"audit.mysql.database": "zt_audit",
 	}); err != nil {
 		return nil, err
 	}
 	tlsCfg, err := readTLS(v)
+	if err != nil {
+		return nil, err
+	}
+	auditCfg, err := readAudit(v)
 	if err != nil {
 		return nil, err
 	}
@@ -170,6 +236,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		SessionTTL:    v.GetInt("auth.session_ttl_hours"),
 		TLS:           tlsCfg,
 		Valkey:        readValkey(v),
+		Audit:         auditCfg,
 	}
 	// UnmarshalKey must run on the same viper instance that read the file,
 	// otherwise it would unmarshal against a fresh, empty store.

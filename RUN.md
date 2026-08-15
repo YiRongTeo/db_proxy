@@ -352,6 +352,58 @@ fields above, and — with the flag on — the captured result rows. Lifecycle *
 (`queries:*`) carry no ticket id at all (Task 8.2 contract); the ticket id appears only in
 query events and log lines.
 
+### 2.5 Session audit to MySQL (Task 9.7)
+
+The Control Plane persists every session to MySQL — maker username, ticket, db target,
+access level, **checker username when present**, lifecycle status and timestamps. The
+Control Plane is the writer by design: it sees the lifecycle events (via the hub's
+`queries:sess:*` pub/sub) and knows the checker identity on watch attach/detach — the Data
+Plane never learns the checker's username.
+
+**Config** (`configs/control.yaml`, env `ZT_AUDIT_MYSQL_*`):
+
+```yaml
+audit:
+  mysql:
+    enabled: false          # ZT_AUDIT_MYSQL_ENABLED — default OFF: no DB dependency
+    host: "127.0.0.1"       # ZT_AUDIT_MYSQL_HOST
+    port: "3307"            # ZT_AUDIT_MYSQL_PORT   (mysql-test, §1.2)
+    user: "root"            # ZT_AUDIT_MYSQL_USER   (dev root; needs CREATE DATABASE — use a dedicated user in prod)
+    password: "root_pw"     # ZT_AUDIT_MYSQL_PASSWORD
+    database: "zt_audit"    # ZT_AUDIT_MYSQL_DATABASE
+```
+
+* **Fail-fast startup:** enabled + missing field, or enabled + unreachable DB → the Control
+  Plane refuses to start (`os.Exit(1)` after logging). No silent audit-less operation.
+* **Auto-schema:** on startup the writer runs `CREATE DATABASE IF NOT EXISTS` +
+  `CREATE TABLE IF NOT EXISTS zt_audit.sessions` (id PK, `session_id` UNIQUE, username,
+  ticket_id, db_type, db_user, db, access, `checker_username` NULL, status, started_at,
+  ended_at, last_seen, created_at — all DATETIME(3), indexed on status/username).
+* **Runtime failures are NON-fatal:** an audit write error is logged and never breaks the
+  token/connect flow (the token is already stored; the session still works).
+
+**Lifecycle mapping** (all idempotent `INSERT … ON DUPLICATE KEY UPDATE` upserts keyed by
+`session_id`):
+
+| Event | Row change |
+|---|---|
+| Token issued (`handleToken`) | status=`pending`, maker username, ticket_id, db_type/db_user, access |
+| Client connects (data plane `started` on `queries:sess:<sid>`) | status=`active`, `started_at`, db (client-requested database) |
+| Client disconnects (data plane `ended`) | status=`ended`, `ended_at` |
+| Checker watches `channel=sess:<sid>` (WS attach) | `checker_username` = checker's username (e.g. `admin`) |
+| Checker disconnects (WS detach) | `checker_username` = NULL |
+
+**Verify** (audit enabled Control Plane running, §2.1):
+
+```bash
+docker exec mysql-test mysql -h127.0.0.1 -P3306 -uroot -proot_pw \
+  -e "SELECT session_id, username, ticket_id, db, checker_username, status, started_at, ended_at \
+      FROM zt_audit.sessions ORDER BY id DESC LIMIT 5\G"
+```
+
+Issue a token (§3), connect (§4), attach a checker WS (§5.2) — the row walks
+pending → active → checker set → NULL on detach → ended when the client disconnects.
+
 ---
 
 ## 3. Issue a token (curl)

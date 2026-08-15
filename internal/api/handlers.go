@@ -138,6 +138,10 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// directory/pubsub hiccup must not fail an already-stored token, but
 	// it IS logged.
 	a.recordPendingSession(r.Context(), &payload)
+	// Task 9.7 audit: persist the pending row (maker username, ticket, db
+	// target, access). Best-effort like the directory record — an audit
+	// write failure is logged, never fatal to the issue.
+	a.auditUpsertPending(r.Context(), &payload)
 	a.log.Info("token issued", "username", payload.Username, "db_user", payload.DBUser,
 		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access,
 		"session_id", payload.SessionID)

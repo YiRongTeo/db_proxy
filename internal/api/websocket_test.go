@@ -38,7 +38,7 @@ func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.Va
 		StaticDir:    t.TempDir(),
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := NewAPI(log, cfg, vs)
+	a := NewAPI(log, cfg, vs, nil)
 	a.watchTTL = 2 * time.Second
 	a.watchHeartbeat = 200 * time.Millisecond
 	srv := httptest.NewServer(a.Routes())

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"zerotrust-proxy/internal/audit"
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/store"
 )
@@ -22,6 +23,11 @@ type api struct {
 	vs   *store.ValkeyStore
 	auth *authMiddleware
 
+	// Task 9.7 session audit: the MySQL writer, nil when audit.mysql.enabled
+	// is false. Every hook checks nil first — zero overhead when disabled.
+	// Write failures are logged by the hooks and NEVER fail the request.
+	audit *audit.Writer
+
 	// Task 8.6 maker write-gate: checker watch presence lease + heartbeat
 	// period. Zero values fall back to watchPresenceTTL / watchHeartbeat —
 	// tests shorten them via these fields so heartbeats are observable fast.
@@ -29,9 +35,10 @@ type api struct {
 	watchHeartbeat time.Duration
 }
 
-// NewAPI builds the Control Plane API with its dependencies.
-func NewAPI(log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore) *api {
-	return &api{log: log, cfg: cfg, vs: vs, auth: &authMiddleware{cfg: cfg, vs: vs}}
+// NewAPI builds the Control Plane API with its dependencies. aw is the
+// session-audit writer (nil when audit is disabled — all hooks no-op).
+func NewAPI(log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, aw *audit.Writer) *api {
+	return &api{log: log, cfg: cfg, vs: vs, auth: &authMiddleware{cfg: cfg, vs: vs}, audit: aw}
 }
 
 // Routes returns the Control Plane HTTP handler tree.

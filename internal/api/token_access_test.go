@@ -43,7 +43,7 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 		},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewAPI(log, cfg, vs).Routes())
+	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
