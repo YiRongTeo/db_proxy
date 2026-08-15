@@ -31,7 +31,7 @@ cd /d/AI/hermes/Project/Project-D        # Windows: cd D:\AI\hermes\Project\Proj
 ## 1. Backend containers (Phase 0 — one-time setup)
 
 If a container already exists from a previous session, skip straight to the readiness checks
-(or `docker start valkey mysql-test pg-test`). Create missing ones with the exact commands below.
+(or `docker start valkey mysql-test pg-test mssql-test`). Create missing ones with the exact commands below.
 
 ### 1.1 Valkey (shared store: tokens, sessions, Pub/Sub)
 
@@ -93,6 +93,68 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ro_user;"
 ```
 
 Verify: `docker exec pg-test psql -U app_user -d appdb -tAc "SELECT COUNT(*) FROM demo_items;"` → `3`.
+
+### 1.4 MSSQL 2022 test backend (`mssql-test`, host port 1434)
+
+Phase 9 (Task 9.1): TDS test backend. SA password meets SQL Server policy
+(8+ chars, 3 of 4 classes); dev app logins use CHECK_POLICY=OFF.
+
+```bash
+docker run -d --name mssql-test -p 1434:1434 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='SqlSrv_2022!' -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
+```
+
+Wait for readiness (retry up to 120 s — first boot initializes system DBs).
+sqlcmd v18 (mssql-tools18, in-image) defaults to Encrypt=mandatory, so `-C`
+trusts the container's self-signed cert; `-N o` (Encrypt=Optional) selects
+plaintext instead:
+
+```bash
+for i in $(seq 1 24); do docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'SqlSrv_2022!' -C -Q "SELECT 1" >/dev/null 2>&1 && break; sleep 5; done
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'SqlSrv_2022!' -C -Q "SELECT @@VERSION"
+```
+
+Seed db + demo data + mixed-mode SQL logins. Idempotent; `GO` separates
+batches; `CREATE DATABASE` must be its own batch; users/grants run in
+`appdb` context (grants on objects in another database are rejected):
+
+```bash
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'SqlSrv_2022!' -C -b -Q "
+USE master;
+GO
+IF DB_ID('appdb') IS NULL CREATE DATABASE appdb;
+GO
+USE appdb;
+GO
+IF OBJECT_ID('dbo.demo_items') IS NOT NULL DROP TABLE dbo.demo_items;
+CREATE TABLE dbo.demo_items (id INT PRIMARY KEY, name NVARCHAR(100));
+INSERT INTO dbo.demo_items (id, name) VALUES (1, 'test'), (2, 'bravo'), (3, 'charlie');
+GO
+CREATE LOGIN ro_user WITH PASSWORD='ro_pw', CHECK_POLICY=OFF, CHECK_EXPIRATION=OFF;
+CREATE USER ro_user FOR LOGIN ro_user;
+GRANT SELECT ON dbo.demo_items TO ro_user;
+GO
+CREATE LOGIN rw_user WITH PASSWORD='rw_pw', CHECK_POLICY=OFF, CHECK_EXPIRATION=OFF;
+CREATE USER rw_user FOR LOGIN rw_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.demo_items TO rw_user;
+GO"
+```
+
+Verify (ro_user SELECT; ro_user INSERT denied — read-only proof; rw_user
+exercises INSERT/UPDATE/DELETE then restores the 3-row seed):
+
+```bash
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U ro_user -P ro_pw -d appdb -C -Q "SELECT COUNT(*) FROM demo_items"    # expect: 3
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U ro_user -P ro_pw -d appdb -C -b -Q "INSERT INTO demo_items VALUES (99, 'nope')"   # expect: Msg 229, INSERT permission denied
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U rw_user -P rw_pw -d appdb -C -b -Q "INSERT INTO demo_items VALUES (4, 'delta'); UPDATE demo_items SET name='delta2' WHERE id=4; DELETE FROM demo_items WHERE id=4; SELECT COUNT(*) FROM demo_items"   # expect: 3
+```
+
+Encryption flags (empirically verified on this image, sqlcmd v18):
+- no flags → fails: Encrypt=mandatory rejects the self-signed cert
+  (`certificate verify failed`).
+- `-C` → TLS with the self-signed cert trusted (works).
+- `-N o` (Encrypt=Optional) → plaintext (works).
+Use `-C` for TLS mode or `-N o` for plaintext; the proxy side negotiates
+per PLAN.md Phase 9 (Task 9.2).
 
 ---
 

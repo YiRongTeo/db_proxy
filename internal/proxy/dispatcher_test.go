@@ -84,6 +84,32 @@ func TestDecidePGFirstByte(t *testing.T) {
 	}
 }
 
+// TestDecideMSSQLFirstByte: a 0x12 first byte (TDS PRELOGIN packet type)
+// classifies the connection as MSSQL — checked BEFORE the PG branch — and
+// the peeked byte stays readable through br.
+func TestDecideMSSQLFirstByte(t *testing.T) {
+	server, client := dialPair(t)
+	br := bufio.NewReader(server)
+	if _, err := client.Write([]byte{0x12}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	proto, err := decide(server, br, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if proto != "mssql" {
+		t.Fatalf("proto = %q, want %q", proto, "mssql")
+	}
+	// The peeked byte must still be readable through br — nothing is lost.
+	b, err := br.Peek(1)
+	if err != nil {
+		t.Fatalf("re-peek: %v", err)
+	}
+	if b[0] != 0x12 {
+		t.Fatalf("peeked byte = %#x, want 0x12", b[0])
+	}
+}
+
 // TestDecideMySQLSilence: a silent client classifies as MySQL after the full
 // detect delay (MySQL is server-first; the client waits for the handshake).
 func TestDecideMySQLSilence(t *testing.T) {
@@ -129,6 +155,7 @@ func TestDispatchPGNilClosesConn(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	d := NewDispatcher(logger, nil /* mysql unused here */, nil, /* pg not wired yet */
+		nil, /* mssql unused here */
 		100*time.Millisecond, 8)
 	if _, err := client.Write([]byte{0x00}); err != nil {
 		t.Fatalf("write: %v", err)
@@ -140,5 +167,61 @@ func TestDispatchPGNilClosesConn(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "pg proxy not wired") {
 		t.Fatalf("expected warn log about pg proxy not wired, got: %s", logBuf.String())
+	}
+}
+
+// TestDispatchMSSQLNilClosesConn: until Task 9.2 wires the TDS proxy, a
+// detected MSSQL client (first byte 0x12) must be dropped — conn closed,
+// warn logged — never a nil panic, and never misrouted to PG/MySQL.
+func TestDispatchMSSQLNilClosesConn(t *testing.T) {
+	server, client := dialPair(t)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	d := NewDispatcher(logger, nil, nil, nil /* mssql not wired yet */, 100*time.Millisecond, 8)
+	if _, err := client.Write([]byte{0x12}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	d.dispatch(context.Background(), server)
+	// dispatch must have closed the server conn → client sees EOF/reset.
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected conn closed after mssql dispatch with nil mssql proxy")
+	}
+	if !strings.Contains(logBuf.String(), "mssql proxy not wired") {
+		t.Fatalf("expected warn log about mssql proxy not wired, got: %s", logBuf.String())
+	}
+}
+
+// fakeMSSQLProxy records that handleConn was invoked and that the peeked
+// 0x12 prelogin byte is still readable through the shared bufio.Reader.
+type fakeMSSQLProxy struct {
+	called bool
+	b      byte
+}
+
+func (f *fakeMSSQLProxy) handleConn(_ context.Context, _ net.Conn, br *bufio.Reader) {
+	f.called = true
+	if b, err := br.Peek(1); err == nil {
+		f.b = b[0]
+	}
+}
+
+// TestDispatchMSSQLRoutesToHandler: a 0x12-prefixed connection routes to the
+// mssql handler (not pg/mysql), and the handler sees the prelogin byte
+// through the same bufio.Reader the dispatcher peeked.
+func TestDispatchMSSQLRoutesToHandler(t *testing.T) {
+	server, client := dialPair(t)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	fake := &fakeMSSQLProxy{}
+	d := NewDispatcher(logger, nil, nil, fake, 100*time.Millisecond, 8)
+	if _, err := client.Write([]byte{0x12, 0x01, 0x00}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	d.dispatch(context.Background(), server)
+	if !fake.called {
+		t.Fatal("expected mssql handler to be invoked for 0x12 first byte")
+	}
+	if fake.b != 0x12 {
+		t.Fatalf("handler peeked byte = %#x, want 0x12 (peeked bytes preserved)", fake.b)
 	}
 }

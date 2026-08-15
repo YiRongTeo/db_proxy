@@ -5,7 +5,7 @@ api:
   api_key: ""                 # empty → external /api/token disabled; set via ZT_API_API_KEY (viper maps api.api_key → ZT_API_API_KEY, NOT ZT_API_KEY)
   token_ttl_seconds: 300
   data_plane_host: "127.0.0.1"
-  data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL)
+  data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
   username: "admin"
   password: "admin123"        # override via ZT_AUTH_PASSWORD
@@ -29,6 +29,21 @@ db_presets:
     db_ip: "127.0.0.1"
     db_port: "5433"
     access: "read"
+  # Phase 9 (Task 9.1): MSSQL 2022 test backend (mssql-test, host port 1434).
+  # Credentials resolve via data.yaml keys mssql:ro_user@127.0.0.1:1434 /
+  # mssql:rw_user@127.0.0.1:1434 (Task 8.7 key format <dbtype>:<db_user>@<db_ip>:<db_port>).
+  - name: "MSSQL read-only"
+    db_type: "mssql"
+    db_user: "ro_user"
+    db_ip: "127.0.0.1"
+    db_port: "1434"
+    access: "read"
+  - name: "MSSQL read-write"
+    db_type: "mssql"
+    db_user: "rw_user"
+    db_ip: "127.0.0.1"
+    db_port: "1434"
+    access: "write"
 tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
   enabled: false
   cert_file: "certs/control.crt"

@@ -49,14 +49,18 @@ func TestLoadControl(t *testing.T) {
 	assertTLSDisabled(t, cfg.TLS)
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
-	if got := len(cfg.DBPresets); got != 3 {
-		t.Fatalf("len(DBPresets) = %d, want 3", got)
+	if got := len(cfg.DBPresets); got != 5 {
+		t.Fatalf("len(DBPresets) = %d, want 5", got)
 	}
 
 	wantPresets := []DBPreset{
 		{Name: "MySQL read-only", DBType: "mysql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "read"},
 		{Name: "MySQL read-write", DBType: "mysql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "write"},
 		{Name: "PostgreSQL read-only", DBType: "postgres", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "5433", Access: "read"},
+		// Phase 9 (Task 9.1): MSSQL presets — port 1434, key format
+		// <dbtype>:<db_user>@<db_ip>:<db_port> matches data.yaml credentials.
+		{Name: "MSSQL read-only", DBType: "mssql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "read"},
+		{Name: "MSSQL read-write", DBType: "mssql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "write"},
 	}
 	for i, want := range wantPresets {
 		got := cfg.DBPresets[i]
@@ -78,6 +82,8 @@ func TestDBPresetAccessValues(t *testing.T) {
 		"MySQL read-only":      "read",
 		"MySQL read-write":     "write",
 		"PostgreSQL read-only": "read",
+		"MSSQL read-only":      "read",
+		"MSSQL read-write":     "write",
 	}
 	for _, p := range cfg.DBPresets {
 		want, ok := wantAccess[p.Name]
@@ -133,8 +139,8 @@ func TestDBPresetJSONWireContract(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("json.Unmarshal(%s) error: %v", s, err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("len = %d, want 3", len(got))
+	if len(got) != 5 {
+		t.Fatalf("len = %d, want 5", len(got))
 	}
 	wantKeys := []string{"name", "db_type", "db_user", "db_ip", "db_port", "access"}
 	for i, m := range got {
@@ -192,6 +198,10 @@ func TestLoadData(t *testing.T) {
 		"mysql:ro_user@127.0.0.1:3307":    "ro_pw",
 		"mysql:rw_user@127.0.0.1:3307":    "rw_pw",
 		"postgres:ro_user@127.0.0.1:5433": "ro_pw",
+		// Phase 9 (Task 9.1): MSSQL — key format <dbtype>:<db_user>@<db_ip>:<db_port>
+		// (Task 8.7), port 1434 matching the mssql-test container + presets.
+		"mssql:ro_user@127.0.0.1:1434": "ro_pw",
+		"mssql:rw_user@127.0.0.1:1434": "rw_pw",
 	}
 	if got := len(cfg.Credentials); got != len(wantCreds) {
 		t.Fatalf("len(Credentials) = %d, want %d", got, len(wantCreds))

@@ -1,5 +1,5 @@
 listen:
-  addr: ":3306"            # shared port for MySQL + PostgreSQL (protocol detected)
+  addr: ":3306"            # shared port for MySQL + PostgreSQL + MSSQL (protocol detected per connection)
   detect_delay_ms: 200     # grace period before assuming MySQL (server-first protocol)
   max_conns: 100           # concurrent connection cap enforced by the dispatcher
 tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
@@ -43,6 +43,12 @@ credentials:                  # Data Plane owns DB credentials (zero-trust); key
     password: "rw_pw"
   - key: "postgres:ro_user@127.0.0.1:5433"
     password: "ro_pw"
+  # Phase 9 (Task 9.1): MSSQL 2022 test backend (mssql-test, host port 1434).
+  # SQL logins seeded with CHECK_POLICY=OFF / CHECK_EXPIRATION=OFF (dev only).
+  - key: "mssql:ro_user@127.0.0.1:1434"
+    password: "ro_pw"
+  - key: "mssql:rw_user@127.0.0.1:1434"
+    password: "rw_pw"
 # Task 8.8 query logging (user directive 2026-08-13): every query passing
 # through the proxy is ALWAYS logged with full context (username, ticket_id,
 # db_user, db, db_type, stmt_type, status, session_id, sql). log_query_output

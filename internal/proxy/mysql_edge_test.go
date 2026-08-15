@@ -130,7 +130,7 @@ func startEdgeDispatcher(t *testing.T, vs *store.ValkeyStore, creds map[string]s
 	}
 	t.Cleanup(func() { ln.Close() })
 	logger := slog.New(slog.NewTextHandler(logW, nil))
-	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil), &PGProxy{}, 100*time.Millisecond, 64)
+	d := NewDispatcher(logger, NewMySQLProxy(logger, vs, &ConfigCredResolver{Creds: creds}, nil), &PGProxy{}, nil /* mssql not wired until Task 9.2 */, 100*time.Millisecond, 64)
 	go d.Serve(ln, context.Background())
 	return ln
 }

@@ -136,6 +136,7 @@ func main() {
 		log,
 		mysqlProxy,
 		pgProxy,
+		nil, // mssql proxy: wired in Task 9.2 — until then a detected TDS client is dropped cleanly
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
