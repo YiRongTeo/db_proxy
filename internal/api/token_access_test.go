@@ -36,6 +36,10 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 			{Name: "MySQL read-only", DBType: "mysql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "read"},
 			{Name: "MySQL read-write", DBType: "mysql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "write"},
 			{Name: "PostgreSQL read-only", DBType: "postgres", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "5433", Access: "read"},
+			// Task 9.3 review GAP 1: the committed mssql presets (mirror of the
+			// mysql/pg pairs) so /api/token can stamp mssql access levels.
+			{Name: "MSSQL read-only", DBType: "mssql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "read"},
+			{Name: "MSSQL read-write", DBType: "mssql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "write"},
 		},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -103,5 +107,71 @@ func TestTokenAccessFromPreset(t *testing.T) {
 		if p.Access != tc.want {
 			t.Errorf("%s: stored access = %q, want %q", tc.name, p.Access, tc.want)
 		}
+	}
+}
+
+// --- Task 9.3 review GAP 1: mssql token acceptance through /api/token ------
+
+// TestTokenAccessMSSQLPresets: POST /api/token accepts db_type=mssql for
+// BOTH committed mssql presets (read-only ro_user + read-write rw_user, both
+// on 127.0.0.1:1434): 200, and the stored payload carries db_type=mssql with
+// the full target fields (db_user/db_ip/db_port), the preset's access level
+// and the issue-time session id + ticket.
+func TestTokenAccessMSSQLPresets(t *testing.T) {
+	srv, client, vs := newPresetTestAPIServer(t)
+	loginViaAPI(t, client, srv.URL)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"mssql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-3"}`, "read"},
+		{"mssql read-write preset", `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-3"}`, "write"},
+	}
+	for _, tc := range cases {
+		token := issueToken(t, client, srv.URL, tc.body)
+		p, err := vs.GetDeleteToken(ctx, token)
+		if err != nil {
+			t.Fatalf("%s: GetDeleteToken(%q): %v", tc.name, token, err)
+		}
+		if p == nil {
+			t.Fatalf("%s: tok:%s missing", tc.name, token)
+		}
+		if p.DBType != "mssql" {
+			t.Errorf("%s: stored db_type = %q, want mssql", tc.name, p.DBType)
+		}
+		if p.DBUser == "" || p.DBIP != "127.0.0.1" || p.DBPort != "1434" {
+			t.Errorf("%s: stored target = %s@%s:%s, want *@127.0.0.1:1434", tc.name, p.DBUser, p.DBIP, p.DBPort)
+		}
+		if p.Access != tc.want {
+			t.Errorf("%s: stored access = %q, want %q", tc.name, p.Access, tc.want)
+		}
+		if p.TicketID != "T-9-3" || p.SessionID == "" || p.Username == "" {
+			t.Errorf("%s: stored payload = %+v, want ticket T-9-3 + session id + username", tc.name, p)
+		}
+	}
+}
+
+// TestTokenRejectsInvalidDBType: the mssql acceptance must not have loosened
+// the rejection — a db_type outside {mysql, postgres, mssql} still gets 422
+// with the canonical message.
+func TestTokenRejectsInvalidDBType(t *testing.T) {
+	srv, client, _ := newPresetTestAPIServer(t)
+	loginViaAPI(t, client, srv.URL)
+
+	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"oracle","ticket_id":"T-9-3"}`
+	resp, err := client.Post(srv.URL+"/api/token", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /api/token: status %d, want 422 (body %s)", resp.StatusCode, body)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(got), "db_type must be mysql, postgres or mssql") {
+		t.Errorf("error body = %s, want the canonical db_type message", got)
 	}
 }

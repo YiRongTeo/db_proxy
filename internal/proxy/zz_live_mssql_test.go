@@ -493,3 +493,128 @@ func TestMSSQLLiveSingleUse(t *testing.T) {
 	}
 	c2.close()
 }
+
+// --- Task 9.3 review GAP 2: two concurrent sessions, no cross-talk ----------
+
+// sendBatchAllHeaders relays a SQL batch prefixed with the real sqlcmd
+// ALL_HEADERS block (allHeaders22 — the live backend rejects bare text
+// with 4002) and returns the response payloads until the response ends
+// (trailing-DONE rule, like sendBatch).
+func (c *tdsTestClient) sendBatchAllHeaders(sql string) []byte {
+	c.t.Helper()
+	payload := append(append([]byte(nil), allHeaders22...), utf16le(sql)...)
+	if err := writeTDSPacket(c.conn, tdsSQLBatch, payload); err != nil {
+		c.t.Fatalf("batch write: %v", err)
+	}
+	var all []byte
+	for i := 0; i < 8; i++ {
+		typ, payload, err := readTDSMessage(c.br)
+		if err != nil {
+			c.t.Fatalf("batch response: %v", err)
+		}
+		if typ != tdsTabular {
+			c.t.Fatalf("batch response typ = %#x, want 0x04", typ)
+		}
+		all = append(all, payload...)
+		done, _, _ := scanLoginResponse(payload)
+		if done {
+			return all
+		}
+	}
+	c.t.Fatal("batch: no terminating DONE within 8 messages")
+	return nil
+}
+
+// TestMSSQLLivePerChannelNoCrossTalk (Task 9.3 review GAP 2): TWO concurrent
+// LIVE mssql sessions (alice + bob, distinct single-use tokens), each with a
+// subscriber on its OWN queries:sess:<sid> channel. Alice runs a query
+// mid-window while bob's channel is live — alice's channel delivers ONLY
+// alice's event and bob's channel stays empty (no cross-talk); then bob's
+// query lands ONLY on bob's channel. Ended events land on the right channels
+// too. Mirrors TestSessionPerChannelNoCrossTalk (Task 8.2) on the TDS plane.
+func TestMSSQLLivePerChannelNoCrossTalk(t *testing.T) {
+	vs := proxyTestStore(t)
+	base := fmt.Sprintf("mssql-xtalk-%d", time.Now().UnixNano())
+	userA, userB := base+"-a", base+"-b"
+	tokenA := mssqlLiveToken(t, vs, userA, "mssql")
+	tokenB := mssqlLiveToken(t, vs, userB, "mssql")
+
+	userChA, cancelA := subscribeEvents(t, vs, userA)
+	defer cancelA()
+	userChB, cancelB := subscribeEvents(t, vs, userB)
+	defer cancelB()
+
+	var logBuf bytes.Buffer
+	ln := startMSSQLTestProxyLoop(t, vs, &logBuf, nil)
+
+	// Both sessions connect; the started events yield the session ids.
+	cA := dialTDS(t, ln.Addr().String())
+	if enc := cA.prelogin(encryptNotSup); enc != encryptNotSup {
+		t.Fatalf("alice prelogin encryption = %#x, want ENCRYPT_NOT_SUP", enc)
+	}
+	if _, done, ok := cA.login(tokenA, "appdb"); !done || !ok {
+		t.Fatalf("alice login failed: done=%v ok=%v", done, ok)
+	}
+	startedA := recvSessionEvent(t, userChA)
+	sidA := startedA.SessionID
+
+	cB := dialTDS(t, ln.Addr().String())
+	if enc := cB.prelogin(encryptNotSup); enc != encryptNotSup {
+		t.Fatalf("bob prelogin encryption = %#x, want ENCRYPT_NOT_SUP", enc)
+	}
+	if _, done, ok := cB.login(tokenB, "appdb"); !done || !ok {
+		t.Fatalf("bob login failed: done=%v ok=%v", done, ok)
+	}
+	startedB := recvSessionEvent(t, userChB)
+	sidB := startedB.SessionID
+	if sidA == sidB {
+		t.Fatalf("both sessions got the same id %q", sidA)
+	}
+
+	// Subscribe to each session's OWN channel now that the ids are known.
+	sessA, cancelSessA := subscribeEvents(t, vs, "sess:"+sidA)
+	defer cancelSessA()
+	sessB, cancelSessB := subscribeEvents(t, vs, "sess:"+sidB)
+	defer cancelSessB()
+
+	// Alice queries mid-window (both per-session channels live): her
+	// channel must deliver her event...
+	cA.sendBatchAllHeaders("SELECT 'from-A'")
+	evA := recvQueryEvent(t, sessA)
+	if evA.SessionID != sidA || !strings.Contains(evA.SQL, "from-A") {
+		t.Errorf("alice channel delivered %q (sid %q) — want alice's own query (from-A, sid %q)",
+			evA.SQL, evA.SessionID, sidA)
+	}
+	// ...and bob's channel must be empty right now: alice's event never
+	// crossed over while bob sat mid-window.
+	select {
+	case m := <-sessB:
+		t.Fatalf("bob channel received alice's event (cross-talk): %s", m)
+	default:
+	}
+
+	// Bob queries mid-window: his channel delivers only his event.
+	cB.sendBatchAllHeaders("SELECT 'from-B'")
+	evB := recvQueryEvent(t, sessB)
+	if evB.SessionID != sidB || !strings.Contains(evB.SQL, "from-B") {
+		t.Errorf("bob channel delivered %q (sid %q) — want bob's own query (from-B, sid %q)",
+			evB.SQL, evB.SessionID, sidB)
+	}
+	select {
+	case m := <-sessA:
+		t.Fatalf("alice channel received bob's event (cross-talk): %s", m)
+	default:
+	}
+
+	// Close both; the ended events land on each session's own channel.
+	cA.close()
+	endedA := recvSessionEvent(t, sessA)
+	if endedA.SessionID != sidA || endedA.Action != "ended" {
+		t.Errorf("alice channel ended = sid %q action %q, want %q/ended", endedA.SessionID, endedA.Action, sidA)
+	}
+	cB.close()
+	endedB := recvSessionEvent(t, sessB)
+	if endedB.SessionID != sidB || endedB.Action != "ended" {
+		t.Errorf("bob channel ended = sid %q action %q, want %q/ended", endedB.SessionID, endedB.Action, sidB)
+	}
+}
