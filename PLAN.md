@@ -2387,5 +2387,26 @@ Amendment 13 in hermes-agent-spec.md. Add Microsoft SQL Server (TDS) as a third 
 ## Task 9.5: Integration gate
 Full stack matrix: (1) token via API (mssql preset) → sqlcmd connect through :3306 → SELECT 3 rows + checker WS event with capture; (2) INSERT + audit event; (3) error query event; (4) session selector lists the mssql session (db=appdb); (5) kill-query WAITFOR + kill-connection E2E; (6) gating rw without watcher blocked + watcher enables; (7) TLS mode pass (tls.enabled + sqlcmd -C -N) IF the container client supports it empirically (else document + test via a Go TDS client); (8) credential API mode (8.7) covers mssql db_type; (9) log hygiene; (10) RUN.md mssql section (container, sqlcmd client commands with -C and encryption flags, presets); (11) gates: go suite + ng test + build; commit; report.
 
+## Task 9.6: In-app documentation with diagrams (user directive 2026-08-15 — "add documentation on the app, run through how it works and with diagrams")
+
+A **"How it works" page inside the SPA** at `/docs` (lazy route, authGuard, linked from both portals' toolbars): a step-by-step run-through of the system with **Mermaid diagrams** rendered inline (dark-theme styled to match the zinc UI).
+
+Content (accurate to the implementation):
+1. **Overview + architecture diagram**: maker/ticketing UI + checker UI + control plane (:8080 HTTPS API + WS hub + SPA) ↔ Valkey (the ONLY coupling: token store, watch keys, Pub/Sub) ↔ data plane (:3306 shared listener) ↔ MySQL/PG/MSSQL. Zero-trust note: no client ever sees real DB credentials.
+2. **Token flow (sequence diagram)**: ticket → /api/token (X-Api-Key/session) → single-use 5-min token (sid stamped) → pending session listed for checkers → maker connects (token as username) → data plane GETDEL (atomic single-use) → real creds resolved (config or credential API, never stored/logged) → backend connect → SQL flows, events fan out to queries:<user>/<ticket>/<sess>.
+3. **Checker flow (sequence)**: session selector (pending badge) → watch key armed → live feed per session → kill query (attention/pg_cancel/KILL QUERY) vs kill connection.
+4. **Write-gating (sequence)**: rw maker + no watcher → grace window (gate_wait_seconds, default 20) → blocked with sqlcmd/mysql/pg-readable error + audit; watcher re-attaches → gate re-opens (no permanent latch).
+5. **Wire protocols + TLS surfaces (diagram)**: three protocols on one port; TLS on/off per config for control/data/valkey.
+6. **Security model + audit**: single-use tokens, no passwords on the wire to clients, credential-API hygiene, query logging (context always, output behind flag).
+
+Implementation:
+1. `npm i mermaid` (v11 ESM). The docs component DYNAMICALLY imports mermaid (lazy chunk — keeps the main bundle lean) and renders each diagram via mermaid.render (initialize with a dark theme + zinc-consistent themeVariables; startOnLoad false).
+2. New lazy route `docs` + a toolbar link in both portals (maker + checker toolbars) + spec coverage.
+3. Tests (checker-style spec): route renders the sections; mermaid container present per diagram; the mermaid import is MOCKED in specs (vi.mock) so tests stay fast/jsdom-safe; assert each section's headings + at least the architecture diagram's source text.
+4. `cd web && npx ng test --watch=false` exit 0; `cd web && npm run build` exit 0.
+5. GATE RULE (user directive): `go test -count=1 ./...` — paste output (must stay green — no Go changes expected).
+6. Commit: git add web/src web/package.json web/package-lock.json && git -c user.name="Hermes" -c user.email="hermes@local" commit -m "feat(web): in-app how-it-works docs with mermaid diagrams"
+7. FULL report to D:\AI\hermes\Project\Project-D\.superpowers\sdd\PLAN\task-9.6-report.md (page structure, diagram list, theme notes, bundle impact (before/after main + lazy chunk sizes), ng test + build + go outputs, commit hash).
+
 ## Phase 9 gate
-All tasks reviewed; full suites green; amendment 13 verified end-to-end; ledger updated.
+All tasks reviewed; full suites green; amendment 13 + 19 verified end-to-end; ledger updated.
