@@ -37,11 +37,18 @@ flowchart LR
         MS[(MSSQL :1434)]
     end
 
+    subgraph Observability [Observability - optional]
+        AU[(Audit MySQL :3307<br/>zt_audit.sessions)]
+        PM[/"Prometheus<br/>scrape :9464/metrics"/]
+    end
+
     C <-->|"GETDEL / SETEX / PubSub"| V
     D <-->|"GETDEL / PubSub / watch keys"| V
     D -->|"real credentials resolved internally"| MY
     D -->|"real credentials resolved internally"| PG
     D -->|"real credentials resolved internally"| MS
+    C -->|"session rows (maker + checker)"| AU
+    D -->|"OTel metrics"| PM
 ```
 
 ## Zero-trust principles

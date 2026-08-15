@@ -10,6 +10,8 @@
 | 4. Write-Gating (Maker–Checker) | [04-write-gating.md](04-write-gating.md) | Read/write access, watch presence, grace window, re-open semantics |
 | 5. Credential Retrieval API | [05-credential-retrieval-api.md](05-credential-retrieval-api.md) | **How the gateway calls an external API to withdraw DB passwords** — request/response contract, config, hygiene |
 | 6. Protocols, TLS & Security | [06-protocols-tls-security.md](06-protocols-tls-security.md) | MySQL/PG/MSSQL wire handling, TLS surfaces, audit & logging |
+| 7. Session Audit Persistence | [07-audit-persistence.md](07-audit-persistence.md) | Durable session/connection records in MySQL (maker + checker usernames) |
+| 8. OpenTelemetry Metrics | [08-otel-metrics.md](08-otel-metrics.md) | Data-plane metrics endpoint scraped by Prometheus |
 
 > **Maintenance note:** pages 2 and 5 describe the two API surfaces most likely to change. Their contracts (headers, keys, status codes, payload fields) are spelled out in tables so edits can be made without re-deriving the wire behaviour.
 
