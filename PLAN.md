@@ -2347,9 +2347,9 @@ The checker controls (session selector, channel input, connect/stop, kill-connec
 ## Phase 8 gate (addendum 5)
 All tasks reviewed; full suites green; amendment 18 verified end-to-end; ledger updated.
 
-# Phase 9: MSSQL support (user directive 2026-08-13)
+# Phase 9: MSSQL support (user directive 2026-08-13, UNPARKED 2026-08-14: "add mssql support")
 
-> **ON HOLD — DO NOT START** (user directive 2026-08-13, immediately after planning: "do not start on phase 9"). The plan below is retained as intent documentation only. NO 9.x task may be dispatched without a new explicit user instruction. Phase 8 continues normally.
+> ~~ON HOLD — DO NOT START~~ — hold LIFTED by explicit user instruction on 2026-08-14; execution begins with Task 9.1.
 
 Amendment 13 in hermes-agent-spec.md. Add Microsoft SQL Server (TDS) as a third wire protocol on the shared data-plane listener, with the FULL feature parity of MySQL/PG: token auth, audit + capture, session directory, two-level kill, write-gating, TLS negotiation, credential API mode, query logging.
 
