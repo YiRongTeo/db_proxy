@@ -24,15 +24,19 @@ import (
 // TDS has no client-visible connection id to capture, and kill-query is N/A
 // until Task 9.4 wires the ATTENTION packet — KillQuery returns false.
 type mssqlSession struct {
-	id        string
-	mu        sync.Mutex
+	id string
+	mu sync.Mutex
+	// Task 9.3 pending event + response capture: set by the client→backend
+	// sniff, completed by the backend→client capture (see mssql_relay.go).
+	pending   *models.QueryEvent
+	capture   *mssqlResultCapture
 	closer    func()
 	db        string               // client-requested database (login7 field, envchange fallback)
 	threadID  int64                // always 0 — see type comment
 	startedAt time.Time            // session establishment (UTC)
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context
-	access    string               // token access level: "write" → maker write-gate applies (Task 9.3)
+	access    string               // token access level: "write" → maker write-gate applies (Task 9.4)
 	client    net.Conn             // (possibly TLS-wrapped) client conn
 	backend   net.Conn             // (possibly TLS-wrapped) backend conn
 }
@@ -390,25 +394,39 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
+	// Deferred in this order so teardown is: flushPendingOnClose (any
+	// unanswered query publishes first, re-arming the heartbeat) → finish
+	// session (DelSessionLive + ended event) → unregister.
 	defer p.finishSession(s, tok, clientAddr)
+	defer p.flushPendingOnClose(s)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
 		"db_type", tok.DBType, "client", clientAddr, "db", db)
 
-	// 9. byte relay until Task 9.3 replaces it with the sniffing query
-	// relay. Whichever direction ends first (client quit, backend close,
-	// network error, Task 6.4 kill) tears down both sides; the second
-	// done-slot is buffered so the survivor never blocks.
+	// 9. Task 9.3 sniffing query relay: client→backend packets are sniffed
+	// for SQL (batch 0x01 / RPC 0x03) and forwarded byte-exact; backend→
+	// client packets are forwarded byte-exact while their token stream
+	// (COLMETADATA/ROW/DONE/ERROR) is passively captured, and each command
+	// publishes its QueryEvent (status/columns/rows) to all three channels.
+	// Whichever direction ends first (client quit, backend close, network
+	// error, Task 6.4 kill) tears down both sides; the second done-slot is
+	// buffered so the survivor never blocks.
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(backend, br) // br preserves peeked + buffered bytes
+		p.pipeMSSQLClientToBackend(br, backend, client, s, tok, clientAddr)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, backendBR)
+		p.pipeMSSQLBackendToClient(backendBR, client, s)
 		done <- struct{}{}
 	}()
+	// Wait for BOTH relay pipes before teardown (Task 8.2 round-3 race
+	// fix, mirrored from MySQL/PG): the first done only means one direction
+	// ended — the survivor may still be inside publishEvent, whose
+	// SetSessionLive re-arms the session-directory heartbeat. Closing both
+	// conns unblocks the survivor; the second receive then guarantees its
+	// final publish completed BEFORE the teardown defers run DelSessionLive.
 	<-done
 	client.Close()
 	backend.Close()

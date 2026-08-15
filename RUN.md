@@ -211,6 +211,40 @@ TDS wiring notes (all pinned by live captures, rounds 6-9):
 - Login response relay is byte-exact; the backend's LOGINACK/ENVCHANGE/DONE
   are passed through verbatim (only the TDS envelope is rebuilt).
 
+#### Relay capture + session events (Task 9.3) — mssql queries reach the checker
+
+SQL batches (`0x01`) and RPCs (`0x03`) are sniffed client→backend; the
+backend→client result stream (COLMETADATA → ROW/NBCROW → DONE/ERROR) is
+captured pre-write while the relay stays byte-exact. Each command publishes
+ONE QueryEvent — exactly like MySQL/PG — to `queries:<user>`,
+`queries:ticket:<t>` and `queries:sess:<sid>`, with `stmt_type`, `status`,
+`columns`/`rows` (caps: 100 rows, 512 chars/cell, 64 KB total, `truncated`
+flag) and `db: appdb`. The Checker dashboard (`/ws/checker`) and
+`/api/sessions` are protocol-agnostic, so mssql sessions and events appear
+alongside MySQL/PG with no frontend changes:
+
+```bash
+# any mssql token (see the TDS-through-the-proxy block above) — then a real query:
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S host.docker.internal,3306 \
+  -U "$TOKEN" -P x -N o -d appdb -Q "SELECT id, name FROM demo_items ORDER BY id"
+# → 3 rows; the checker feed carries one event:
+#   {"kind":"query","db_type":"mssql","sql":"SELECT id, name FROM demo_items",
+#    "stmt_type":"select","status":"ok","columns":["id","name"],
+#    "rows":[["1","test"],["2","bravo"],["3","charlie"]],"db":"appdb"}
+#   (INSERTs publish stmt_type=insert; failures publish status=error with the
+#    server message, e.g. "Invalid object name 'no_such_table_zz'.")
+
+# the session shows up in the checker directory with its database:
+curl -b /tmp/zt.jar http://127.0.0.1:8080/api/sessions
+# → 200 → [..., {"db_type":"mssql","db":"appdb", ...}, ...]
+```
+
+Wire notes pinned by live captures (2026-08-15): the live SQL Server 2022
+NEVER sets the DONE_FINAL bit on query responses — completion is the message
+EOM after a DONE-family token (documented in `mssql_capture.go`).
+ATTENTION (`0x06`) / LOGOUT (`0x0E`) pass through untouched; the maker
+write-gate slots into the client→backend sniff (Task 9.4).
+
 ---
 
 ## 2. Start the planes (control → data)

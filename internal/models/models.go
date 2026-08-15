@@ -13,7 +13,7 @@ type TokenPayload struct {
 	DBUser   string `json:"db_user"`             // backend DB user
 	DBIP     string `json:"db_ip"`               // backend DB host
 	DBPort   string `json:"db_port"`             // backend DB port
-	DBType   string `json:"db_type"`             // "mysql" | "postgres"
+	DBType   string `json:"db_type"`             // "mysql" | "postgres" | "mssql"
 	TicketID string `json:"ticket_id,omitempty"` // optional maker-checker grouping
 	Access   string `json:"access,omitempty"`    // "read" | "write" (Task 8.6 maker write-gating); absent = read
 	// SessionID (Task 8.11) is the session directory id stamped by the
@@ -58,7 +58,7 @@ type QueryEvent struct {
 	DBUser     string    `json:"db_user"`
 	DBIP       string    `json:"db_ip"`
 	DBPort     string    `json:"db_port"`
-	DBType     string    `json:"db_type"` // mysql | postgres
+	DBType     string    `json:"db_type"` // mysql | postgres | mssql
 	SQL        string    `json:"sql"`
 	ClientAddr string    `json:"client_addr"`
 	// Phase 6 enhancement fields — all omitempty for wire backward compatibility.

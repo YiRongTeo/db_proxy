@@ -109,8 +109,8 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ticket_id required"})
 		return
 	}
-	if req.DBType != "mysql" && req.DBType != "postgres" {
-		http.Error(w, `{"error":"db_type must be mysql or postgres"}`, http.StatusUnprocessableEntity)
+	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" {
+		http.Error(w, `{"error":"db_type must be mysql, postgres or mssql"}`, http.StatusUnprocessableEntity)
 		return
 	}
 	token, err := store.NewToken()
