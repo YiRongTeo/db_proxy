@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"zerotrust-proxy/internal/api"
+	"zerotrust-proxy/internal/audit"
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/logging"
 	"zerotrust-proxy/internal/store"
@@ -68,7 +69,32 @@ func main() {
 	}
 	defer vs.Close()
 
-	apiSrv := api.NewAPI(log, cfg, vs) // Task 2.2/2.3 replaces the stub
+	// Task 9.7 session audit: when audit.mysql.enabled is set, open the
+	// writer (auto-creates zt_audit.sessions) and fail fast if the database
+	// is unreachable — an audit-enabled plane that cannot write must not
+	// start silently. Runtime write failures stay non-fatal (logged only).
+	var aw *audit.Writer
+	if cfg.Audit.MySQL.Enabled {
+		aw, err = audit.NewWriter(log, audit.Config{
+			Host: cfg.Audit.MySQL.Host, Port: cfg.Audit.MySQL.Port,
+			User: cfg.Audit.MySQL.User, Password: cfg.Audit.MySQL.Password,
+			Database: cfg.Audit.MySQL.Database,
+		})
+		if err != nil {
+			log.Error("audit mysql", "err", err)
+			os.Exit(1)
+		}
+		defer aw.Close()
+		log.Info("session audit enabled", "host", cfg.Audit.MySQL.Host,
+			"port", cfg.Audit.MySQL.Port, "database", cfg.Audit.MySQL.Database)
+	}
+
+	apiSrv := api.NewAPI(log, cfg, vs, aw) // Task 2.2/2.3 replaces the stub
+	if aw != nil {
+		// Consume the hub's queries:sess:* lifecycle events (started/ended)
+		// into the audit writer for the process lifetime.
+		go apiSrv.RunAuditLifecycle(ctx)
+	}
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: apiSrv.Routes()}
 
 	go func() {
