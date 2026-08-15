@@ -21,24 +21,29 @@ import (
 // mssqlSession tracks one established TDS session. It serves as the kill
 // registry entry (closer force-closes both conns to tear the session down)
 // and carries the Task 8.2 session-directory fields. threadID is always 0:
-// TDS has no client-visible connection id to capture, and kill-query is N/A
-// until Task 9.4 wires the ATTENTION packet — KillQuery returns false.
+// TDS has no client-visible connection id to capture — kill-query is the
+// ATTENTION packet on the LIVE backend conn (Task 9.4).
 type mssqlSession struct {
 	id string
 	mu sync.Mutex
 	// Task 9.3 pending event + response capture: set by the client→backend
 	// sniff, completed by the backend→client capture (see mssql_relay.go).
-	pending   *models.QueryEvent
-	capture   *mssqlResultCapture
-	closer    func()
-	db        string               // client-requested database (login7 field, envchange fallback)
-	threadID  int64                // always 0 — see type comment
-	startedAt time.Time            // session establishment (UTC)
-	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
-	tok       *models.TokenPayload // credential context
-	access    string               // token access level: "write" → maker write-gate applies (Task 9.4)
-	client    net.Conn             // (possibly TLS-wrapped) client conn
-	backend   net.Conn             // (possibly TLS-wrapped) backend conn
+	pending     *models.QueryEvent
+	capture     *mssqlResultCapture
+	closer      func()
+	db          string               // client-requested database (login7 field, envchange fallback)
+	threadID    int64                // always 0 — see type comment
+	startedAt   time.Time            // session establishment (UTC)
+	lastSeen    time.Time            // last activity — heartbeat stamp (UTC)
+	tok         *models.TokenPayload // credential context
+	access      string               // token access level: "write" → maker write-gate applies (Task 9.4)
+	spid        uint16               // backend SPID from the login-response ENVCHANGE token (ATTENTION header, Task 9.4)
+	attnPending bool                 // a proxy-initiated ATTENTION is outstanding: the backend's DONE_ATTN ack must be swallowed (Task 9.4 round-1 fix)
+	writeMu     sync.Mutex           // serializes BACKEND writes: relay forward, gate flush, ATTENTION (Task 9.4)
+	gateMu      sync.Mutex           // Task 9.4 grace-hold state guard (mirrors mysqlSession.gateMu)
+	gate        mssqlGateState       // Task 9.4 maker write-gate grace hold (mirrors mysqlGateState)
+	client      net.Conn             // (possibly TLS-wrapped) client conn
+	backend     net.Conn             // (possibly TLS-wrapped) backend conn
 }
 
 // MSSQLProxy runs TDS (SQL Server) sessions on the Data Plane (Task 9.2):
@@ -220,10 +225,27 @@ func (p *MSSQLProxy) KillSession(id string) bool {
 	return true
 }
 
-// KillQuery aborts the session's in-flight query only. TDS has no
-// out-of-band query cancel: SQL Server cancels via the ATTENTION (0x06)
-// packet, which Task 9.4 wires. Until then every kill-query request is
-// refused with a warn — the session itself is never touched.
+// KillQuery aborts the session's in-flight query only, leaving the session
+// alive (Task 9.4). TDS cancels via the ATTENTION (0x06) packet: a single
+// header-only packet (type 0x06, EOM, length 8, no payload) written on the
+// LIVE backend conn — connection-scoped cancel, no SPID lookup needed. The
+// backend aborts the in-flight batch and answers with an ERROR/DONE_ERROR
+// response, which the relay captures and forwards to the client naturally;
+// the session itself is untouched and its next command flows normally.
+//
+// The attention is sent ONLY while a command is genuinely in flight (the
+// session's pending event is set — the sniff ran and the response has not
+// completed); an idle session is refused with a warn. Writes are serialized
+// with the relay's forwards (writeMu) so the attention can never interleave
+// mid-message. The header's SPID field carries the backend SPID captured at
+// login (ENVCHANGE token) when the server announced one, else 0 — what the
+// real ODBC driver sends.
+//
+// The backend acknowledges the attention with a SEPARATE DONE_ATTN message
+// (after the aborted batch's DONE_ERROR). The client never asked to cancel,
+// so the relay swallows that ack proxy-side (attnPending → see
+// pipeMSSQLBackendToClient) — the client sees only the aborted batch's
+// error and its next command flows normally on the same session.
 func (p *MSSQLProxy) KillQuery(id string) bool {
 	p.mu.Lock()
 	s := p.sessions[id]
@@ -231,8 +253,35 @@ func (p *MSSQLProxy) KillQuery(id string) bool {
 	if s == nil {
 		return false
 	}
-	p.log.Warn("kill query: not supported until task 9.4 (attention packet)", "session_id", id)
-	return false
+	s.mu.Lock()
+	inflight := s.pending != nil
+	s.mu.Unlock()
+	if !inflight {
+		p.log.Warn("kill query: no command in flight", "session_id", id)
+		return false
+	}
+	// Arm the ack swallow BEFORE the write: the backend answers the
+	// attention with a separate DONE_ATTN acknowledgement message after
+	// the aborted batch's DONE_ERROR (live capture: `fd 02 00` then
+	// `fd 20 00`). The client never asked to cancel — forwarding that ack
+	// would corrupt its protocol state (its next batch would read the
+	// stale ack as its response). pipeMSSQLBackendToClient consumes it
+	// proxy-side and clears this flag.
+	s.mu.Lock()
+	s.attnPending = true
+	s.mu.Unlock()
+	s.writeMu.Lock()
+	err := writeTDSPacketSPID(s.backend, tdsAttention, tdsStatusEOM, s.spid, nil)
+	s.writeMu.Unlock()
+	if err != nil {
+		s.mu.Lock()
+		s.attnPending = false
+		s.mu.Unlock()
+		p.log.Error("kill query: attention write failed", "session_id", id, "err", err)
+		return false
+	}
+	p.log.Info("query killed", "session_id", id, "db_type", "mssql")
+	return true
 }
 
 // handleConn runs one TDS session. The Dispatcher owns the accept loop and
@@ -390,15 +439,18 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		lastSeen:  time.Now().UTC(),
 		tok:       tok,
 		access:    tok.Access,
+		spid:      scanLoginSPID(loginResp),
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
 	defer p.unregisterSession(s.id)
-	// Deferred in this order so teardown is: flushPendingOnClose (any
-	// unanswered query publishes first, re-arming the heartbeat) → finish
-	// session (DelSessionLive + ended event) → unregister.
+	// Deferred in this order so teardown is: closeMSSQLGateWait (Task 9.4 —
+	// any grace-held commands drain with the timeout rejection) → flush-
+	// PendingOnClose (any unanswered query publishes first, re-arming the
+	// heartbeat) → finish session (DelSessionLive + ended event) → unregister.
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
+	defer p.closeMSSQLGateWait(s)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,
@@ -584,12 +636,20 @@ func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
 // the client's OWN credential, echoed back only to the client that presented
 // it.
 func buildLoginError(msg string) []byte {
-	const (
-		errNumber  = 18456
-		errState   = 1
-		errClass   = 14
-		serverName = "zerotrust-proxy"
-	)
+	return buildTDSErrorToken(msg, 18456, 1, 14)
+}
+
+// buildTDSErrorToken builds a TABULAR RESULT token stream carrying one
+// sqlcmd-readable error: an ERROR token (0xAA — number/state/class + the
+// UTF-16LE MsgText + empty server/proc + line 1) followed by a DONE token
+// (0xFD) with the DONE_ERROR status bit (0x0002) — the exact shape the real
+// SQL Server ends a failed command with, and what sqlcmd renders as
+// "Msg <n>, Level <class>, State <s>: <msg>". Used for login failures
+// (buildLoginError, 18456/1/14) and for the Task 9.4 maker write-gate
+// rejections (18456/1/14 — the same access-denied family; the gating text
+// names the session).
+func buildTDSErrorToken(msg string, errNumber uint32, errState, errClass byte) []byte {
+	const serverName = "zerotrust-proxy"
 	utf16le := func(s string) []byte {
 		units := utf16.Encode([]rune(s))
 		b := make([]byte, len(units)*2)
@@ -626,15 +686,50 @@ func buildLoginError(msg string) []byte {
 	binary.LittleEndian.PutUint32(lb[:], 1) // LineNumber
 	out = append(out, lb[:]...)
 	// DONE token: type(1) + status(2, LE) + curcmd(2) + rowcount(8). The
-	// real server ends a rejected login with status 0x0002 (DONE_ERROR
-	// only — NO DONE_FINAL bit; captured `fd 02 00` tail) and then drops
-	// the connection — the close is what ends the response.
+	// real server ends a failed command with status 0x0002 (DONE_ERROR
+	// only — NO DONE_FINAL bit; captured `fd 02 00` tail) and the message
+	// EOM is what ends the response.
 	status := uint16(tdsDoneError) // 0x0002
 	out = append(out, 0xFD)
 	out = append(out, byte(status), byte(status>>8))
 	out = append(out, 0x00, 0x00) // curcmd
 	out = append(out, make([]byte, 8)...)
 	return out
+}
+
+// scanLoginSPID walks the backend login response token stream and returns
+// the SPID announced by an ENVCHANGE (0xE3) token of type 0x04 (SPID — the
+// new value is a USHORT). Returns 0 when the server announced none. The
+// ATTENTION packet's SPID header field mirrors it (Task 9.4) — the real
+// ODBC driver fills the field from the same login response.
+func scanLoginSPID(buf []byte) uint16 {
+	for pos := 0; pos < len(buf); {
+		t := buf[pos]
+		switch t {
+		case 0xFD, 0xFE, 0xFF: // DONE family — fixed 13-byte tail
+			if pos+13 > len(buf) {
+				return 0
+			}
+			pos += 13
+		case 0xAA, 0xAB, 0xAD, 0xAE, 0xE3, 0xE4: // length-prefixed tokens
+			if pos+3 > len(buf) {
+				return 0
+			}
+			l := int(binary.LittleEndian.Uint16(buf[pos+1 : pos+3]))
+			if pos+3+l > len(buf) {
+				return 0
+			}
+			// ENVCHANGE: NewValueType(1) NewValue OldValueType(1) OldValue.
+			// Type 0x04 = SPID, new value = USHORT (2 bytes).
+			if t == 0xE3 && l >= 5 && buf[pos+3] == 0x04 {
+				return binary.LittleEndian.Uint16(buf[pos+4 : pos+6])
+			}
+			pos += 3 + l
+		default:
+			return 0 // unknown token — post-login traffic
+		}
+	}
+	return 0
 }
 
 // refreshSessionLive writes (or refreshes) the session's directory record —

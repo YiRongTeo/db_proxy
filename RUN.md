@@ -520,6 +520,51 @@ curl -b /tmp/zt.jar -X POST http://127.0.0.1:8080/api/kill \
 The Checker dashboard shows one row per session with two buttons: **Kill query** (mode=query,
 session survives) and **Kill connection** (mode=connection, session removed).
 
+### 5.3 MSSQL kill + write-gating (Task 9.4)
+
+The same kill + write-gate machinery applies to the TDS plane; only the wire mechanism differs:
+
+| Aspect | MySQL / PostgreSQL | MSSQL (TDS) |
+|---|---|---|
+| Kill query | second backend conn: `KILL QUERY <thread_id>` / `pg_cancel_backend(<pid>)` | **ATTENTION packet (type 0x06)** on the LIVE backend conn — header-only (length 8, no payload), SPID field from the login-response ENVCHANGE token (0 when the server announced none) |
+| Kill connection | close both conns via the registry closer | identical (registry closer) |
+| Gated messages | `COM_QUERY` 0x03 / `COM_STMT_PREPARE` 0x16 / `COM_STMT_EXECUTE` 0x17; PG `Q` / `P` / `E` | **SQL batch (0x01)** and **RPC (0x03)** messages on write-access sessions (control types — prelogin, login7, ATTENTION, logout, tabular — never gate) |
+| Block response | MySQL `ERR 1045` / PG `FATAL 28000` | TABULAR stream with an **ERROR token (18456, class 14)** + DONE_ERROR tail — sqlcmd renders `Msg 18456, Level 14, State 1: maker gating: no checker connected to session <sid>` |
+
+**ATTENTION / kill-query semantics.** `POST /api/kill` with `mode=query` on an mssql session
+writes the ATTENTION packet on the live backend connection (writes are serialized with the
+relay's forwards, so it can never interleave mid-message):
+
+- The attention is sent **only while a command is genuinely in flight** (the sniff's pending
+  event is set). An idle session is refused with a warn (`kill query: no command in flight`)
+  and never touched; an unknown session reports false.
+- The backend aborts the in-flight batch and answers with an **ERROR/DONE_ERROR** response
+  (live capture `fd 02 00 …`) — the client sees that error, and the audit event publishes as
+  `status=error`.
+- The backend then sends a **separate DONE_ATTN acknowledgement** (live capture `fd 20 00 …`).
+  The client never asked to cancel, so the proxy **swallows that ack proxy-side** (the
+  `attnPending` flag is armed before the write and consumed by the backend→client pipe, logged
+  `attention ack swallowed`): forwarding it would corrupt the client's protocol state — its
+  next batch would read the stale ack as its response. The client sees only the aborted
+  batch's error, and its **next command runs normally on the same session** — no reconnect.
+  Client-initiated attentions (their acks arrive with the flag unset) still pass through
+  untouched.
+
+**Write-gating on TDS** — same rule as §5.1, applies to mssql write-access tokens: a
+per-command `EXISTS watch:<sid>` check (never cached), **fail closed** on store error,
+read-only sessions exempt, a block never kills the connection, and a re-attached watcher
+re-opens the same session. The **grace window** (§5.1 Task 8.13) applies identically:
+unwatched SQL batches queue per session (bounded at 16 held messages), flush in order when a
+checker attaches, and drain with the 18456 rejection + audit event (`status=error`) when
+`gate_wait_seconds` expires (`0` = reject immediately); a drain does not latch — re-watch
+re-opens.
+
+Practical flow: issue a write-access mssql token → connect with sqlcmd through the shared
+port (3306; `-N o` plaintext or `-C` TLS) → run `WAITFOR DELAY '00:00:30'` → Checker
+**Kill query** → the batch aborts with the attention error, `SELECT 1` on the SAME session
+returns real rows → **Kill connection** → the client drops and the session leaves `sess:live`.
+Without a checker, an INSERT is held/blocked per the gate rule above.
+
 ---
 
 ## 6. TLS mode & Valkey TLS / Sentinel (Phase 7 — optional)

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	"zerotrust-proxy/internal/models"
 )
 
 // --- Task 9.2 unit tests: error-token shape, the 0x12-wrapping TLS seam,
@@ -195,13 +197,14 @@ func TestWriteTDSMessageFragments(t *testing.T) {
 	}
 }
 
-// TestMSSQLKillHooks pins the Task 9.2 kill-registry contract (Task 6.4
-// parity, mirror of TestSessionRegistryKillClosesBothConns): KillSession
-// force-closes a registered session's conns and stays registered until the
-// session goroutine's deferred unregister runs (so a repeat kill still
-// reports true); unknown ids report false. KillQuery is refused (TDS
-// cancels via ATTENTION in Task 9.4) with a warn but never touches the
-// session.
+// TestMSSQLKillHooks pins the Task 9.4 kill contract on the TDS plane
+// (registry parity: mirror of TestSessionRegistryKillClosesBothConns).
+// KillSession force-closes a registered session's conns and stays
+// registered until the session goroutine's deferred unregister runs (so a
+// repeat kill still reports true); unknown ids report false. KillQuery —
+// live in Task 9.4 — aborts ONLY an in-flight command via the ATTENTION
+// (0x06) packet written on the LIVE backend conn and reports true; an idle
+// or unknown session is refused with a warn and never touched.
 func TestMSSQLKillHooks(t *testing.T) {
 	var logBuf bytes.Buffer
 	p := NewMSSQLProxy(slog.New(slog.NewTextHandler(&logBuf, nil)), nil, &ConfigCredResolver{}, nil)
@@ -222,15 +225,56 @@ func TestMSSQLKillHooks(t *testing.T) {
 	if !p.KillSession("sid-1") {
 		t.Fatal("second KillSession on the still-registered session must return true")
 	}
-	p.registerSession(&mssqlSession{id: "sid-2"})
-	if p.KillQuery("sid-2") {
-		t.Fatal("KillQuery must be refused before Task 9.4")
+	// KillQuery: a command in flight (the pending event is set) → the
+	// ATTENTION packet lands on the LIVE backend conn, the ack swallow is
+	// armed, and the verdict is true. The session itself stays open.
+	client, cpeer := net.Pipe()
+	backend, bpeer := net.Pipe()
+	defer func() { cpeer.Close(); bpeer.Close(); client.Close(); backend.Close() }()
+	s := &mssqlSession{id: "sid-2", client: client, backend: backend, spid: 0x0A0B}
+	bbr := bufio.NewReader(bpeer)
+	p.registerSession(s)
+	defer p.unregisterSession(s.id)
+	s.mu.Lock()
+	s.pending = &models.QueryEvent{SQL: "WAITFOR DELAY '00:00:30'", SessionID: s.id}
+	s.mu.Unlock()
+	// net.Pipe writes block until consumed — drive the kill in a
+	// goroutine and read the attention off the backend peer.
+	killed := make(chan bool, 1)
+	go func() { killed <- p.KillQuery("sid-2") }()
+	hdr, payload, err := readTDSFrame(bbr)
+	if err != nil {
+		t.Fatalf("read attention off the backend conn: %v", err)
 	}
-	if !strings.Contains(logBuf.String(), "not supported until task 9.4") {
-		t.Fatalf("kill query warn missing: %s", logBuf.String())
+	if !<-killed {
+		t.Fatal("KillQuery on an in-flight session must return true")
+	}
+	want := [8]byte{tdsAttention, tdsStatusEOM, 0x00, 0x08, 0x0A, 0x0B, 0x01, 0x00}
+	if hdr != want {
+		t.Errorf("attention header = % x, want % x (type 0x06, EOM, len 8, spid 0x0A0B)", hdr, want)
+	}
+	if len(payload) != 0 {
+		t.Errorf("attention payload = % x, want empty", payload)
+	}
+	s.mu.Lock()
+	attn := s.attnPending
+	s.mu.Unlock()
+	if !attn {
+		t.Error("attnPending not armed after KillQuery")
+	}
+	// Now idle (no command in flight): KillQuery is refused with a warn
+	// and writes nothing — the session is never touched.
+	s.mu.Lock()
+	s.pending = nil
+	s.mu.Unlock()
+	if p.KillQuery("sid-2") {
+		t.Error("KillQuery on an idle session must be refused")
 	}
 	if p.KillQuery("nope") {
-		t.Fatal("KillQuery on an unknown session must return false")
+		t.Error("KillQuery on an unknown session must return false")
+	}
+	if !strings.Contains(logBuf.String(), "no command in flight") {
+		t.Fatalf("idle-kill warn missing: %s", logBuf.String())
 	}
 }
 

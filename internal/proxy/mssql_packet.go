@@ -25,6 +25,7 @@ const (
 	tdsVersion740 = 0x74000004 // TDS 7.4 — what sqlcmd v18 sends
 	tdsDoneFinal  = 0x0200     // DONE token status bit: message complete
 	tdsDoneError  = 0x0002     // DONE token status bit: error occurred
+	tdsDoneAttn   = 0x0020     // DONE token status bit: attention acknowledged (MS-TDS 2.2.7.10)
 )
 
 // PreLogin option tokens (MS-TDS 2.2.6.3).
@@ -77,13 +78,22 @@ func writeTDSPacket(w io.Writer, typ byte, payload []byte) error {
 // the non-EOM variant is needed when a message is fragmented across packets
 // (the EOM bit marks the final fragment only).
 func writeTDSPacketStatus(w io.Writer, typ, status byte, payload []byte) error {
+	return writeTDSPacketSPID(w, typ, status, 0, payload)
+}
+
+// writeTDSPacketSPID is writeTDSPacketStatus with a caller-chosen SPID
+// header field. The relay and the login path use SPID 0 (what every captured
+// client/server packet in round 1 used); the ATTENTION packet (Task 9.4
+// kill-query) carries the backend SPID captured at login — the real ODBC
+// driver fills the field from the login response's ENVCHANGE SPID token.
+func writeTDSPacketSPID(w io.Writer, typ, status byte, spid uint16, payload []byte) error {
 	hdr := make([]byte, tdsHeaderLen)
 	hdr[0] = typ
 	hdr[1] = status
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(tdsHeaderLen+len(payload)))
-	binary.BigEndian.PutUint16(hdr[4:6], 0) // SPID
-	hdr[6] = 1                              // packet id
-	hdr[7] = 0                              // window
+	binary.BigEndian.PutUint16(hdr[4:6], spid)
+	hdr[6] = 1 // packet id
+	hdr[7] = 0 // window
 	if _, err := w.Write(append(hdr, payload...)); err != nil {
 		return err
 	}

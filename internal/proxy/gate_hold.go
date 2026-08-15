@@ -404,3 +404,201 @@ func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg s
 		p.publishEvent(s, e.ev)
 	}
 }
+
+// --- MSSQL (Task 9.4) ------------------------------------------------------
+//
+// The TDS-plane mirror of the Task 8.13/8.17 grace hold, driven from
+// pipeMSSQLClientToBackend (see mssql_relay.go). A held entry is one raw
+// client MESSAGE — its frames (each frame's original header + payload,
+// byte-exact) plus the audit event snapshot taken at queue time. A watcher
+// arriving within gate_wait_seconds flushes the queue IN ORDER, each
+// message forwarded exactly as the normal forward path writes it; the
+// window expiring DRAINS the queue — every held message is rejected to the
+// client with an sqlcmd-readable ERROR token (18456, class 14, the
+// "maker gating: no checker connected within <N>s" text) and an audit event
+// (status=error). gate_wait_seconds=0 rejects immediately (the caller's
+// reject path). A drain does NOT latch (Task 8.17): the gate re-evaluates
+// per message — a re-attached watcher re-opens it.
+
+// mssqlGateFrame is one raw TDS packet of a held message: the 8-byte header
+// VERBATIM plus its payload, forwarded byte-exact on flush.
+type mssqlGateFrame struct {
+	hdr     [8]byte
+	payload []byte
+}
+
+// mssqlGateEntry is one held message: its raw frames plus the audit event
+// snapshot taken at queue time.
+type mssqlGateEntry struct {
+	frames []mssqlGateFrame
+	ev     *models.QueryEvent
+}
+
+// mssqlGateState is the per-session Task 8.13 grace-hold state for the TDS
+// plane, guarded by the session's gateMu. Mirrors mysqlGateState.
+type mssqlGateState struct {
+	active bool
+	queue  []mssqlGateEntry
+	stop   chan struct{}
+	done   chan struct{}
+}
+
+// gateMSSQLHold queues a gated (blocked) TDS message for the grace window
+// instead of rejecting it. Returns true when the message was QUEUED — the
+// caller must NOT reply and must NOT forward: the client's response comes
+// later, either the real backend result (watcher flush) or the drain ERROR.
+// Returns false when the caller must reject immediately: gate_wait_seconds
+// = 0 (pre-8.13 behavior) or the queue is full (overflow rejects only the
+// new message — the queue keeps waiting).
+func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame) bool {
+	if p.gateWaitSeconds <= 0 {
+		return false
+	}
+	s.gateMu.Lock()
+	if !s.gate.active {
+		// First held message: start the wait (grace timer + watch ticker).
+		s.gate.active = true
+		s.gate.stop = make(chan struct{})
+		s.gate.done = make(chan struct{})
+		go p.gateMSSQLWaitLoop(s)
+	}
+	if len(s.gate.queue) >= gateQueueMax {
+		s.gateMu.Unlock()
+		return false // overflow: reject THIS message only; the queue keeps waiting
+	}
+	s.mu.Lock()
+	ev := s.pending // audit snapshot — sniffMSSQLCommand ran before the gate check
+	s.mu.Unlock()
+	s.gate.queue = append(s.gate.queue, mssqlGateEntry{frames: frames, ev: ev})
+	s.gateMu.Unlock()
+	// A watcher that appeared since the gate check unblocks the queue
+	// immediately — checked on every new message arrival, not only on the
+	// ticker.
+	if watched, err := p.vs.WatchActive(context.Background(), s.id); err == nil && watched {
+		p.gateMSSQLFlush(s)
+	}
+	return true
+}
+
+// gateMSSQLWaitLoop is the TDS mirror of gateWaitLoop: it re-checks for a
+// watcher on a short ticker (flushing the queue in order when one appears)
+// and drains + rejects the queue when the grace window expires. It exits as
+// soon as the wait is ended by any path (flush, drain, session close).
+func (p *MSSQLProxy) gateMSSQLWaitLoop(s *mssqlSession) {
+	defer close(s.gate.done)
+	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(gateWatchRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			p.gateMSSQLTimeout(s)
+			return
+		case <-ticker.C:
+			watched, err := p.vs.WatchActive(context.Background(), s.id)
+			if err != nil {
+				p.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", s.id, "err", err)
+				continue
+			}
+			if watched {
+				p.gateMSSQLFlush(s)
+				return
+			}
+		case <-s.gate.stop:
+			return
+		}
+	}
+}
+
+// gateMSSQLFlush forwards every held message to the backend IN ORDER — each
+// frame written byte-exact (original header + payload) under the session's
+// writeMu, exactly as the normal forward path writes it — and clears the
+// wait: subsequent messages flow normally. Holds gateMu across the writes
+// so a message arriving mid-flush cannot overtake the held queue.
+func (p *MSSQLProxy) gateMSSQLFlush(s *mssqlSession) {
+	s.gateMu.Lock()
+	if !s.gate.active {
+		s.gateMu.Unlock()
+		return
+	}
+	s.gate.active = false
+	entries := s.gate.queue
+	s.gate.queue = nil
+	close(s.gate.stop)
+	s.gate.stop = nil
+	s.writeMu.Lock()
+	for _, e := range entries {
+		for _, f := range e.frames {
+			if _, err := s.backend.Write(append(f.hdr[:], f.payload...)); err != nil {
+				s.writeMu.Unlock()
+				s.gateMu.Unlock()
+				return
+			}
+		}
+	}
+	s.writeMu.Unlock()
+	s.gateMu.Unlock()
+}
+
+// gateMSSQLTimeout drains the queue when the grace window expires: every
+// held message is rejected to the client (ERROR token 18456 + the timeout
+// message) with an audit event. The session is NOT latched (Task 8.17): a
+// watcher that attaches later re-opens the gate — the maker's next message
+// flows.
+func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
+	s.gateMu.Lock()
+	if !s.gate.active {
+		s.gateMu.Unlock()
+		return
+	}
+	s.gate.active = false
+	entries := s.gate.queue
+	s.gate.queue = nil
+	close(s.gate.stop)
+	s.gate.stop = nil
+	s.gateMu.Unlock()
+	p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+}
+
+// closeMSSQLGateWait ends a grace wait on session teardown: the held
+// messages are drained with the same rejection as a timeout (the replies
+// are best-effort — the client is going away anyway) and the wait goroutine
+// and its timers are cleaned up.
+func (p *MSSQLProxy) closeMSSQLGateWait(s *mssqlSession) {
+	s.gateMu.Lock()
+	if !s.gate.active {
+		s.gateMu.Unlock()
+		return
+	}
+	s.gate.active = false
+	entries := s.gate.queue
+	s.gate.queue = nil
+	close(s.gate.stop)
+	s.gate.stop = nil
+	s.gateMu.Unlock()
+	p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+}
+
+// gateMSSQLRejectEntries replies to the client for every held message (a
+// TABULAR ERROR token + DONE_ERROR tail, best-effort) and publishes each
+// one's audit event as status=error with the given message. The pending
+// slot is cleared so the teardown path cannot publish a duplicate
+// "connection closed" event.
+func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGateEntry, msg string) {
+	s.mu.Lock()
+	s.pending = nil
+	s.capture = nil
+	s.mu.Unlock()
+	var lastEv *models.QueryEvent
+	for _, e := range entries {
+		_ = writeTDSMessage(s.client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
+		if e.ev == nil || e.ev == lastEv {
+			continue // no event, or a later frame of the same multi-frame message
+		}
+		lastEv = e.ev
+		e.ev.Status = "error"
+		e.ev.Error = msg
+		p.publishEvent(s, e.ev)
+	}
+}
