@@ -2408,5 +2408,25 @@ Implementation:
 6. Commit: git add web/src web/package.json web/package-lock.json && git -c user.name="Hermes" -c user.email="hermes@local" commit -m "feat(web): in-app how-it-works docs with mermaid diagrams"
 7. FULL report to D:\AI\hermes\Project\Project-D\.superpowers\sdd\PLAN\task-9.6-report.md (page structure, diagram list, theme notes, bundle impact (before/after main + lazy chunk sizes), ng test + build + go outputs, commit hash).
 
-## Phase 9 gate
-All tasks reviewed; full suites green; amendment 13 + 19 verified end-to-end; ledger updated.
+## Task 9.7: Session audit persistence to MySQL (user directive 2026-08-15)
+
+The app writes connection details to a MySQL database: sessions, maker username, checker username when present. **Control plane is the writer** (it sees lifecycle events via the hub + knows the checker identity on watch attach/detach).
+
+1. Config (control.yaml): `audit.mysql {enabled (default false), host, port, user, password, database (default zt_audit)}` + env ZT_AUDIT_MYSQL_ENABLED/_HOST/_PORT/_USER/_PASSWORD/_DATABASE; fail-fast enabled+missing fields. Dependency go-sql-driver/mysql (Apache-2.0).
+2. Schema (auto-created on startup when enabled: CREATE DATABASE IF NOT EXISTS + CREATE TABLE IF NOT EXISTS): `sessions(session_id VARCHAR(64) PK-ish UNIQUE, username (maker), ticket_id, db_type, db_user, db, access, checker_username NULL, status (pending|active|ended), started_at, ended_at, last_seen, created_at)`.
+3. Hooks: handleToken success → INSERT pending row; hub lifecycle started → UPDATE active (db fields + started_at); ended → UPDATE ended_at + status ended; watcher attach (hub sets watch:<sid>) → UPDATE checker_username = <checker>; watcher disconnect → checker_username = NULL. Upserts idempotent (INSERT ... ON DUPLICATE KEY UPDATE).
+4. Tests: unit (upsert + finalize logic), LIVE: token issue → row pending; connect → active; watcher attaches → checker_username set; watcher leaves → NULL; session ends → ended_at set; a full lifecycle row verified via mysql client against mysql-test (new zt_audit database).
+5. Gates: `go test -count=1 ./...` green + ng + build; commit; report to .superpowers/sdd/PLAN/task-9.7-report.md.
+
+## Task 9.8: OpenTelemetry metrics for Prometheus scrape (user directive 2026-08-15)
+
+The data plane exposes OTel metrics on an HTTP endpoint a Prometheus server can scrape.
+
+1. Deps: go.opentelemetry.io/otel + otel/sdk/metric + otel/exporters/prometheus + prometheus/client_golang (all Apache-2.0; house rule no-GPL holds).
+2. Config (data.yaml): `metrics {enabled (default false), listen (default 0.0.0.0:9464), path (default /metrics)}` + env ZT_METRICS_ENABLED/_LISTEN/_PATH; promhttp handler on its own goroutine; fail-fast bad listen.
+3. Instruments (Meter "zerotrust.proxy"): tokens.validated (counter), tokens.rejected {reason: invalid|expired|consumed|wrong_db_type}, connections.total {db_type, result}, connections.active {db_type} (updown), queries.total {db_type, stmt_type, status}, gate.blocks {db_type}, kills.total {mode}, session.duration (histogram s, {db_type}), query.duration (histogram s, {db_type}). Wire at the exact call sites (GETDEL ok/reject, per-protocol session open/close, publishPending, gate reject, kill handler, session teardown timestamps).
+4. LIVE proof: data plane with metrics enabled → curl :9464/metrics → OpenMetrics format, the counters present; run a query → tokens.validated + queries.total + connections.active move; a gated INSERT → gate.blocks increments; kill → kills.total. (A Prometheus server scrapes the same endpoint; the curl scrape is the proof.)
+5. Gates: `go test -count=1 ./...` green (unit tests: instrument wiring via a test meter; live test: endpoint + deltas); commit; report.
+
+## Phase 9 gate (addendum 2)
+All tasks reviewed; full suites green; amendment 13 + 19 + 20 verified end-to-end; ledger updated.
