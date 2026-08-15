@@ -320,6 +320,7 @@ func TestPGWriteGateDecision(t *testing.T) {
 
 	// Unwatched write session → blocked with FATAL 28000 + ReadyForQuery.
 	unw := &pgSession{id: "sid-pg-gate-unwatched", access: "write"}
+	cleanupLiveRecord(t, vs, unw.id)
 	if !p.gatePGMessage(be, &pgproto3.Query{String: "SELECT 1"}, unw) {
 		t.Fatal("unwatched write session: allowed, want blocked")
 	}
@@ -389,6 +390,7 @@ func TestMySQLWriteGateBlocksUnwatched(t *testing.T) {
 	rwClient := dialTestMySQLSession(t, ln, rwToken)
 	started := recvSessionEvent(t, userCh)
 	sid := started.SessionID
+	cleanupLiveRecord(t, vs, sid)
 
 	// No watcher: the INSERT must be blocked with ERR 1045.
 	insert := append([]byte{cmdQuery}, "INSERT INTO demo_items (name) VALUES ('"+marker+"')"...)
@@ -403,7 +405,10 @@ func TestMySQLWriteGateBlocksUnwatched(t *testing.T) {
 
 	// Backend untouched: the marker row is absent — verified through a
 	// read-access session (gate exempt).
+	roCh := subscribePG(t, vs, "queries:gate-reader")
 	roClient := dialTestMySQLSession(t, ln, roToken)
+	roStarted := recvSessionEvent(t, roCh)
+	cleanupLiveRecord(t, vs, roStarted.SessionID)
 	sel := append([]byte{cmdQuery}, "SELECT name FROM demo_items WHERE name = '"+marker+"'"...)
 	if err := writeMySQLPacket(roClient, 0, sel); err != nil {
 		t.Fatalf("write SELECT: %v", err)
@@ -449,6 +454,7 @@ func TestMySQLWriteGateWatcherPass(t *testing.T) {
 	rwClient := dialTestMySQLSession(t, ln, rwToken)
 	started := recvSessionEvent(t, userCh)
 	sid := started.SessionID
+	cleanupLiveRecord(t, vs, sid)
 	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
@@ -465,7 +471,10 @@ func TestMySQLWriteGateWatcherPass(t *testing.T) {
 	}
 
 	// The row actually landed (watcher enabled the write).
+	roCh := subscribePG(t, vs, "queries:gate-pass-ro")
 	roClient := dialTestMySQLSession(t, ln, roToken)
+	roStarted := recvSessionEvent(t, roCh)
+	cleanupLiveRecord(t, vs, roStarted.SessionID)
 	sel := append([]byte{cmdQuery}, "SELECT name FROM demo_items WHERE name = '"+marker+"'"...)
 	if err := writeMySQLPacket(roClient, 0, sel); err != nil {
 		t.Fatalf("write SELECT: %v", err)
@@ -504,7 +513,8 @@ func TestMySQLWriteGateReadOnlyExempt(t *testing.T) {
 	ln, _ := startGatingProxy(t, vs, gatingCreds)
 
 	client := dialTestMySQLSession(t, ln, roToken)
-	recvSessionEvent(t, userCh) // started
+	started := recvSessionEvent(t, userCh) // started
+	cleanupLiveRecord(t, vs, started.SessionID)
 
 	sel := append([]byte{cmdQuery}, "SELECT 1"...)
 	if err := writeMySQLPacket(client, 0, sel); err != nil {
@@ -543,6 +553,7 @@ func TestMySQLWriteGateWatcherRemovedMidSession(t *testing.T) {
 	client := dialTestMySQLSession(t, ln, rwToken)
 	started := recvSessionEvent(t, userCh)
 	sid := started.SessionID
+	cleanupLiveRecord(t, vs, sid)
 
 	// Watched → INSERT passes.
 	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
@@ -654,6 +665,7 @@ func TestPGWriteGateBlocksUnwatched(t *testing.T) {
 
 	started := recvSessionEvent(t, userCh)
 	sid := started.SessionID
+	cleanupLiveRecord(t, vs, sid)
 
 	// No watcher → blocked with FATAL 28000 + ReadyForQuery.
 	pgSendQuery(t, front, "SELECT 1")
@@ -746,6 +758,7 @@ func TestMySQLWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
 	if started.SessionID != sid {
 		t.Fatalf("started event session_id = %q, want the token's sid %q", started.SessionID, sid)
 	}
+	cleanupLiveRecord(t, vs, sid)
 
 	// FIRST query: the gate passes — no 1045 on the first command.
 	insert := append([]byte{cmdQuery}, "INSERT INTO demo_items (name) VALUES ('"+marker+"')"...)
@@ -809,6 +822,7 @@ func TestPGWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
 	if started.SessionID != sid {
 		t.Fatalf("started event session_id = %q, want the token's sid %q", started.SessionID, sid)
 	}
+	cleanupLiveRecord(t, vs, sid)
 
 	// FIRST query passes the gate.
 	pgExecQuery(t, front, "SELECT 1")

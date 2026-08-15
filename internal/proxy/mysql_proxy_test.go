@@ -142,6 +142,7 @@ func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-3-4",
 		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307"}
 
@@ -221,6 +222,7 @@ func TestSniffCommandPublishesTicketChannel(t *testing.T) {
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 
 	// With a ticket: event lands on the ticket channel once the response
 	// completes.
@@ -415,6 +417,7 @@ func TestSniffCommandTrimsTrailingNUL(t *testing.T) {
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	tok := &models.TokenPayload{Username: "test-user", DBUser: "ro_user"}
 	s := newTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 
 	cases := []struct {
 		name string

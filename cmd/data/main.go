@@ -120,27 +120,36 @@ func main() {
 	}
 	mysqlProxy := proxy.NewMySQLProxy(log, vs, credResolver, dataTLS)
 	pgProxy := proxy.NewPGProxy(log, vs, credResolver, dataTLS)
+	// Task 9.2: the TDS (SQL Server) proxy shares the listener; the
+	// Dispatcher detects it client-first (first byte 0x12 = PRELOGIN) and
+	// routes here. Client-side TLS (same dataTLS): the proxy answers the
+	// client PRELOGIN with ENCRYPT_ON and upgrades through the 0x12-wrapped
+	// TDS 8.0 wiring; nil keeps the plaintext ENCRYPT_NOT_SUP path (sqlcmd
+	// needs -N o then).
+	mssqlProxy := proxy.NewMSSQLProxy(log, vs, credResolver, dataTLS)
 	// Task 8.8 query logging: every query is ALWAYS logged with context;
 	// the captured result payload (columns/rows/row_count/truncated) is
 	// added only when log_query_output is on (configs/data.yaml,
 	// ZT_LOG_QUERY_OUTPUT).
 	mysqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	pgProxy.SetLogQueryOutput(cfg.LogQueryOutput)
+	mssqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	// Task 8.13 maker write-gate grace hold: blocked SQL commands on an
 	// unwatched write session wait up to gate_wait_seconds for a checker
 	// instead of failing instantly (0 = reject immediately, the pre-8.13
 	// behavior; configs/data.yaml, ZT_GATE_WAIT_SECONDS).
 	mysqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	pgProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
+	mssqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	d := proxy.NewDispatcher(
 		log,
 		mysqlProxy,
 		pgProxy,
-		nil, // mssql proxy: wired in Task 9.2 — until then a detected TDS client is dropped cleanly
+		mssqlProxy, // TDS proxy wired in Task 9.2 — detected TDS clients are served
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
-	killer := proxy.NewKiller(mysqlProxy, pgProxy)
+	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
 
 	l, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {

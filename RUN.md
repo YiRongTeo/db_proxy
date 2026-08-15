@@ -100,7 +100,7 @@ Phase 9 (Task 9.1): TDS test backend. SA password meets SQL Server policy
 (8+ chars, 3 of 4 classes); dev app logins use CHECK_POLICY=OFF.
 
 ```bash
-docker run -d --name mssql-test -p 1434:1434 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='SqlSrv_2022!' -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
+docker run -d --name mssql-test -p 1434:1433 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='SqlSrv_2022!' -e MSSQL_PID=Developer mcr.microsoft.com/mssql/server:2022-latest
 ```
 
 Wait for readiness (retry up to 120 s — first boot initializes system DBs).
@@ -155,6 +155,61 @@ Encryption flags (empirically verified on this image, sqlcmd v18):
 - `-N o` (Encrypt=Optional) → plaintext (works).
 Use `-C` for TLS mode or `-N o` for plaintext; the proxy side negotiates
 per PLAN.md Phase 9 (Task 9.2).
+
+#### TDS through the proxy (Task 9.2) — token as the username
+
+The proxy answers the client PRELOGIN with `ENCRYPT_NOT_SUP` when the data
+plane runs plaintext (`tls.enabled: false`) — a mandatory-encryption client
+(bare sqlcmd, no `-N o`) aborts cleanly, `-N o` proceeds plaintext. With
+`tls.enabled: true` it answers `ENCRYPT_ON` and the client MUST upgrade.
+sqlcmd connects to the same shared port as MySQL/PostgreSQL — the
+dispatcher detects TDS by the client-first PRELOGIN byte (0x12). The token
+goes in the USERNAME field; the password is ignored (`-P x`). The token's
+`db_ip`/`db_port` select the backend (mssql preset → `127.0.0.1:1434`):
+
+```bash
+# token for the mssql preset (Control Plane must be running):
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token -H "X-Api-Key: dev-ke...-me" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+# plaintext plane:  expect `1` / `(1 rows affected)`, exit 0
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S host.docker.internal,3306 -U "$TOKEN" -P x -N o -Q "SELECT 1"
+# TLS plane (ZT_TLS_ENABLED=true):  same result with -C (0x12-wrapped upgrade)
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S host.docker.internal,3306 -U "$TOKEN" -P x -C -Q "SELECT 1"
+# wrong/expired token → canonical 18456, exit 1 (renders EXACTLY like the
+# real server's own rejection — round-9 verified byte-for-byte):
+docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S host.docker.internal,3306 -U sess_badbadbadbadbadbadbadbadbadb -P x -N o -Q "SELECT 1"
+# → Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sess_badbad…'.  (exit 1)
+```
+
+TDS wiring notes (all pinned by live captures, rounds 6-9):
+- **0x12-wrapped TLS upgrade**: the TLS handshake does NOT run raw — the
+  client wraps every handshake record in a TDS packet type 0x12 (PRELOGIN);
+  the server answers the same way. The proxy's `tdsTLSConn` seam
+  strips/re-adds that framing for `tls.Conn`. Post-handshake the LOGIN7 and
+  everything after travel as **bare TLS records** (no TDS header) — the
+  seam switches to pass-through (`bare`) after `HandshakeContext`.
+- **TLS 1.2 only on the client leg**: the real SQL Server 2022 negotiates
+  TLS 1.2 (cipher c02f); the proxy pins `MaxVersion: TLS 1.2` so the
+  client leg's framing stays 0x12-wrapped through the whole handshake (a
+  TLS 1.3 ServerHello flips mid-handshake to bare records — a mixed stream
+  real ODBC 18 clients cannot follow). The backend leg negotiates whatever
+  the backend offers.
+- **Derived obfuscation**: the backend LOGIN7 password is NOT sent in the
+  clear — it is XOR-obfuscated with the per-login magic key derived from
+  the client's own obfuscation fields (the `ClientProgVer`/`ClientPID`/…
+  block), exactly like the real client does for its own password. The
+  client leg's LOGIN7 is rewritten: token → real `db_user`, dummy password
+  → resolver password (obfuscated), `database` field kept. The token value
+  itself never leaves the data plane's valkey GETDEL.
+- **Login failure shape**: `ERROR` token 18456 (class 14/state 1) with the
+  `US_VARCHAR` message length in UTF-16 code units, `B_VARCHAR`
+  server/proc names, then `DONE` status 0x0002 and connection close —
+  byte-identical to the real server's rejection (round-8/9 captures).
+- Login response relay is byte-exact; the backend's LOGINACK/ENVCHANGE/DONE
+  are passed through verbatim (only the TDS envelope is rebuilt).
 
 ---
 

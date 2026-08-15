@@ -248,6 +248,7 @@ func TestSessionCapturePublish(t *testing.T) {
 
 	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-6-2", DBUser: "ro_user"}
 
 	// ERR response → status error + server message, stmt classified.

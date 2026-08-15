@@ -381,6 +381,7 @@ func TestPGSessionCapturePublish(t *testing.T) {
 
 	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
 
@@ -455,6 +456,7 @@ func TestPGSessionStaleCaptureGuard(t *testing.T) {
 
 	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
 
@@ -509,6 +511,7 @@ func TestPGSessionReadyForQuerySafetyPublish(t *testing.T) {
 
 	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
 
@@ -546,6 +549,7 @@ func TestPGSessionFlushOnClose(t *testing.T) {
 
 	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
 	s := newPGTestSession()
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "pg-user", TicketID: "T-6-3", DBUser: "ro_user"}
 	cache := newStmtCache()
 

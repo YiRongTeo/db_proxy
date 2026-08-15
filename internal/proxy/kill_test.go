@@ -98,7 +98,7 @@ func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
 func TestKillerKillsOnEitherPlane(t *testing.T) {
 	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
-	k := NewKiller(mysql, pg)
+	k := NewKiller(mysql, pg, nil)
 
 	mc, mcPeer := net.Pipe()
 	mb, mbPeer := net.Pipe()
@@ -274,6 +274,7 @@ func TestMySQLKillSessionLive(t *testing.T) {
 		t.Fatalf("session_id = %q, want sid- prefix", ev.SessionID)
 	}
 	sid := ev.SessionID
+	cleanupLiveRecord(t, vs, sid)
 
 	// Negative: unknown id → false, and the session is unaffected (the next
 	// query still round-trips).
@@ -291,6 +292,8 @@ func TestMySQLKillSessionLive(t *testing.T) {
 	// Session B — the observer. Count backend conns on the MySQL server
 	// (excluding B's own): the victim's backend conn must be there.
 	clientB := dialTestMySQLSession(t, ln, tokenB)
+	sidB := recvSessionEvent(t, out).SessionID // B's started (first event after the dial)
+	cleanupLiveRecord(t, vs, sidB)
 	count := func() int {
 		t.Helper()
 		q := "SELECT COUNT(*) FROM information_schema.processlist WHERE user='ro_user' AND id <> CONNECTION_ID()"
@@ -423,6 +426,8 @@ func TestKillIsolationLive(t *testing.T) {
 	}
 	clientA, sidA := connect(tokenA, outA)
 	clientB, sidB := connect(tokenB, outB)
+	cleanupLiveRecord(t, vs, sidA)
+	cleanupLiveRecord(t, vs, sidB)
 
 	// Both clients go into long server-side SLEEPs (SLEEP blocks in MySQL, so
 	// each session is genuinely in-flight mid-query when the kill lands).
@@ -487,6 +492,7 @@ func TestKillIsolationLive(t *testing.T) {
 	}
 
 	// 3. A THIRD fresh session connects and queries fine after the kill.
+	outC := sub("queries:iso-c")
 	clientC := dialTestMySQLSession(t, ln, tokenC)
 	if err := writeMySQLPacket(clientC, 0, append([]byte{cmdQuery}, "SELECT 'fresh-ok'"...)); err != nil {
 		t.Fatalf("write C SELECT: %v", err)
@@ -501,6 +507,8 @@ func TestKillIsolationLive(t *testing.T) {
 	if v, ok := decodeLenencString(rows[0]); !ok || v != "fresh-ok" {
 		t.Fatalf("C SELECT cell = %q (ok=%v), want \"fresh-ok\"", v, ok)
 	}
+	sidC := recvSessionEvent(t, outC).SessionID
+	cleanupLiveRecord(t, vs, sidC)
 }
 
 // --- Task 8.3: two-level kill — ctl:kill mode parsing + dispatch ------------
@@ -512,7 +520,7 @@ func TestKillIsolationLive(t *testing.T) {
 // (("", "")), and an unknown mode is ignored ("kill: unknown mode"), never a
 // crash. With nil planes every real dispatch reports the session unknown.
 func TestHandleKillPayloadParse(t *testing.T) {
-	k := NewKiller(nil, nil)
+	k := NewKiller(nil, nil, nil)
 	cases := []struct {
 		name string
 		msg  string
@@ -619,7 +627,7 @@ func TestKillerKillQueryFanOut(t *testing.T) {
 	var mysqlLog, pgLog bytes.Buffer
 	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(&mysqlLog, nil)), nil, &ConfigCredResolver{}, nil)
 	pg := NewPGProxy(slog.New(slog.NewTextHandler(&pgLog, nil)), nil, &ConfigCredResolver{}, nil)
-	k := NewKiller(mysql, pg)
+	k := NewKiller(mysql, pg, nil)
 
 	pg.registerSession(&pgSession{id: "sid-pg", threadID: 0})
 
@@ -821,17 +829,20 @@ func TestMySQLKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil))
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	clientA, sidA := killTestConnect(t, ln, tokenA, outA)
 	clientB, sidB := killTestConnect(t, ln, tokenB, outB)
+	cleanupLiveRecord(t, vs, sidA)
+	cleanupLiveRecord(t, vs, sidB)
 
 	// Lock holder C: a THIRD proxy session (its sid is not needed). It
 	// acquires the named lock first, so A's GET_LOCK below genuinely
 	// blocks in the backend — a kill-abortable in-flight query. The lock
 	// name is unique per run: a lock left behind by a crashed earlier run
 	// must not poison this one.
+	outC := killTestUserSub(t, vs, "kq-c")
 	clientC := dialTestMySQLSession(t, ln, tokenC)
 	lockName := fmt.Sprintf("kq8-%d", time.Now().UnixNano())
 	if err := writeMySQLPacket(clientC, 0, append([]byte{cmdQuery}, "SELECT GET_LOCK('"+lockName+"', 60)"...)); err != nil {
@@ -847,6 +858,8 @@ func TestMySQLKillQueryLive(t *testing.T) {
 	if v, ok := decodeLenencString(rows[0]); !ok || v != "1" {
 		t.Fatalf("holder C GET_LOCK cell = %q (ok=%v), want \"1\"", v, ok)
 	}
+	sidC := recvSessionEvent(t, outC).SessionID
+	cleanupLiveRecord(t, vs, sidC)
 
 	// A: SELECT GET_LOCK('<lockName>', 60) — the kill-query victim: C owns
 	// the lock, so A's statement blocks in the backend. B: SELECT SLEEP(8)
@@ -1009,18 +1022,20 @@ func TestMySQLKillConnectionLive(t *testing.T) {
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxyAny(t, vs, &logBuf)
 	addr := killTestAddr(ln)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil))
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	// Bystander B: connects and round-trips BEFORE the kill.
 	clientB := dialTestMySQLSessionAt(t, addr, tokenB)
+	sidB := recvSessionEvent(t, outB).SessionID // B's started (published at dial)
+	cleanupLiveRecord(t, vs, sidB)
 	if err := writeMySQLPacket(clientB, 0, append([]byte{cmdQuery}, "SELECT 1"...)); err != nil {
 		t.Fatalf("write B SELECT 1: %v", err)
 	}
 	if _, err := readTextResultSet(clientB); err != nil {
 		t.Fatalf("read B result set: %v", err)
 	}
-	recvQueryEvent(t, outB) // B's SELECT 1 event (drain; session id not needed)
+	recvQueryEvent(t, outB) // B's SELECT 1 event (drain)
 
 	// Victim A: the real mysql C client inside the mysql-test container,
 	// running SELECT SLEEP(60) through the proxy.
@@ -1111,7 +1126,7 @@ func TestPGKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p, done := startPGKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), p)
+	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), p, nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	token := pgLiveToken(t, vs)

@@ -85,6 +85,7 @@ func TestMySQLQueryLoggingContextAlways(t *testing.T) {
 	vs := proxyTestStore(t)
 	p := NewMySQLProxy(cap.logger(), vs, &ConfigCredResolver{}, nil) // flag off (default)
 	s := &mysqlSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user"}
 
 	p.sniffCommand(s, cmdQuery, []byte("SELECT id FROM demo_items"), tok, "127.0.0.1:1")
@@ -116,6 +117,7 @@ func TestMySQLQueryLoggingOutputFlag(t *testing.T) {
 	p := NewMySQLProxy(cap.logger(), vs, &ConfigCredResolver{}, nil)
 	p.SetLogQueryOutput(true)
 	s := &mysqlSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user"}
 
 	p.sniffCommand(s, cmdQuery, []byte("SELECT id FROM demo_items"), tok, "127.0.0.1:1")
@@ -159,6 +161,7 @@ func TestPGQueryLoggingContextAlways(t *testing.T) {
 	vs := proxyTestStore(t)
 	p := NewPGProxy(cap.logger(), vs, &ConfigCredResolver{}, nil) // flag off (default)
 	s := &pgSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "bob", TicketID: "T-8-8b", DBUser: "ro_user"}
 
 	p.sniffPGMessage(&pgproto3.Query{String: "SELECT id FROM demo_items"}, newStmtCache(), s, tok, "127.0.0.1:1")
@@ -187,6 +190,7 @@ func TestPGQueryLoggingOutputFlag(t *testing.T) {
 	p := NewPGProxy(cap.logger(), vs, &ConfigCredResolver{}, nil)
 	p.SetLogQueryOutput(true)
 	s := &pgSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
+	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "bob", TicketID: "T-8-8b", DBUser: "ro_user"}
 
 	p.sniffPGMessage(&pgproto3.Query{String: "SELECT id FROM demo_items"}, newStmtCache(), s, tok, "127.0.0.1:1")

@@ -20,6 +20,7 @@ type SessionKiller interface {
 var (
 	_ SessionKiller = (*MySQLProxy)(nil)
 	_ SessionKiller = (*PGProxy)(nil)
+	_ SessionKiller = (*MSSQLProxy)(nil)
 	_ SessionKiller = (*Killer)(nil)
 )
 
@@ -37,24 +38,25 @@ const (
 // read. The ctl:kill subscriber must never block on a dead backend.
 const killQueryTimeout = 10 * time.Second
 
-// Killer fans a ctl:kill request out to both proxies' registries. Session ids
-// are generated per proxy ("sid-" + random hex), so a live session lives on
-// exactly one plane — but the ctl:kill subscriber (Task 6.4) does not know
-// which protocol a session uses, so it asks both. Both are always tried so an
-// (astronomically unlikely) id collision on the other plane cannot leave a
-// session alive; KillSession/KillQuery are fast mutex-guarded map lookups on
-// a miss.
+// Killer fans a ctl:kill request out to the MySQL, PostgreSQL and MSSQL
+// proxies' registries. Session ids are generated per proxy ("sid-" + random
+// hex), so a live session lives on exactly one plane — but the ctl:kill
+// subscriber (Task 6.4) does not know which protocol a session uses, so it
+// asks all of them. All are always tried so an (astronomically unlikely) id
+// collision on another plane cannot leave a session alive;
+// KillSession/KillQuery are fast mutex-guarded map lookups on a miss.
 type Killer struct {
 	mysql SessionKiller
 	pg    SessionKiller
+	mssql SessionKiller // Task 9.2: TDS sessions (kill-query N/A until 9.4)
 }
 
-func NewKiller(mysql, pg SessionKiller) *Killer {
-	return &Killer{mysql: mysql, pg: pg}
+func NewKiller(mysql, pg, mssql SessionKiller) *Killer {
+	return &Killer{mysql: mysql, pg: pg, mssql: mssql}
 }
 
 // KillSession tries the MySQL registry first, then the PostgreSQL registry,
-// and reports whether either plane had the session.
+// then the MSSQL registry, and reports whether any plane had the session.
 func (k *Killer) KillSession(id string) bool {
 	killed := false
 	if k.mysql != nil && k.mysql.KillSession(id) {
@@ -63,20 +65,27 @@ func (k *Killer) KillSession(id string) bool {
 	if k.pg != nil && k.pg.KillSession(id) {
 		killed = true
 	}
+	if k.mssql != nil && k.mssql.KillSession(id) {
+		killed = true
+	}
 	return killed
 }
 
-// KillQuery tries to abort the in-flight query of the session on either
-// plane, WITHOUT touching the session itself (Task 8.3). Reports whether
-// either plane accepted the kill-query — i.e. the session exists, has a
-// captured thread id, and the backend acknowledged the abort. Failure
-// reasons are logged by the plane's KillQuery.
+// KillQuery tries to abort the in-flight query of the session on any plane,
+// WITHOUT touching the session itself (Task 8.3). Reports whether any plane
+// accepted the kill-query — i.e. the session exists, has a captured thread
+// id, and the backend acknowledged the abort. Failure reasons are logged by
+// the plane's KillQuery (the MSSQL plane refuses until Task 9.4 wires the
+// ATTENTION packet).
 func (k *Killer) KillQuery(id string) bool {
 	killed := false
 	if k.mysql != nil && k.mysql.KillQuery(id) {
 		killed = true
 	}
 	if k.pg != nil && k.pg.KillQuery(id) {
+		killed = true
+	}
+	if k.mssql != nil && k.mssql.KillQuery(id) {
 		killed = true
 	}
 	return killed

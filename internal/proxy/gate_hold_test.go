@@ -42,9 +42,25 @@ func holdMySQLProxy(t *testing.T, vs *store.ValkeyStore, seconds int) *MySQLProx
 // (clear-then-list on the shared dev Valkey) races those lingering records.
 // Registered for EVERY fake session so no future gate test can leak one
 // (DelSessionLive on an absent key is a no-op).
+//
+// Round-11 race fix: the DEL cannot be a single shot. For a REAL session
+// whose handleConn goroutine is still tearing down when the cleanup runs
+// (the conn-close cleanups registered before this one run AFTER it — LIFO),
+// the teardown defers publish one final event — flushPendingOnClose re-arms
+// sess:live:<sid> via SetSessionLive BEFORE finishSession deletes it — so
+// the record can reappear moments after the first DEL. Settle past that
+// teardown (the re-arm + finishSession DEL complete within milliseconds of
+// the conn close), then DEL again: whatever the ordering, the key is gone by
+// the time the next test — or a parallel package binary — scans the
+// directory. For fake sessions the second DEL is a cheap no-op.
 func cleanupLiveRecord(t *testing.T, vs *store.ValkeyStore, sid string) {
 	t.Helper()
-	t.Cleanup(func() { _ = vs.DelSessionLive(context.Background(), sid) })
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_ = vs.DelSessionLive(ctx, sid)
+		time.Sleep(200 * time.Millisecond)
+		_ = vs.DelSessionLive(ctx, sid)
+	})
 }
 
 // --- unit: queue bounds ----------------------------------------------------
