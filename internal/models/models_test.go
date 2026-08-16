@@ -307,6 +307,28 @@ func TestQueryEventSessionBackwardCompatNoNewKeys(t *testing.T) {
 func TestSessionRoundTrip(t *testing.T) {
 	roundTrip(t, Session{
 		Username: "bob.ad",
-		Expires:  time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC),
 	})
+}
+
+// TestNewEventID (Task 9.9): NewEventID returns the 16-hex event id format
+// the control plane publishes in lifecycle events — same generator family
+// as NewSessionID (deduplicated via randomHex), distinct values per call.
+func TestNewEventID(t *testing.T) {
+	a, b := NewEventID(), NewEventID()
+	for _, id := range []string{a, b} {
+		if len(id) != 16 {
+			t.Errorf("NewEventID() = %q, want 16 hex chars", id)
+		}
+		for _, c := range id {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				t.Errorf("NewEventID() = %q contains non-hex char %q", id, c)
+			}
+		}
+	}
+	if a == b {
+		t.Errorf("NewEventID() twice = %q, want distinct values", a)
+	}
+	if !strings.HasPrefix(NewSessionID(), "sid-") {
+		t.Errorf("NewSessionID() = %q, want sid- prefix", NewSessionID())
+	}
 }

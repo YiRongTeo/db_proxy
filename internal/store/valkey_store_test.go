@@ -18,9 +18,11 @@ const testAddr = "127.0.0.1:6379"
 
 func newTestStore(t *testing.T) *ValkeyStore {
 	t.Helper()
-	s, err := NewValkeyStoreDirect(context.Background(), testAddr, "", 0)
+	// Package-internal tests build the store directly (storetest would
+	// create an import cycle: storetest imports store).
+	s, err := NewValkeyStore(context.Background(), StoreOptions{Addrs: []string{testAddr}})
 	if err != nil {
-		t.Fatalf("NewValkeyStoreDirect(%q): %v", testAddr, err)
+		t.Fatalf("NewValkeyStore(%q): %v", testAddr, err)
 	}
 	t.Cleanup(s.Close)
 	return s
@@ -46,8 +48,28 @@ func cleanupKey(t *testing.T, s *ValkeyStore, key string) {
 
 // TestWatchPresence (Task 8.6): SetWatch makes WatchActive true with a TTL
 // lease, a refresh re-arms the lease, DelWatch removes presence, and
-// WatchTTL reports 0 for an absent key (never negative).
-func TestWatchPresence(t *testing.T) {
+// --- watch presence (Task 8.6 + Task 9.9 reference counting) ----------------
+
+// watchLeaseTTL reads the TTL of a specific lease key (same-package test
+// helper; the production surface deliberately exposes no TTL reader).
+func watchLeaseTTL(t *testing.T, s *ValkeyStore, key string) time.Duration {
+	t.Helper()
+	secs, err := s.client.Do(context.Background(), s.client.B().Ttl().Key(key).Build()).AsInt64()
+	if err != nil {
+		t.Fatalf("TTL(%s): %v", key, err)
+	}
+	if secs < 0 {
+		return 0 // -1 no expiry / -2 missing — neither is a valid lease
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// TestWatchPresenceRefcounted (Task 9.9 CRITICAL b): presence is
+// reference-counted PER CONNECTION — with two watchers on the same session,
+// removing the FIRST connection's lease must NOT close the gate while the
+// second watcher still holds a key; only the last disconnect clears
+// presence.
+func TestWatchPresenceRefcounted(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	sid := uniqueSid(t)
@@ -60,73 +82,89 @@ func TestWatchPresence(t *testing.T) {
 	if active {
 		t.Error("WatchActive before set = true, want false")
 	}
-	ttl, err := s.WatchTTL(ctx, sid)
-	if err != nil {
-		t.Fatalf("WatchTTL before set: %v", err)
-	}
-	if ttl != 0 {
-		t.Errorf("WatchTTL before set = %v, want 0", ttl)
-	}
 
-	if err := s.SetWatch(ctx, sid, 30*time.Second); err != nil {
-		t.Fatalf("SetWatch: %v", err)
+	// First checker connects.
+	if err := s.SetWatchConn(ctx, sid, "conn-1", 30*time.Second); err != nil {
+		t.Fatalf("SetWatchConn conn-1: %v", err)
 	}
 	active, err = s.WatchActive(ctx, sid)
 	if err != nil {
-		t.Fatalf("WatchActive after set: %v", err)
+		t.Fatalf("WatchActive after conn-1: %v", err)
 	}
 	if !active {
-		t.Error("WatchActive after set = false, want true")
+		t.Fatal("WatchActive after conn-1 = false, want true")
 	}
-	ttl, err = s.WatchTTL(ctx, sid)
-	if err != nil {
-		t.Fatalf("WatchTTL after set: %v", err)
-	}
-	if ttl <= 0 || ttl > 30*time.Second {
-		t.Errorf("WatchTTL after set = %v, want (0, 30s]", ttl)
+	// The lease key is the per-connection form watch:<sid>:<connid>.
+	if ttl := watchLeaseTTL(t, s, "watch:"+sid+":conn-1"); ttl <= 0 || ttl > 30*time.Second {
+		t.Errorf("conn-1 lease TTL = %v, want (0, 30s]", ttl)
 	}
 
-	// Refresh re-arms the lease (heartbeat semantics): TTL must not shrink.
-	if err := s.SetWatch(ctx, sid, 30*time.Second); err != nil {
-		t.Fatalf("SetWatch refresh: %v", err)
-	}
-	ttl2, err := s.WatchTTL(ctx, sid)
-	if err != nil {
-		t.Fatalf("WatchTTL after refresh: %v", err)
-	}
-	if ttl2 < ttl {
-		t.Errorf("WatchTTL shrank on refresh: %v -> %v", ttl, ttl2)
+	// Second checker connects (same session, different connection).
+	if err := s.SetWatchConn(ctx, sid, "conn-2", 30*time.Second); err != nil {
+		t.Fatalf("SetWatchConn conn-2: %v", err)
 	}
 
-	if err := s.DelWatch(ctx, sid); err != nil {
-		t.Fatalf("DelWatch: %v", err)
+	// FIRST disconnect: the gate must stay OPEN (conn-2 still watches).
+	if err := s.WatchRemoveConn(ctx, sid, "conn-1"); err != nil {
+		t.Fatalf("WatchRemoveConn conn-1: %v", err)
 	}
 	active, err = s.WatchActive(ctx, sid)
 	if err != nil {
-		t.Fatalf("WatchActive after delete: %v", err)
+		t.Fatalf("WatchActive after conn-1 remove: %v", err)
+	}
+	if !active {
+		t.Fatal("WatchActive after first disconnect = false, want true (second watcher still holds a key)")
+	}
+
+	// LAST disconnect: presence gone.
+	if err := s.WatchRemoveConn(ctx, sid, "conn-2"); err != nil {
+		t.Fatalf("WatchRemoveConn conn-2: %v", err)
+	}
+	active, err = s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive after conn-2 remove: %v", err)
 	}
 	if active {
-		t.Error("WatchActive after delete = true, want false")
-	}
-	ttl, err = s.WatchTTL(ctx, sid)
-	if err != nil {
-		t.Fatalf("WatchTTL after delete: %v", err)
-	}
-	if ttl != 0 {
-		t.Errorf("WatchTTL after delete = %v, want 0", ttl)
+		t.Error("WatchActive after last disconnect = true, want false")
 	}
 }
 
-// TestWatchPresenceTTLExpiry: an un-refreshed watch key expires on its own —
-// a crashed checker/hub cannot leave a stale "watched" state forever.
-func TestWatchPresenceTTLExpiry(t *testing.T) {
+// TestWatchLeaseRefreshExtendsTTL: refreshing a connection's lease re-arms
+// its TTL — with a 1s lease, a refresh at 0.6s keeps presence alive past
+// the original deadline (the heartbeat semantics the hub relies on).
+func TestWatchLeaseRefreshExtendsTTL(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	sid := uniqueSid(t)
 	cleanupKey(t, s, "watch:"+sid)
 
-	if err := s.SetWatch(ctx, sid, time.Second); err != nil {
-		t.Fatalf("SetWatch: %v", err)
+	if err := s.SetWatchConn(ctx, sid, "conn-1", time.Second); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if err := s.SetWatchConn(ctx, sid, "conn-1", time.Second); err != nil { // heartbeat refresh
+		t.Fatalf("SetWatchConn refresh: %v", err)
+	}
+	time.Sleep(600 * time.Millisecond) // 1.2s total > the 1s original lease
+	active, err := s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive: %v", err)
+	}
+	if !active {
+		t.Error("WatchActive after refresh = false, want true (heartbeat must re-arm the lease)")
+	}
+}
+
+// TestWatchLeaseTTLExpiry: an un-refreshed lease expires on its own — a
+// crashed checker/hub cannot leave a stale "watched" state forever.
+func TestWatchLeaseTTLExpiry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "watch:"+sid)
+
+	if err := s.SetWatchConn(ctx, sid, "conn-1", time.Second); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
 	}
 	active, err := s.WatchActive(ctx, sid)
 	if err != nil {
@@ -144,6 +182,34 @@ func TestWatchPresenceTTLExpiry(t *testing.T) {
 	}
 	if active {
 		t.Error("WatchActive after TTL expiry = true, want false")
+	}
+}
+
+// TestDelWatchClearsAllConnections: DelWatch (test/ops force-clear) removes
+// EVERY connection's lease, closing the gate even with watchers attached.
+func TestDelWatchClearsAllConnections(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "watch:"+sid)
+
+	for _, conn := range []string{"conn-a", "conn-b", "conn-c"} {
+		if err := s.SetWatchConn(ctx, sid, conn, 30*time.Second); err != nil {
+			t.Fatalf("SetWatchConn %s: %v", conn, err)
+		}
+	}
+	if err := s.DelWatch(ctx, sid); err != nil {
+		t.Fatalf("DelWatch: %v", err)
+	}
+	active, err := s.WatchActive(ctx, sid)
+	if err != nil {
+		t.Fatalf("WatchActive after DelWatch: %v", err)
+	}
+	if active {
+		t.Error("WatchActive after DelWatch = true, want false")
+	}
+	if ttl := watchLeaseTTL(t, s, "watch:"+sid+":conn-a"); ttl != 0 {
+		t.Errorf("lease conn-a TTL after DelWatch = %v, want 0", ttl)
 	}
 }
 
@@ -211,7 +277,7 @@ func TestSessionLifecycle(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	id, err := s.CreateSession(ctx, models.Session{Username: "carol", Expires: time.Now().Add(time.Hour)}, 60*time.Second)
+	id, err := s.CreateSession(ctx, models.Session{Username: "carol"}, 60*time.Second)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

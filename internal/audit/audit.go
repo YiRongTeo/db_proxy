@@ -232,11 +232,20 @@ func (w *Writer) SetChecker(ctx context.Context, sessionID, checker string) erro
 	return err
 }
 
-// ErrClosed reports whether the underlying pool is closed (used by tests to
-// prove write failures surface as errors, never panics).
-func (w *Writer) ErrClosed() error {
-	if w == nil || w.db == nil {
-		return fmt.Errorf("audit writer not initialized")
+// SweepStalePending expires pending rows whose maker never connected: every
+// status='pending' row with last_seen older than olderThan is flipped to
+// 'ended' with ended_at = now, so the audit trail terminates instead of
+// lingering 'pending' forever (review 9.9). Returns the number of rows
+// swept. Idempotent backstop, not a lock: a late real lifecycle event
+// simply re-upserts the row (SetActive/SetEnded win).
+func (w *Writer) SweepStalePending(ctx context.Context, olderThan time.Time) (int64, error) {
+	now := time.Now().UTC()
+	res, err := w.db.ExecContext(ctx,
+		"UPDATE "+w.tbl+" SET `status` = 'ended', `ended_at` = ?, `last_seen` = ? "+
+			"WHERE `status` = 'pending' AND `last_seen` < ?",
+		now, now, olderThan.UTC())
+	if err != nil {
+		return 0, err
 	}
-	return w.db.Ping()
+	return res.RowsAffected()
 }

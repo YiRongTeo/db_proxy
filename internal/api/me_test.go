@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"zerotrust-proxy/internal/config"
+	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
 
@@ -21,7 +24,7 @@ import (
 // requests exactly like a browser would.
 func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -56,6 +59,28 @@ func loginViaAPI(t *testing.T, client *http.Client, base string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/login: status %d, want 200", resp.StatusCode)
 	}
+}
+
+// sessionAs creates a UI session for user directly in Valkey and installs
+// the zt_session cookie on the client — the browser-equivalent of logging
+// in as that user. Used by tests that issue tokens for a NON-admin maker:
+// review 9.9a binds the token-request body username to the session (the
+// body must match or be rejected), while the login endpoint only ever
+// authenticates the configured admin — so a token for "audit-maker-…"
+// requires a session created for that user.
+func sessionAs(t *testing.T, client *http.Client, base string, vs *store.ValkeyStore, user string) {
+	t.Helper()
+	id, err := vs.CreateSession(context.Background(), models.Session{Username: user}, 8*time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession(%q): %v", user, err)
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse base %q: %v", base, err)
+	}
+	client.Jar.SetCookies(u, []*http.Cookie{{
+		Name: sessionCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
+	}})
 }
 
 // TestMeRequiresSession: GET /api/me without a zt_session cookie → 401.

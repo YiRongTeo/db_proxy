@@ -2,10 +2,9 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"zerotrust-proxy/internal/models"
@@ -21,18 +20,6 @@ const maxBodyBytes = 1 << 20
 // sessionLiveTTL heartbeat so pending and active records share one cadence.
 const sessionPendingTTL = 60 * time.Second
 
-// newEventID returns a random 64-bit hex id for control-plane lifecycle
-// events (mirrors the data plane's event id format). rand.Read cannot fail
-// in practice on supported platforms; the zero fallback keeps the id
-// non-empty in that pathological case.
-func newEventID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "0000000000000000"
-	}
-	return hex.EncodeToString(b)
-}
-
 // handleHealth reports Control Plane + Valkey liveness.
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := a.vs.Ping(r.Context()); err != nil {
@@ -47,10 +34,16 @@ func (a *api) handleDBPresets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.cfg.DBPresets)
 }
 
-// decodeJSON reads and decodes a JSON request body, capped at 1 MB.
-func decodeJSON(r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
-	return json.NewDecoder(r.Body).Decode(v)
+// decodeJSON reads and decodes a JSON request body, capped at 1 MB. The
+// MaxBytesReader is bound to the ResponseWriter so an oversized body aborts
+// the connection instead of dribbling, and unknown fields are REJECTED —
+// a misspelled field is a client bug, not a silently-ignored field (review
+// 9.9 MINOR).
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 // writeJSON encodes v as a JSON response with the proper Content-Type.
@@ -60,25 +53,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// sessionFromCookie resolves the UI session from the zt_session cookie when
-// present and valid, otherwise nil. handleToken is registered bare (no
-// requireSession wrapper) so it must resolve the session itself to support
-// the "API key OR session" auth model.
-func (a *api) sessionFromCookie(r *http.Request) *models.Session {
-	c, err := r.Cookie(sessionCookie)
-	if err != nil || c.Value == "" {
-		return nil
-	}
-	sess, err := a.vs.GetSession(r.Context(), c.Value)
-	if err != nil || sess == nil {
-		return nil
-	}
-	return sess
-}
-
 // handleToken issues a single-use DB token. Auth: valid API key OR UI session.
 func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
-	if sess := a.sessionFromCookie(r); sess != nil {
+	// Bare route (no requireSession wrapper): resolve the session cookie
+	// ourselves to support the "API key OR session" auth model.
+	if sess, err := a.auth.sessionFromRequest(r); err == nil && sess != nil {
 		r = r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess))
 	}
 	if !a.auth.validAPIKey(r) && sessionFrom(r) == nil {
@@ -93,24 +72,54 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		DBType   string `json:"db_type"`
 		TicketID string `json:"ticket_id,omitempty"`
 	}
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 		return
 	}
-	if sess := sessionFrom(r); sess != nil && req.Username == "" {
+	// Review 9.9 CRITICAL (a): a session-authenticated requester's username
+	// is BOUND to the session. The body username (if present) must match the
+	// session's — otherwise the request is rejected — and the token is
+	// ALWAYS issued for the session username. Only the API-key path (no
+	// session) trusts the body.
+	if sess := sessionFrom(r); sess != nil {
+		if req.Username != "" && req.Username != sess.Username {
+			http.Error(w, `{"error":"username does not match session"}`, http.StatusBadRequest)
+			return
+		}
 		req.Username = sess.Username
 	}
+	req.Username = strings.TrimSpace(req.Username)
 	if req.Username == "" || req.DBUser == "" || req.DBIP == "" || req.DBPort == "" {
 		http.Error(w, `{"error":"missing required fields"}`, http.StatusBadRequest)
 		return
 	}
 	// Spec amendment 9b: every token must be traceable to a ticket.
+	// Review 9.9 MINOR: ticket_id is also shape-validated — it lands in
+	// audit rows and event payloads, so no whitespace/control characters and
+	// a bounded length.
 	if req.TicketID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ticket_id required"})
 		return
 	}
+	tid := strings.TrimSpace(req.TicketID)
+	if len(tid) > 128 || strings.ContainsAny(tid, " 	\r\n") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ticket_id"})
+		return
+	}
+	req.TicketID = tid
 	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" {
 		http.Error(w, `{"error":"db_type must be mysql, postgres or mssql"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	// Review 9.9 MINOR: issuance throttle — bound token minting. Session
+	// requests are keyed by the (bound) username; API-key requests by the
+	// client IP (the key is shared, the IP is the only per-client signal).
+	issueKey := req.Username
+	if sessionFrom(r) == nil {
+		issueKey = clientIP(r)
+	}
+	if a.issueLimiter.blocked(issueKey, time.Now()) {
+		http.Error(w, `{"error":"token issuance rate limited"}`, http.StatusTooManyRequests)
 		return
 	}
 	token, err := store.NewToken()
@@ -133,6 +142,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
+	a.issueLimiter.hit(issueKey, time.Now())
 	// The token is stored; now list the session at issue time (pending
 	// directory record + action=issued lifecycle event). Best-effort — a
 	// directory/pubsub hiccup must not fail an already-stored token, but
@@ -197,7 +207,7 @@ func (a *api) recordPendingSession(ctx context.Context, p *models.TokenPayload) 
 		a.log.Error("pending session record store", "err", err, "session_id", p.SessionID)
 	}
 	ev := models.QueryEvent{
-		ID:        newEventID(),
+		ID:        models.NewEventID(),
 		Ts:        now,
 		Kind:      "session",
 		Action:    "issued",
@@ -247,10 +257,19 @@ func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
 		SessionID string `json:"session_id"`
 		Mode      string `json:"mode"`
 	}
-	if err := decodeJSON(r, &req); err != nil || req.SessionID == "" {
+	if err := decodeJSON(w, r, &req); err != nil || req.SessionID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id required"})
 		return
 	}
+	// Review 9.9 MINOR: session_id shape validation — it becomes the ctl:kill
+	// channel payload key, so no whitespace/control characters and a bounded
+	// length.
+	sid := strings.TrimSpace(req.SessionID)
+	if len(sid) > 64 || strings.ContainsAny(sid, " 	\r\n") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid session_id"})
+		return
+	}
+	req.SessionID = sid
 	mode := req.Mode
 	if mode == "" {
 		mode = "connection"

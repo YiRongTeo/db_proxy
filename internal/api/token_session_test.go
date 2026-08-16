@@ -203,9 +203,9 @@ func assertIssuedEvent(t *testing.T, ev models.QueryEvent, user, dbUser, dbType,
 // payload — the data plane adopts it when the maker connects.
 func TestTokenIssueListsPendingSession(t *testing.T) {
 	srv, client, vs := newPresetTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
 	ctx := context.Background()
-
+	// Review 9.9a: the token is issued for the SESSION user — each case
+	// creates a session for its maker instead of the shared admin login.
 	// The per-session channel must be subscribed BEFORE issuing — the sid
 	// is generated inside handleToken.
 	sessPat := subscribePatternAPI(t, vs, "queries:sess:*")
@@ -218,6 +218,7 @@ func TestTokenIssueListsPendingSession(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			sessionAs(t, client, srv.URL, vs, tc.user)
 			userCh := subscribeAPI(t, vs, "queries:"+tc.user)
 			body := fmt.Sprintf(`{"username":%q,"db_user":%q,"db_ip":"127.0.0.1","db_port":"3307","db_type":%q,"ticket_id":"T-8-11"}`,
 				tc.user, tc.dbUser, tc.dbType)

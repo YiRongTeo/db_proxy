@@ -33,9 +33,9 @@ import (
 // raw *sql.DB for row assertions.
 func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *sql.DB) {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
-		t.Fatalf("NewValkeyStoreDirect: %v", err)
+		t.Fatalf("NewValkeyStore: %v", err)
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
@@ -202,9 +202,11 @@ func issueAuditToken(t *testing.T, client *http.Client, srv *httptest.Server, vs
 // as the issue returns 200.
 func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 	srv, client, vs, db := newAuditTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
 
 	user := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
+	// Review 9.9a: the token is issued for the SESSION user — the maker
+	// under test needs its own session (the login endpoint only knows admin).
+	sessionAs(t, client, srv.URL, vs, user)
 	sid := issueAuditToken(t, client, srv, vs, user, "ro_user", "T-9-7")
 
 	r := fetchAuditRow(t, db, sid)
@@ -240,9 +242,10 @@ func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 // status ended + ended_at.
 func TestAuditLifecycleConsumer(t *testing.T) {
 	srv, client, vs, db := newAuditTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
 
 	user := fmt.Sprintf("audit-lc-%d", time.Now().UnixNano())
+	// Review 9.9a: the token is issued for the SESSION user.
+	sessionAs(t, client, srv.URL, vs, user)
 	sid := issueAuditToken(t, client, srv, vs, user, "rw_user", "T-LC")
 
 	started := time.Now().UTC()
@@ -277,19 +280,21 @@ func TestAuditLifecycleConsumer(t *testing.T) {
 
 // TestWSCheckerAuditAttachDetach (Task 9.7 live): a checker subscribing with
 // channel=sess:<sid> writes checker_username=<checker>; disconnecting clears
-// it to NULL. The checker identity comes from the WS session (admin).
+// it to NULL. The checker identity comes from the WS session (here: the
+// maker's own session — the same browser watches the session it issued).
 func TestWSCheckerAuditAttachDetach(t *testing.T) {
 	srv, client, vs, db := newAuditTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
 
 	user := fmt.Sprintf("audit-ws-%d", time.Now().UnixNano())
+	// Review 9.9a: the token is issued for the SESSION user.
+	sessionAs(t, client, srv.URL, vs, user)
 	sid := issueAuditToken(t, client, srv, vs, user, "ro_user", "T-WS")
 
 	cookie := wsSessionCookie(t, srv, client)
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
 
 	waitAudit(t, db, sid, "checker attach",
-		func(r auditRow) bool { return r.checker.Valid && r.checker.String == "admin" }, nil)
+		func(r auditRow) bool { return r.checker.Valid && r.checker.String == user }, nil)
 	r := fetchAuditRow(t, db, sid)
 	if r.status != "pending" {
 		t.Errorf("checker attach clobbered status = %q, want pending (no session yet)", r.status)

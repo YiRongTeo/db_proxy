@@ -21,7 +21,7 @@ import (
 // wired into the config, so handleToken can resolve access levels.
 func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore) {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}

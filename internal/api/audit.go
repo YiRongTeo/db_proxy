@@ -84,21 +84,59 @@ func (a *api) auditLifecycleEvent(ctx context.Context, ev models.QueryEvent) {
 	}
 }
 
+// auditSweepEvery is the pending-row sweeper cadence (review 9.9): pending
+// audit rows (token issued, maker never connected) are expired to 'ended'
+// once their last_seen is older than sessionPendingTTL. Tests shorten the
+// cadence via the api.auditSweepEvery field (zero → this default).
+const auditSweepEvery = 30 * time.Second
+
+// RunAuditSweeper periodically expires stale pending audit rows: rows whose
+// maker never connected within sessionPendingTTL are flipped to 'ended' by
+// the writer (SweepStalePending), keeping the audit trail terminated. It
+// runs until ctx is cancelled; no-op when audit is disabled (no writer, no
+// goroutine work). Events lost during a pub/sub gap are healed by the same
+// sweep — a pending row that never became active is ended on the next pass.
+func (a *api) RunAuditSweeper(ctx context.Context) {
+	if a.audit == nil {
+		return
+	}
+	every := a.auditSweepEvery
+	if every <= 0 {
+		every = auditSweepEvery
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			n, err := a.audit.SweepStalePending(ctx, time.Now().Add(-sessionPendingTTL))
+			if err != nil {
+				a.log.Error("audit sweep stale pending", "err", err)
+				continue
+			}
+			if n > 0 {
+				a.log.Info("audit sweep expired stale pending rows", "rows", n)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // RunAuditLifecycle consumes the hub's per-session lifecycle channel pattern
 // (queries:sess:*, where the Control Plane and Data Plane publish
 // kind=session issued/started/ended events) and mirrors started/ended into
 // the audit writer. Blocks until ctx is canceled; only meaningful when audit
-// is enabled (no-op otherwise — no subscription, zero overhead).
+// is enabled (no-op otherwise — no subscription, zero overhead). The
+// subscription is resilient: subscribeLoop resubscribes with backoff on
+// transient failures (review 9.9), and events lost during a gap are healed
+// by the pending-audit sweeper.
 func (a *api) RunAuditLifecycle(ctx context.Context) {
 	if a.audit == nil {
 		return
 	}
 	out := make(chan []byte, 256)
-	go func() {
-		if err := a.vs.Subscribe(ctx, "queries:sess:*", true, out); err != nil && ctx.Err() == nil {
-			a.log.Warn("audit lifecycle subscribe ended", "err", err)
-		}
-	}()
+	go a.subscribeLoop(ctx, "queries:sess:*", true, out)
 	for {
 		select {
 		case m := <-out:

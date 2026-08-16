@@ -94,22 +94,38 @@ func main() {
 		// Consume the hub's queries:sess:* lifecycle events (started/ended)
 		// into the audit writer for the process lifetime.
 		go apiSrv.RunAuditLifecycle(ctx)
+		// Review 9.9: expire stale pending audit rows (token issued, maker
+		// never connected) on a timer — the audit trail must terminate.
+		go apiSrv.RunAuditSweeper(ctx)
 	}
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: apiSrv.Routes()}
+	// Review 9.9: server timeouts — bounded header/body reads (slowloris
+	// hardening), bounded response writes and a keep-alive idle window.
+	// WebSocket connections are exempt: hijacked conns bypass WriteTimeout,
+	// and the hub applies its own per-write deadlines (watchWriteTimeout).
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           apiSrv.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
+	}
 
 	go func() {
 		if cfg.TLS != nil && cfg.TLS.Enabled {
 			log.Info("control plane listening (https)", "addr", cfg.HTTPAddr)
 			if err := srv.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// Review 9.9c: a bind/serve failure must FAIL FAST — the old
+				// cancel()-only path left main blocked on <-stop forever.
 				log.Error("https", "err", err)
-				cancel()
+				os.Exit(1)
 			}
 			return
 		}
 		log.Info("control plane listening", "addr", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "err", err)
-			cancel()
+			os.Exit(1)
 		}
 	}()
 	stop := make(chan os.Signal, 1)

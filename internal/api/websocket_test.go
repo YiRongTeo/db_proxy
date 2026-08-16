@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -25,7 +26,7 @@ import (
 // watch keys it maintains.
 func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore) {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -115,26 +116,25 @@ func TestWSCheckerWatchPresenceOnSubscribe(t *testing.T) {
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
 
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
-	pollWatch(t, vs, sid, true) // subscribe → key exists
+	pollWatch(t, vs, sid, true) // subscribe → lease exists (gate probe sees the watch)
 
-	// The presence lease is live (TTL set, > 0).
-	ttl, err := vs.WatchTTL(context.Background(), sid)
-	if err != nil {
-		t.Fatalf("WatchTTL: %v", err)
-	}
-	if ttl <= 0 || ttl > 2*time.Second {
-		t.Errorf("WatchTTL = %v, want (0, 2s]", ttl)
-	}
+	// Lease TTL semantics are covered at the store level (watchLeaseTTL in
+	// valkey_store_test.go); the API test proves the WIRING: subscribe arms
+	// the presence and disconnect clears it.
 
 	// Disconnect → key gone.
 	_ = c.Close(websocket.StatusNormalClosure, "")
 	pollWatch(t, vs, sid, false)
 }
 
-// TestWSCheckerWatchHeartbeatRefreshesTTL (Task 8.6): while the checker
-// stays connected the hub refreshes the lease every heartbeat. With a 2s
-// lease and a 200ms heartbeat, the TTL must still be near-full after 1.2s —
-// an un-refreshed key would have decayed to ~0.8s.
+// TestWSCheckerWatchHeartbeatRefreshesTTL (Task 8.6, review 9.9): while the
+// checker stays connected the hub refreshes its lease every heartbeat. With
+// a 2s lease and a 200ms heartbeat the lease must SURVIVE past its own TTL —
+// an un-refreshed key would expire ~2s after subscribe. So the connection
+// stays up 2.5s (> lease TTL) and the gate probe must STILL see the watch:
+// the heartbeat kept re-arming the key. (TTL introspection lives at the
+// store level — watchLeaseTTL in valkey_store_test.go; this test proves the
+// hub's refresh loop actually runs.)
 func TestWSCheckerWatchHeartbeatRefreshesTTL(t *testing.T) {
 	srv, client, vs := newWatchTestServer(t)
 	loginViaAPI(t, client, srv.URL)
@@ -147,14 +147,14 @@ func TestWSCheckerWatchHeartbeatRefreshesTTL(t *testing.T) {
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
 	pollWatch(t, vs, sid, true)
 
-	time.Sleep(1200 * time.Millisecond) // ~6 heartbeat ticks
+	time.Sleep(2500 * time.Millisecond) // ~12 heartbeat ticks, past the 2s lease TTL
 
-	ttl, err := vs.WatchTTL(context.Background(), sid)
+	active, err := vs.WatchActive(context.Background(), sid)
 	if err != nil {
-		t.Fatalf("WatchTTL: %v", err)
+		t.Fatalf("WatchActive: %v", err)
 	}
-	if ttl < 1500*time.Millisecond {
-		t.Errorf("WatchTTL after 1.2s connected = %v, want >= 1.5s (heartbeat must refresh the lease)", ttl)
+	if !active {
+		t.Error("watch lease expired while the checker stayed connected — heartbeat did not refresh it")
 	}
 	_ = c.Close(websocket.StatusNormalClosure, "")
 	pollWatch(t, vs, sid, false)
@@ -218,5 +218,94 @@ func TestWSCheckerWatchMalformedChannelHoldsNoKey(t *testing.T) {
 	}
 	for _, c := range []*websocket.Conn{conn1, conn2, conn3} {
 		_ = c.Close(websocket.StatusNormalClosure, "")
+	}
+}
+
+// TestWSCheckerWatchRefcountDisconnectSafety (review 9.9 CRITICAL b, hub
+// wiring): presence is reference-counted per connection — with TWO checkers
+// watching the same session, the FIRST disconnect must NOT close the gate
+// while the second still watches; only the last disconnect clears presence.
+// (The store-level lease math is covered by TestWatchPresenceRefcounted;
+// this test proves the hub's SetWatchConn/WatchRemoveConn wiring end to end.)
+func TestWSCheckerWatchRefcountDisconnectSafety(t *testing.T) {
+	srv, client, vs := newWatchTestServer(t)
+	loginViaAPI(t, client, srv.URL)
+	cookie := wsSessionCookie(t, srv, client)
+
+	sid := "sid-ws-refcount"
+	_ = vs.DelWatch(context.Background(), sid)
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	// Two checkers attach to the same session.
+	connA := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	connB := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	pollWatch(t, vs, sid, true)
+
+	// FIRST disconnect: the gate must stay OPEN (connB still watches).
+	_ = connA.Close(websocket.StatusNormalClosure, "")
+	pollWatch(t, vs, sid, true)
+
+	// LAST disconnect: presence gone.
+	_ = connB.Close(websocket.StatusNormalClosure, "")
+	pollWatch(t, vs, sid, false)
+}
+
+// TestSubscribeLoopResubscribesWithBackoff (review 9.9 one-shot subscribe):
+// a transient pubsub failure must not silently end the checker's stream —
+// subscribeLoop resubscribes with exponential backoff until ctx is
+// cancelled. The loop is driven against the real store: the first
+// subscription is confirmed live (a message flows), then the store client
+// is closed, forcing Subscribe to fail; the loop must retry (logged per
+// attempt) and must return promptly once the context is cancelled.
+func TestSubscribeLoopResubscribesWithBackoff(t *testing.T) {
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	var logBuf bytes.Buffer
+	a := &api{log: slog.New(slog.NewTextHandler(&logBuf, nil)), vs: vs}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan []byte, 8)
+	done := make(chan struct{})
+	go func() {
+		a.subscribeLoop(ctx, "queries:test-resub", false, out)
+		close(done)
+	}()
+
+	// First subscription live: publish until a message lands (a publish
+	// that fires before the subscribe registers is lost by design, so the
+	// publisher retries until the subscription is confirmed).
+	deadline := time.Now().Add(5 * time.Second)
+	got := false
+	for time.Now().Before(deadline) && !got {
+		_ = vs.Publish(context.Background(), "queries:test-resub", []byte(`{"n":1}`))
+		select {
+		case m := <-out:
+			if string(m) != `{"n":1}` {
+				t.Fatalf("message = %q, want the published payload", m)
+			}
+			got = true
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !got {
+		t.Fatal("no message within 5s — first subscription never came up")
+	}
+
+	// Force the subscription to fail: the closed client makes every
+	// subsequent Subscribe return immediately.
+	vs.Close()
+	time.Sleep(800 * time.Millisecond) // room for several backoff retries (100ms, 200ms, 400ms)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscribeLoop did not return within 5s of cancel")
+	}
+
+	retries := strings.Count(logBuf.String(), "resubscribing")
+	if retries < 2 {
+		t.Errorf("resubscribe log lines = %d, want >= 2 (the loop must retry after the failure)", retries)
 	}
 }

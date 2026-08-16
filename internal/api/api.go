@@ -33,12 +33,29 @@ type api struct {
 	// tests shorten them via these fields so heartbeats are observable fast.
 	watchTTL       time.Duration
 	watchHeartbeat time.Duration
+
+	// Review 9.9 pending-audit sweeper cadence; zero falls back to
+	// auditSweepEvery (tests shorten it to observe sweeps quickly).
+	auditSweepEvery time.Duration
+
+	// Review 9.9: login brute-force backoff + token issuance throttle
+	// (fixed-window per-key counters, wired in NewAPI).
+	loginLimiter *rateLimiter
+	issueLimiter *rateLimiter
 }
 
 // NewAPI builds the Control Plane API with its dependencies. aw is the
 // session-audit writer (nil when audit is disabled — all hooks no-op).
 func NewAPI(log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, aw *audit.Writer) *api {
-	return &api{log: log, cfg: cfg, vs: vs, auth: &authMiddleware{cfg: cfg, vs: vs}, audit: aw}
+	return &api{
+		log: log, cfg: cfg, vs: vs,
+		auth: &authMiddleware{
+			cfg: cfg, vs: vs, log: log,
+			loginLimiter: newRateLimiter(loginRateWindow, loginMaxFailures),
+		},
+		audit:        aw,
+		issueLimiter: newRateLimiter(issueRateWindow, issueMaxTokens),
+	}
 }
 
 // Routes returns the Control Plane HTTP handler tree.

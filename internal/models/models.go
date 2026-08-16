@@ -3,6 +3,7 @@ package models
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -24,19 +25,33 @@ type TokenPayload struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
+// randomHex returns n random bytes hex-encoded (2*n hex chars). rand.Read
+// cannot fail in practice on supported platforms; the zero fallback keeps
+// the id well-formed in that pathological case. Shared by NewSessionID and
+// NewEventID (Task 9.9: the control plane's duplicate event-id generator
+// was deduplicated onto this).
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return strings.Repeat("0", 2*n)
+	}
+	return hex.EncodeToString(b)
+}
+
 // NewSessionID returns a random session id in the sid-<hex> form shared by
 // the Control Plane (stamped into tokens at issue time — Task 8.11) and the
 // Data Plane (fallback when a token carries no sid). The form mirrors the
 // data plane's legacy "sid-" + 16-hex generation so old and new ids are
-// indistinguishable on the wire. rand.Read cannot fail in practice on
-// supported platforms; the zero fallback keeps the id well-formed in that
-// pathological case.
+// indistinguishable on the wire.
 func NewSessionID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "sid-0000000000000000"
-	}
-	return "sid-" + hex.EncodeToString(b)
+	return "sid-" + randomHex(8)
+}
+
+// NewEventID returns a random 64-bit hex id for control-plane lifecycle
+// events (kind=session issued events; mirrors the data plane's event id
+// format). Deduplicated with NewSessionID via randomHex (Task 9.9).
+func NewEventID() string {
+	return randomHex(8)
 }
 
 // TokenResponse is returned by POST /api/token.
@@ -74,8 +89,9 @@ type QueryEvent struct {
 	DB     string `json:"db,omitempty"`     // client-requested target database
 }
 
-// Session is the UI session payload (stored at sess:ui:<id>).
+// Session is the UI session payload (stored at sess:ui:<id>). The TTL of
+// the sess:ui:<id> key IS the expiry — the Expires field was dead weight
+// and is gone (Task 9.9 review remediation).
 type Session struct {
-	Username string    `json:"username"`
-	Expires  time.Time `json:"expires"`
+	Username string `json:"username"`
 }

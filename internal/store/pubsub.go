@@ -25,11 +25,18 @@ func (s *ValkeyStore) Subscribe(ctx context.Context, channel string, pattern boo
 	}
 	// Receive registers the subscription and invokes fn for every message
 	// until ctx is cancelled (it then returns ctx.Err()). fn runs on the
-	// client's reader goroutine, so the send must also unblock on ctx.Done().
+	// client's reader goroutine, so it must NEVER block — a slow consumer
+	// would otherwise head-of-line-block every other subscription on this
+	// client (review 9.9 slow-consumer HOL). The send is therefore
+	// non-blocking: the bounded out buffer absorbs bursts, and once it is
+	// full NEW messages are dropped. Live query events tolerate drops (the
+	// checker UI renders what arrives); audit lifecycle drops are healed by
+	// the pending-audit sweeper.
 	err := s.client.Receive(ctx, cmd, func(msg valkey.PubSubMessage) {
 		select {
 		case out <- []byte(msg.Message):
 		case <-ctx.Done():
+		default: // slow consumer — drop rather than block the reader
 		}
 	})
 	if err != nil {

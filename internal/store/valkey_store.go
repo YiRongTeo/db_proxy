@@ -107,13 +107,11 @@ func BuildClientOption(opts StoreOptions) valkey.ClientOption {
 // ValkeyStore wraps valkey-go with the token/session primitives.
 type ValkeyStore struct {
 	client valkey.Client
-	opts   StoreOptions // kept for future reconnect logic
 }
 
 // NewValkeyStore connects to Valkey (direct or via sentinel per opts) and
 // verifies connectivity with a PING (3s timeout) — fail fast. The valkey-go
-// client reconnects internally; opts is retained on the store for any later
-// reconnect needs.
+// client reconnects internally.
 func NewValkeyStore(ctx context.Context, opts StoreOptions) (*ValkeyStore, error) {
 	if len(opts.Addrs) == 0 {
 		return nil, errors.New("valkey store: at least one address required")
@@ -128,13 +126,7 @@ func NewValkeyStore(ctx context.Context, opts StoreOptions) (*ValkeyStore, error
 		client.Close()
 		return nil, fmt.Errorf("valkey ping: %w", err)
 	}
-	return &ValkeyStore{client: client, opts: opts}, nil
-}
-
-// NewValkeyStoreDirect is the plaintext direct-mode convenience wrapper
-// (single address, no sentinel, no TLS) — used by tests and simple callers.
-func NewValkeyStoreDirect(ctx context.Context, addr, password string, db int) (*ValkeyStore, error) {
-	return NewValkeyStore(ctx, StoreOptions{Addrs: []string{addr}, Password: password, DB: db})
+	return &ValkeyStore{client: client}, nil
 }
 
 func (s *ValkeyStore) Close() { s.client.Close() }
@@ -263,45 +255,86 @@ func (s *ValkeyStore) ListSessions(ctx context.Context) ([][]byte, error) {
 // exists while at least one checker is subscribed to the session's own
 // channel (sess:<sid>). The Data Plane's maker write-gate probes it with
 // WatchActive before relaying SQL on write-access sessions.
+//
+// Task 9.9 review remediation (CRITICAL b): presence is REFERENCE-COUNTED
+// PER CONNECTION. Each checker connection holds its own lease key
+// watch:<sid>:<connid> — set with a TTL on subscribe, heartbeat-refreshed
+// while connected, deleted on that connection's disconnect. N checkers
+// watching the same session are therefore independent: the first
+// disconnect deletes ONLY its own key, and the shared presence survives as
+// long as ANY watcher holds a key. WatchActive probes "does ANY
+// watch:<sid>:* lease exist?" via a bounded Lua SCAN. A crashed checker
+// self-expires via its lease TTL, so presence can never outlive every live
+// watcher by more than the lease.
 const watchPrefix = "watch:"
 
-// SetWatch records checker presence on a session (watch:<sid>) with a
-// presence lease ttl — the Control Plane WS hub sets it on subscribe to
-// channel sess:<sid> and refreshes it on a heartbeat while the checker
-// stays connected (SET … EX semantics).
-func (s *ValkeyStore) SetWatch(ctx context.Context, sid string, ttl time.Duration) error {
-	return s.client.Do(ctx, s.client.B().Set().Key(watchPrefix+sid).Value("1").Ex(ttl).Build()).Error()
+// watchAnyScript implements the gate probe: returns 1 when ANY key under
+// the watch:<sid>: prefix exists, 0 otherwise. The SCAN walk is bounded by
+// the pattern (only one session's leases match) and the watch keyspace is
+// tiny (one key per checker connection).
+var watchAnyScript = valkey.NewLuaScript(`
+local cursor = '0'
+repeat
+  local r = redis.call('SCAN', cursor, 'MATCH', KEYS[1] .. '*', 'COUNT', 256)
+  cursor = r[1]
+  if #r[2] > 0 then return 1 end
+until cursor == '0'
+return 0`)
+
+// watchClearScript force-clears ALL presence for a session: every
+// watch:<sid>:* lease (plus a legacy watch:<sid> base key). Test/ops
+// support — the hub itself only ever removes one connection's lease.
+var watchClearScript = valkey.NewLuaScript(`
+local cursor = '0'
+repeat
+  local r = redis.call('SCAN', cursor, 'MATCH', KEYS[1] .. ':*', 'COUNT', 256)
+  cursor = r[1]
+  for i, k in ipairs(r[2]) do redis.call('DEL', k) end
+until cursor == '0'
+redis.call('DEL', KEYS[1])
+return 1`)
+
+// SetWatchConn records (or refreshes) checker presence for ONE connection:
+// watch:<sid>:<connid> is set with a presence lease ttl (SET … EX). The
+// Control Plane WS hub calls it on subscribe and on every heartbeat; the
+// connection's disconnect must call WatchRemoveConn with the SAME connID.
+func (s *ValkeyStore) SetWatchConn(ctx context.Context, sid, connID string, ttl time.Duration) error {
+	return s.client.Do(ctx, s.client.B().Set().
+		Key(watchPrefix+sid+":"+connID).
+		Value("1").Ex(ttl).Build()).Error()
 }
 
-// DelWatch removes checker presence for a session (checker disconnected or
-// switched away from the session's channel).
-func (s *ValkeyStore) DelWatch(ctx context.Context, sid string) error {
-	return s.client.Do(ctx, s.client.B().Del().Key(watchPrefix+sid).Build()).Error()
+// WatchRemoveConn removes ONE connection's presence lease (checker
+// disconnected or switched away from the session's channel). Other
+// watchers' leases are untouched — the shared presence survives as long as
+// any lease exists (Task 9.9 reference counting).
+func (s *ValkeyStore) WatchRemoveConn(ctx context.Context, sid, connID string) error {
+	return s.client.Do(ctx, s.client.B().Del().Key(watchPrefix+sid+":"+connID).Build()).Error()
 }
 
-// WatchActive reports whether a checker is currently watching the session
-// (EXISTS watch:<sid>) — the Data Plane's maker write-gate probe. Callers
-// treat an error as FAIL CLOSED (the gate blocks the command).
+// WatchActive reports whether at least one checker is currently watching
+// the session (EXISTS-any over the watch:<sid>:* lease keys) — the Data
+// Plane's maker write-gate probe. Callers treat an error as FAIL CLOSED
+// (the gate blocks the command).
 func (s *ValkeyStore) WatchActive(ctx context.Context, sid string) (bool, error) {
-	n, err := s.client.Do(ctx, s.client.B().Exists().Key(watchPrefix+sid).Build()).AsInt64()
+	res := watchAnyScript.Exec(ctx, s.client, []string{watchPrefix + sid + ":"}, []string{})
+	if err := res.Error(); err != nil {
+		return false, err
+	}
+	n, err := res.AsInt64()
 	if err != nil {
 		return false, err
 	}
 	return n > 0, nil
 }
 
-// WatchTTL returns the remaining presence lease of a watch key (0 when the
-// key is absent or has no expiry) — used by tests to prove the hub's
-// heartbeat refreshes the lease rather than merely setting the key once.
-func (s *ValkeyStore) WatchTTL(ctx context.Context, sid string) (time.Duration, error) {
-	secs, err := s.client.Do(ctx, s.client.B().Ttl().Key(watchPrefix+sid).Build()).AsInt64()
-	if err != nil {
-		return 0, err
-	}
-	if secs < 0 {
-		return 0, nil // -1 no expiry / -2 missing — neither is a valid lease
-	}
-	return time.Duration(secs) * time.Second, nil
+// DelWatch force-clears ALL presence for a session (every connection's
+// lease). Test/ops support for tearing a session's watch state down
+// wholesale — the hub never calls it (each connection removes only its own
+// key via WatchRemoveConn).
+func (s *ValkeyStore) DelWatch(ctx context.Context, sid string) error {
+	res := watchClearScript.Exec(ctx, s.client, []string{watchPrefix + sid}, []string{})
+	return res.Error()
 }
 
 // SessionInfo is the checker-facing session directory entry (Task 8.4),

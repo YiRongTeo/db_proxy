@@ -89,7 +89,7 @@ func TestSessionsListsLiveDirectory(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestSessionsEmptyIsEmptyArray(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestKillPublishesCtlKillModeDefault(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestKillPublishesCtlKillModeQuery(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}

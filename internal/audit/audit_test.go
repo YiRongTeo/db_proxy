@@ -97,6 +97,16 @@ func rowCount(t *testing.T, w *Writer, sid string) int {
 	return n
 }
 
+// ErrClosed reports whether the underlying pool is closed (review 9.9: the
+// test-only helper moved OUT of the production file — tests use it to prove
+// write failures surface as errors, never panics).
+func (w *Writer) ErrClosed() error {
+	if w == nil || w.db == nil {
+		return fmt.Errorf("audit writer not initialized")
+	}
+	return w.db.Ping()
+}
+
 // TestNewWriterCreatesSchema: NewWriter auto-creates the database + sessions
 // table on the live server (the throwaway DB name proves it).
 func TestNewWriterCreatesSchema(t *testing.T) {
@@ -283,5 +293,66 @@ func TestWriteFailureIsErrorNotPanic(t *testing.T) {
 	}
 	if err := w.SetChecker(ctx, "sid-x", "carol"); err == nil {
 		t.Error("SetChecker after Close: want error, got nil")
+	}
+}
+
+// TestSweepStalePendingEndsStale (review 9.9 pending-audit sweeper): a
+// pending row whose maker never connected (last_seen older than the cutoff)
+// is flipped to ended with ended_at stamped, so the audit trail terminates
+// instead of lingering 'pending' forever. FRESH pending rows and rows in
+// other lifecycle states are left untouched; the sweep is idempotent (a
+// second run sweeps nothing).
+func TestSweepStalePendingEndsStale(t *testing.T) {
+	w := newLiveWriter(t)
+	ctx := context.Background()
+	stale := "sid-sweep-stale"
+	fresh := "sid-sweep-fresh"
+	active := "sid-sweep-active"
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	now := time.Now().UTC()
+
+	// Two pending rows: one stale (maker never connected), one fresh.
+	for _, sid := range []string{stale, fresh} {
+		if err := w.UpsertSession(ctx, SessionRecord{SessionID: sid, Username: "eve", LastSeen: old}); err != nil {
+			t.Fatalf("UpsertSession %s: %v", sid, err)
+		}
+	}
+	if err := w.UpsertSession(ctx, SessionRecord{SessionID: fresh, Username: "eve", LastSeen: now}); err != nil {
+		t.Fatalf("UpsertSession %s (fresh): %v", fresh, err)
+	}
+	// An ACTIVE row with an old last_seen must never be swept (the sweeper
+	// targets status='pending' only — live sessions belong to the hub).
+	if err := w.SetActive(ctx, ActiveRecord{
+		SessionID: active, Username: "eve", StartedAt: old, LastSeen: old,
+	}); err != nil {
+		t.Fatalf("SetActive %s: %v", active, err)
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	n, err := w.SweepStalePending(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("SweepStalePending: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("swept %d rows, want exactly 1 (the stale pending row)", n)
+	}
+
+	r := fetchRow(t, w, stale)
+	if r.status != "ended" {
+		t.Errorf("stale row status = %q, want ended", r.status)
+	}
+	if !r.endedAt.Valid {
+		t.Error("stale row ended_at not stamped")
+	}
+	if r := fetchRow(t, w, fresh); r.status != "pending" {
+		t.Errorf("fresh row status = %q, want pending (untouched)", r.status)
+	}
+	if r := fetchRow(t, w, active); r.status != "active" {
+		t.Errorf("active row status = %q, want active (untouched)", r.status)
+	}
+
+	// Idempotent backstop: a second sweep has nothing left to do.
+	if n, err := w.SweepStalePending(ctx, cutoff); err != nil || n != 0 {
+		t.Errorf("second sweep = %d rows, err %v; want 0, nil", n, err)
 	}
 }
