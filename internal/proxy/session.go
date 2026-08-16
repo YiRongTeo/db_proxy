@@ -32,12 +32,13 @@ type sessionRecord struct {
 	LastSeen  time.Time `json:"last_seen"`
 }
 
-// buildSessionRecord marshals a session directory record; nil on failure
-// (practically impossible for these field types). status is "active" from
-// the data plane (every write here is an established session); the control
-// plane writes its own "pending" records at token issue (Task 8.11).
+// buildSessionRecord marshals a session directory record. status is
+// "active" from the data plane (every write here is an established
+// session); the control plane writes its own "pending" records at token
+// issue (Task 8.11). Marshal cannot fail for these field types — the
+// Task 9.10 cleanup removed the old nil guard branches at the call sites.
 func buildSessionRecord(sid, username, dbUser, dbType, db string, threadID int64, startedAt, lastSeen time.Time, status string) []byte {
-	raw, err := json.Marshal(sessionRecord{
+	raw, _ := json.Marshal(sessionRecord{
 		SessionID: sid,
 		Username:  username,
 		DBUser:    dbUser,
@@ -48,8 +49,5 @@ func buildSessionRecord(sid, username, dbUser, dbType, db string, threadID int64
 		StartedAt: startedAt,
 		LastSeen:  lastSeen,
 	})
-	if err != nil {
-		return nil
-	}
 	return raw
 }

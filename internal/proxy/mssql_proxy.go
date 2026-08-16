@@ -40,7 +40,8 @@ type mssqlSession struct {
 	access      string               // token access level: "write" → maker write-gate applies (Task 9.4)
 	spid        uint16               // backend SPID from the login-response ENVCHANGE token (ATTENTION header, Task 9.4)
 	attnPending bool                 // a proxy-initiated ATTENTION is outstanding: the backend's DONE_ATTN ack must be swallowed (Task 9.4 round-1 fix)
-	writeMu     sync.Mutex           // serializes BACKEND writes: relay forward, gate flush, ATTENTION (Task 9.4)
+	attnAt      time.Time            // when the proxy attention was sent — the swallow expectation expires after mssqlAttnTimeout (Task 9.10)
+	writeMu     sync.Mutex           // serializes ALL socket writes: relay forward, gate flush, drain replies, ATTENTION (Task 9.4/9.10)
 	gateMu      sync.Mutex           // Task 9.4 grace-hold state guard (mirrors mysqlSession.gateMu)
 	gate        mssqlGateState       // Task 9.4 maker write-gate grace hold (mirrors mysqlGateState)
 	client      net.Conn             // (possibly TLS-wrapped) client conn
@@ -279,6 +280,7 @@ func (p *MSSQLProxy) KillQuery(id string) bool {
 	// proxy-side and clears this flag.
 	s.mu.Lock()
 	s.attnPending = true
+	s.attnAt = time.Now() // Task 9.10: start the swallow-expiry clock
 	s.mu.Unlock()
 	s.writeMu.Lock()
 	err := writeTDSPacketSPID(s.backend, tdsAttention, tdsStatusEOM, s.spid, nil)
@@ -384,6 +386,8 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	tok, err := p.vs.GetDeleteToken(ctx, token)
 	if err != nil {
 		p.log.Error("token lookup", "err", err, "client", clientAddr)
+		p.metrics.ConnectionsTotal("mssql", "rejected")
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token validation failed.", token)))
 		return
 	}
 	if tok == nil {
@@ -430,6 +434,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// rejection ends the attempt here: no session is established and the
 	// backend closes the conn on its own.
 	if !loginOK {
+		p.metrics.ConnectionsTotal("mssql", "rejected") // Task 9.10: rejection funnel
 		p.log.Warn("backend login rejected", "client", clientAddr, "db_user", tok.DBUser)
 		_ = writeTDSMessage(client, tdsTabular, loginResp)
 		return
@@ -510,15 +515,25 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 }
 
 // connectMSSQLBackend speaks the CLIENT side of TDS against the real SQL
-// Server: PRELOGIN (ENCRYPT_ON when useTLS, ENCRYPT_NOT_SUP otherwise — the
-// backend accepts both), optional 0x12-wrapped TLS upgrade, then the
-// REWRITTEN LOGIN7 (username = the token's real db_user, password = the
-// resolver password obfuscated with the derived transform, the client's
-// database and connection metadata mirrored). Returns the (possibly
-// TLS-wrapped) conn, the buffered reader the relay must keep reading
-// through (it may hold bytes buffered past the login response), the
-// backend's login response payload VERBATIM, whether the login succeeded,
-// and any database announced by an ENVCHANGE token.
+// Server: PRELOGIN (ENCRYPT_ON when useTLS — the data plane's TLS config is
+// on; ENCRYPT_NOT_SUP otherwise — the backend accepts both), optional
+// 0x12-wrapped TLS upgrade, then the REWRITTEN LOGIN7 (username = the
+// token's real db_user, password = the resolver password obfuscated with
+// the derived transform, the client's database and connection metadata
+// mirrored). Returns the (possibly TLS-wrapped) conn, the buffered reader
+// the relay must keep reading through (it may hold bytes buffered past the
+// login response), the backend's login response payload VERBATIM, whether
+// the login succeeded, and any database announced by an ENVCHANGE token.
+//
+// TLS LEG FRAMING (probe-verified 2026-08-16 against the live mssql-test
+// backend; task 9.10): with ENCRYPT_ON offered the server answers
+// ENCRYPT_ON, the handshake travels 0x12-wrapped, the login7 goes out as a
+// BARE TLS record (no 0x12 header — tdsTLSConn bare mode), and — unlike
+// the ENCRYPT_OFF path, where the login response comes back in PLAINTEXT —
+// the login response arrives as a BARE TLS RECORD too. The relay therefore
+// runs entirely over the TLS conn (bare TLS records both directions). The
+// old code returned the RAW conn after the login, so only the login7 was
+// encrypted and every subsequent byte went out plaintext — nominal TLS.
 func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredResolver, li login7Info, useTLS bool) (net.Conn, *bufio.Reader, []byte, bool, string, error) {
 	pw, err := res.Password(ctx, backendKey(t))
 	if err != nil {
@@ -534,14 +549,15 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReader(conn)
 
-	// client PRELOGIN. TDS 8.0 mirror (round-1 live capture, sqlcmd v18):
-	// the prelogin ENCRYPTION value stays ENCRYPT_OFF even when the client
-	// will upgrade — the TLS upgrade itself is the signal (the server
-	// answers whatever we ask; the 0x12-wrapped handshake proceeds
-	// regardless). useTLS=false keeps the honest ENCRYPT_NOT_SUP offer.
+	// client PRELOGIN. Task 9.10: when the data plane's TLS is enabled the
+	// proxy offers ENCRYPT_ON — per MS-TDS the server MUST answer
+	// ENCRYPT_ON and the TLS upgrade is then mandatory (probe: mssql-test
+	// echoes 0x01 and everything after the handshake is encrypted). When
+	// TLS is disabled the offer is the honest ENCRYPT_NOT_SUP and the
+	// exchange stays plaintext end to end.
 	enc := byte(encryptNotSup)
 	if useTLS {
-		enc = encryptOff
+		enc = encryptOn
 	}
 	if err := writeTDSPacket(conn, tdsPrelogin, buildPrelogin(enc)); err != nil {
 		conn.Close()
@@ -560,23 +576,27 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 		conn.Close()
 		return nil, nil, nil, false, "", err
 	}
-	_ = serverEnc // the negotiated value does not gate the upgrade — see below
-	// TLS upgrade when useTLS. The backend's TLS records also travel
-	// 0x12-wrapped — the same seam serves the client role. The backend's
-	// cert is the container's self-signed dev certificate; production
-	// would pin the CA via RootCAs instead of InsecureSkipVerify.
-	//
-	// ASYMMETRIC WIRING (round-7 root cause, live-probed 2026-08-15):
-	// the 0x12 wrapping covers the handshake ONLY. After it, the login7
-	// must go out as a BARE TLS record — a raw TLS record whose payload is
-	// the full TDS 0x10 packet (8-byte header + login7), with NO 0x12
-	// header on the wire — and the server answers the login in PLAINTEXT
-	// TDS. The round-6 code kept 0x12-wrapping the login7 (like the
-	// client leg) and SQL Server rejected it with 17832 "login packet
-	// structurally invalid"; the round-7 probe matrix against the live
-	// backend proved the accepted shape byte-for-byte (variants: wrapped
-	// → close, bare-record-with-TDS-header → LOGIN-OK plaintext).
-	if useTLS {
+	// TLS upgrade when offered AND accepted: a backend that answers
+	// ENCRYPT_NOT_SUP (TLS disabled on its side) keeps the plaintext leg —
+	// the login7 then travels as a regular 0x10 TDS packet.
+	upgrade := useTLS && serverEnc != encryptNotSup
+	if upgrade {
+		// The backend's TLS records also travel 0x12-wrapped — the same
+		// seam serves the client role. The backend's cert is the
+		// container's self-signed dev certificate; production would pin
+		// the CA via RootCAs instead of InsecureSkipVerify.
+		//
+		// ASYMMETRIC WIRING (round-7 root cause, live-probed 2026-08-15,
+		// re-probed for ENCRYPT_ON 2026-08-16): the 0x12 wrapping covers
+		// the handshake ONLY. After it, the login7 must go out as a BARE
+		// TLS record — a raw TLS record whose payload is the full TDS
+		// 0x10 packet (8-byte header + login7), with NO 0x12 header on
+		// the wire. Under ENCRYPT_OFF the server answers the login in
+		// PLAINTEXT TDS (and the relay stays plaintext); under ENCRYPT_ON
+		// the login response and everything after travel as bare TLS
+		// records — the returned conn is the TLS conn and the relay runs
+		// over it (Task 9.10, probe-verified: `17 03 03 …` records both
+		// directions, SELECT round-trip OK).
 		tds := &tdsTLSConn{Conn: conn, br: br}
 		tlsConn := tls.Client(tds, &tls.Config{
 			InsecureSkipVerify: true, // dev: mssql-test self-signed cert
@@ -587,22 +607,23 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 			return nil, nil, nil, false, "", fmt.Errorf("backend mssql tls: %w", err)
 		}
 		// Post-handshake: login7 = bare TLS record (tdsTLSConn Write
-		// switches to raw pass-through), response = plaintext TDS read
-		// straight off the raw conn (br below stays the raw reader).
+		// switches to raw pass-through), login response = bare TLS record
+		// read through the TLS conn.
 		tds.bare = true
 		login7 := buildLogin7(li.hostname, t.DBUser, li.appname, li.server, li.database, obfuscatePassword(pw))
 		if err := writeTDSPacket(tlsConn, tdsLogin7, login7); err != nil {
 			conn.Close()
 			return nil, nil, nil, false, "", err
 		}
-		typ, loginResp, err := readTDSMessage(br)
+		tlsBR := bufio.NewReader(tlsConn)
+		typ, loginResp, err := readTDSMessage(tlsBR)
 		if err != nil || typ != tdsTabular {
 			conn.Close()
 			return nil, nil, nil, false, "", fmt.Errorf("backend mssql login response: %v", err)
 		}
 		_, loginOK, envDB := scanLoginResponse(loginResp)
 		_ = conn.SetDeadline(time.Time{}) // relay must be deadline-free
-		return conn, br, loginResp, loginOK, envDB, nil
+		return tlsConn, tlsBR, loginResp, loginOK, envDB, nil
 	}
 
 	// PLAINTEXT leg: REWRITTEN LOGIN7 as a regular 0x10 TDS packet.
@@ -625,7 +646,8 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 // the payload across packets at the 4096-byte TDS packet limit with the EOM
 // status bit on the last fragment. The login response and the error
 // responses all fit one packet in practice, but a message MUST be
-// fragmentable per spec.
+// fragmentable per spec. Task 9.10: every fragment write is checked for
+// short writes.
 func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
 	for id := byte(1); ; id++ {
 		n := len(payload)
@@ -640,8 +662,12 @@ func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
 		}
 		binary.BigEndian.PutUint16(hdr[2:4], uint16(tdsHeaderLen+n))
 		hdr[6] = id
-		if _, err := w.Write(append(hdr, payload[:n]...)); err != nil {
+		wn, err := w.Write(append(hdr, payload[:n]...))
+		if err != nil {
 			return err
+		}
+		if wn != tdsHeaderLen+n {
+			return io.ErrShortWrite
 		}
 		payload = payload[n:]
 		if len(payload) == 0 {
@@ -763,9 +789,6 @@ func (p *MSSQLProxy) refreshSessionLive(s *mssqlSession, tok *models.TokenPayloa
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec == nil {
-		return
-	}
 	_ = p.vs.SetSessionLive(context.Background(), s.id, rec, sessionLiveTTL)
 }
 

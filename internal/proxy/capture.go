@@ -2,6 +2,177 @@ package proxy
 
 import "strings"
 
+// --- SQL password-clause redaction (Task 9.10) -----------------------------
+//
+// redactSQL masks password literals in the LOG/EVENT copy of SQL text —
+// common CREATE USER / SET PASSWORD / IDENTIFIED BY patterns. It is applied
+// ONLY to the sniffed copy that lands in QueryEvent.SQL (and from there the
+// query log lines); the RELAYED BYTES ARE NEVER TOUCHED. The redactor is
+// BOUNDED: the input is capped at redactMaxLen (the tail beyond it passes
+// through verbatim — the scan cost is O(n) with a fixed per-keyword
+// lookahead, and no regex backtracking is possible).
+
+const (
+	// redactMaxLen caps the scanned SQL; longer text keeps its tail
+	// verbatim (matching the capture's capMaxEvent spirit).
+	redactMaxLen = 64 << 10
+	// redactLookahead bounds how far past a keyword the redactor hunts for
+	// the password literal — a "password" farther away than this is not a
+	// password clause.
+	redactLookahead = 512
+)
+
+// redactKeywords are the clause starters whose following quoted literal is
+// a password. Case-insensitive; "identified by" and "password" cover the
+// common MySQL/PG/MSSQL forms (CREATE USER ... IDENTIFIED BY 'x', ALTER
+// ROLE ... PASSWORD 'x', SET PASSWORD [FOR u] = 'x', PASSWORD('x'),
+// IDENTIFIED WITH <plugin> BY 'x').
+var redactKeywords = []string{"identified by", "password"}
+
+// redactSQL returns sql with password literals replaced by *** (quotes
+// preserved). Bounded: capped input, fixed lookahead, linear scan.
+func redactSQL(sql string) string {
+	if sql == "" {
+		return sql
+	}
+	if len(sql) > redactMaxLen {
+		sql = sql[:redactMaxLen]
+	}
+	lower := strings.ToLower(sql)
+	var out strings.Builder
+	out.Grow(len(sql))
+	pos := 0
+	for pos < len(sql) {
+		// Next keyword occurrence (earliest of the patterns).
+		next, kwLen := -1, 0
+		for _, kw := range redactKeywords {
+			if idx := strings.Index(lower[pos:], kw); idx >= 0 && (next < 0 || idx < next) {
+				next = pos + idx
+				kwLen = len(kw)
+			}
+		}
+		if next < 0 {
+			out.WriteString(sql[pos:])
+			break
+		}
+		out.WriteString(sql[pos:next])
+		pos = next + kwLen
+		if quote, end, ok := redactLiteral(sql, lower, pos); ok {
+			out.WriteByte(quote)
+			out.WriteString("***")
+			out.WriteByte(quote)
+			pos = end
+		} else {
+			out.WriteString(sql[next:pos]) // no literal in range — keep the clause as-is
+		}
+	}
+	return out.String()
+}
+
+// redactLiteral scans forward from `from` (just past a password keyword)
+// for the quoted password literal, skipping the allowed connective tokens
+// (whitespace, '=', '(', ')', and the words for/with/by/password/plugin
+// identifiers). Returns the quote byte and the position just past the
+// closing quote. The scan is bounded by redactLookahead and a skip budget.
+func redactLiteral(sql, lower string, from int) (byte, int, bool) {
+	limit := from + redactLookahead
+	if limit > len(sql) {
+		limit = len(sql)
+	}
+	j := from
+	for skips := 0; j < limit && skips < 16; skips++ {
+		for j < limit && isRedactSpace(sql[j]) {
+			j++
+		}
+		if j >= limit {
+			return 0, 0, false
+		}
+		switch c := sql[j]; {
+		case c == '=' || c == '(' || c == ')':
+			j++
+		case c == '\'' || c == '"':
+			end, ok := skipRedactQuoted(sql, j, limit)
+			if !ok {
+				return 0, 0, false
+			}
+			return c, end, true
+		default:
+			if !isRedactWordChar(c) {
+				return 0, 0, false // unexpected token — not a password clause
+			}
+			w := redactWord(sql, j, limit)
+			switch strings.ToLower(w) {
+			case "for", "with", "by", "password":
+				j += len(w)
+				if strings.ToLower(w) == "for" {
+					// SET PASSWORD FOR 'u'@'h' = 'pw': skip the quoted
+					// user@host clause before the '='.
+					for j < limit {
+						for j < limit && isRedactSpace(sql[j]) {
+							j++
+						}
+						if j >= limit || (sql[j] != '\'' && sql[j] != '"') {
+							break
+						}
+						e, ok := skipRedactQuoted(sql, j, limit)
+						if !ok {
+							return 0, 0, false
+						}
+						j = e
+						for j < limit && isRedactSpace(sql[j]) {
+							j++
+						}
+						if j < limit && sql[j] == '@' {
+							j++
+							continue
+						}
+						break
+					}
+				}
+			default:
+				j += len(w) // plugin name / other identifier — keep scanning
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// skipRedactQuoted scans a quoted literal from the opening quote (start) to
+// its matching close, honoring backslash escapes and doubled-quote escapes,
+// bounded by limit.
+func skipRedactQuoted(sql string, start, limit int) (int, bool) {
+	q := sql[start]
+	for i := start + 1; i < limit; i++ {
+		if sql[i] == '\\' {
+			i++
+			continue
+		}
+		if sql[i] == q {
+			if i+1 < limit && sql[i+1] == q {
+				i++
+				continue
+			}
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+func isRedactSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\r' || c == '\n' }
+
+func isRedactWordChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// redactWord reads an identifier word starting at j (bounded by limit).
+func redactWord(sql string, j, limit int) string {
+	end := j
+	for end < limit && isRedactWordChar(sql[end]) {
+		end++
+	}
+	return sql[j:end]
+}
+
 // classifyStmt returns select|insert|update|delete|other from the leading keyword.
 func classifyStmt(sql string) string {
 	s := strings.TrimSpace(sql)
@@ -53,7 +224,6 @@ type resultCapture struct {
 }
 
 func (c *resultCapture) done() bool { return c == nil || c.doneFlag }
-func (c *resultCapture) ok() bool   { return c != nil && c.status == "ok" }
 
 func (c *resultCapture) feed(payload []byte) {
 	if c.done() || len(payload) == 0 {

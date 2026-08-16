@@ -148,8 +148,24 @@ const (
 // DONE_FINAL 0x0200).
 const tdsDoneSRVError = 0x0100
 
+// decimalSizeFromPrecision maps a DECIMAL/NUMERIC precision to its on-wire
+// storage size (MS-TDS 2.2.5.5.1.2): 1-9 → 4 bytes, 10-19 → 8, 20-28 → 12,
+// 29-38 → 16. Task 9.10: the DECIMALN/NUMERICN value length is derived
+// from the PRECISION, not the TYPE_INFO maxlen byte.
+func decimalSizeFromPrecision(p int) int {
+	switch {
+	case p > 28:
+		return 16
+	case p > 19:
+		return 12
+	case p > 9:
+		return 8
+	default:
+		return 4
+	}
+}
+
 func (c *mssqlResultCapture) done() bool { return c == nil || c.doneFlag }
-func (c *mssqlResultCapture) ok() bool   { return c != nil && c.status == "ok" }
 
 func (c *mssqlResultCapture) finish() {
 	if c.status == "" {
@@ -380,27 +396,23 @@ func parseTDSColType(t byte, buf []byte, off int) (tdsColType, int, bool) {
 			return tdsColType{}, 0, false
 		}
 		return tdsColType{kind: tdsFixed, size: ml}, off + 1, true
-	case 0x6A, 0x6C: // DECIMALN / NUMERICN: maxlen + precision + scale
+	case 0x6A, 0x6C: // DECIMALN / NUMERICN: maxlen + precision + scale.
+		// Task 9.10: the VALUE length is derived from the PRECISION (the
+		// maxlen byte is the storage maximum, not the on-wire length) —
+		// the old size=maxlen broke parseRow's `ln != ct.size` check and
+		// DROPPED the whole event for any decimal column whose value was
+		// shorter than its maxlen (the live backend's common shape).
 		if !need(3) {
 			return tdsColType{}, 0, false
 		}
-		ml := int(buf[off])
-		return tdsColType{kind: tdsFixed, size: ml, lenPrefix: true}, off + 3, true
+		p := int(buf[off+1])
+		return tdsColType{kind: tdsFixed, size: decimalSizeFromPrecision(p), lenPrefix: true}, off + 3, true
 	case 0x37, 0x3F: // DECIMAL / NUMERIC (non-nullable): precision + scale
 		if !need(2) {
 			return tdsColType{}, 0, false
 		}
 		p := int(buf[off])
-		size := 4
-		switch {
-		case p > 28:
-			size = 16
-		case p > 19:
-			size = 12
-		case p > 9:
-			size = 8
-		}
-		return tdsColType{kind: tdsFixed, size: size}, off + 2, true
+		return tdsColType{kind: tdsFixed, size: decimalSizeFromPrecision(p)}, off + 2, true
 	case 0x29, 0x2A, 0x2B: // TIME / DATETIME2 / DATETIMEOFFSET: scale(1),
 		// value 3/4/5 bytes (+5 offset bytes) — length-prefixed (live)
 		if !need(1) {

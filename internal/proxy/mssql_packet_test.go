@@ -211,9 +211,9 @@ func TestLogin7ParseCaptured(t *testing.T) {
 	if li.server != "host.docker.internal,1504" {
 		t.Fatalf("servername = %q", li.server)
 	}
-	if !bytes.Equal(li.password, mustHex(t, goldenRoPW)) {
-		t.Fatalf("password field = %x", li.password)
-	}
+	// The client's password field is deliberately NOT parsed (Task 9.10):
+	// the backend login7 always carries the RESOLVER password, so the
+	// client's value is never inspected — only skipped.
 }
 
 func TestBuildLogin7RoundTrip(t *testing.T) {
@@ -226,9 +226,8 @@ func TestBuildLogin7RoundTrip(t *testing.T) {
 	if li.username != "ro_user" || li.database != "appdb" || li.hostname != "zerotrust-proxy" {
 		t.Fatalf("round trip fields: %+v", li)
 	}
-	if !bytes.Equal(li.password, pw) {
-		t.Fatalf("password round trip: %x", li.password)
-	}
+	// Password round-trip is NOT asserted: the password field is
+	// deliberately unparsed (Task 9.10 — resolver-password-only model).
 	// Length field must equal the payload length.
 	if int(msg[0])|int(msg[1])<<8 != len(msg) { // length field is LE here (login7)
 		t.Fatalf("length field %d != payload %d", int(msg[0])|int(msg[1])<<8, len(msg))

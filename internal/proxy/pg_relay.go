@@ -53,10 +53,35 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 			p.gatePGReject(be, msg, s, blockMsg)
 			continue
 		}
-		if err := front.f.Send(msg); err != nil { // relay unchanged
+		// Task 9.10: while a grace wait is ACTIVE, EVERY message is
+		// stalled — extended-protocol messages (Bind/Describe/Sync/Close/
+		// Flush) must never overtake the held Parse/Execute messages, or
+		// the prepared-statement ordering breaks on the success path. The
+		// message is queued exactly like a blocked one; overflow (or a
+		// mid-flight flush deactivation) rejects it to the client instead
+		// of ever forwarding it past the held queue.
+		if p.gatePGHolding(s) {
+			if !p.gatePGHold(msg, s) {
+				p.gatePGReject(be, msg, s, gatingMessage(s.id))
+			}
+			continue
+		}
+		s.writeMu.Lock() // serialize with the gate flush (Task 9.10)
+		err = front.f.Send(msg)
+		s.writeMu.Unlock()
+		if err != nil { // relay unchanged
 			return
 		}
 	}
+}
+
+// gatePGHolding reports whether a grace wait is currently active (Task
+// 9.10): while it is, the relay stalls every subsequent client message so
+// nothing can overtake the held queue.
+func (p *PGProxy) gatePGHolding(s *pgSession) bool {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	return s.gate.active
 }
 
 // gatePGBlockMsg implements the Task 8.6 maker write-gate DECISION: a
@@ -89,15 +114,20 @@ func (p *PGProxy) gatePGBlockMsg(msg pgproto3.FrontendMessage, s *pgSession) str
 // gatePGReject sends the Task 8.6 block response for an immediately
 // rejected message: ErrorResponse FATAL 28000 with the block message is
 // sent to the client; SimpleQuery also gets the trailing ReadyForQuery a
-// simple-query response always ends with, while extended-protocol messages
-// (P/E) get the bare ErrorResponse — the client's Sync (relayed) draws the
-// backend's ReadyForQuery. The sniffed event is published immediately as
-// status=error.
+// simple-query response always ends with, and a rejected Sync draws the
+// ReadyForQuery that completes an extended-protocol exchange (Task 9.10),
+// while other extended-protocol messages (P/B/E) get the bare
+// ErrorResponse — the client's Sync (relayed) draws the backend's
+// ReadyForQuery. The sniffed event is published immediately as
+// status=error. The replies take the session's writeMu (Task 9.10).
 func (p *PGProxy) gatePGReject(be *pgproto3.Backend, msg pgproto3.FrontendMessage, s *pgSession, blockMsg string) {
+	s.writeMu.Lock()
 	_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000", Message: blockMsg})
-	if _, ok := msg.(*pgproto3.Query); ok {
+	switch msg.(type) {
+	case *pgproto3.Query, *pgproto3.Sync:
 		_ = be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	}
+	s.writeMu.Unlock()
 	p.publishBlocked(s, blockMsg)
 }
 
@@ -154,7 +184,10 @@ func (p *PGProxy) pipePGBackendToClient(front *pgFrontend, be *pgproto3.Backend,
 		}
 		done := c.done()
 		s.mu.Unlock()
-		if err := be.Send(msg); err != nil {
+		s.writeMu.Lock() // serialize with gate drain replies (Task 9.10)
+		err = be.Send(msg)
+		s.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 		if done {
@@ -181,10 +214,10 @@ func (p *PGProxy) sniffPGMessage(msg pgproto3.FrontendMessage, cache *stmtCache,
 	var kind, sql string
 	switch m := msg.(type) {
 	case *pgproto3.Query:
-		kind, sql = "query", m.String
+		kind, sql = "query", redactSQL(m.String)
 	case *pgproto3.Parse:
-		kind, sql = "prepare", m.Query
-		cache.m[m.Name] = m.Query
+		kind, sql = "prepare", redactSQL(m.Query)
+		cache.m[m.Name] = sql
 	case *pgproto3.Execute:
 		kind = "execute"
 		if s, ok := cache.m[m.Portal]; ok {
@@ -260,7 +293,8 @@ func (p *PGProxy) publishPending(s *pgSession, capture *pgResultCapture) {
 // pending at a statement boundary (defensive — every real response ends in
 // CommandComplete/ErrorResponse/EmptyQueryResponse, all of which complete
 // the capture) is finished as ok and published, so no event is ever left
-// dangling across statements.
+// dangling across statements. Task 9.10: metrics parity with publishPending
+// — one queries.total increment + query.duration per published event.
 func (p *PGProxy) publishPendingOnReady(s *pgSession) {
 	s.mu.Lock()
 	ev := s.pending
@@ -280,6 +314,8 @@ func (p *PGProxy) publishPendingOnReady(s *pgSession) {
 	}
 	s.mu.Unlock()
 	if ev != nil {
+		p.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
+		p.metrics.QueryDuration(ev.DBType, time.Since(ev.Ts))
 		p.publishEvent(s, ev)
 	}
 }
@@ -304,9 +340,7 @@ func (p *PGProxy) publishEvent(s *pgSession, ev *models.QueryEvent) {
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec != nil {
-		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
-	}
+	_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
 	// Task 8.8 query logging: every published query event is logged with
 	// full context (never the token value — the event carries no token).
 	// The captured result payload (columns/row_count/rows/truncated) is
@@ -337,9 +371,6 @@ func (p *PGProxy) refreshSessionLive(s *pgSession, tok *models.TokenPayload) {
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec == nil {
-		return
-	}
 	_ = p.vs.SetSessionLive(context.Background(), s.id, rec, sessionLiveTTL)
 }
 

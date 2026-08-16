@@ -454,7 +454,7 @@ func TestMSSQLLiveWriteGateWatcherPass(t *testing.T) {
 	}
 	sid := recvSessionEvent(t, out).SessionID
 	cleanupLiveRecord(t, vs, sid)
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(ctx, sid) })
@@ -577,7 +577,7 @@ func TestMSSQLLiveWriteGateGraceHoldRunsAfterWatcher(t *testing.T) {
 
 	// Checker attaches WITHIN the window → the held query runs and returns
 	// the real backend response (no gate error).
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(ctx, sid) })
@@ -691,7 +691,7 @@ func TestMSSQLLiveWriteGateGraceHoldTimeoutThenReopens(t *testing.T) {
 
 	// Task 8.17: the drain did NOT latch. A watcher attaching AFTER the
 	// drain re-opens the gate — the same session's next INSERT runs.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(ctx, sid) })

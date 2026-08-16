@@ -347,9 +347,9 @@ func TestLiveMetricsScrapeAndDeltas(t *testing.T) {
 // the established suite convention).
 func liveStore(t *testing.T) *store.ValkeyStore {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
-		t.Fatalf("NewValkeyStoreDirect: %v", err)
+		t.Fatalf("NewValkeyStore: %v", err)
 	}
 	t.Cleanup(vs.Close)
 	return vs

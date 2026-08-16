@@ -69,23 +69,19 @@ func readTDSPacket(br *bufio.Reader) (typ, status byte, payload []byte, err erro
 
 // writeTDSPacket writes one TDS packet (type typ) with the EOM status bit,
 // SPID 0, packet id 1, window 0 — the shape every captured client/server
-// packet in round 1 used.
+// packet in round 1 used. (The writeTDSPacketStatus wrapper is gone — Task
+// 9.10 unnecessary-code removal; multi-fragment messages go through
+// writeTDSMessage.)
 func writeTDSPacket(w io.Writer, typ byte, payload []byte) error {
-	return writeTDSPacketStatus(w, typ, tdsStatusEOM, payload)
+	return writeTDSPacketSPID(w, typ, tdsStatusEOM, 0, payload)
 }
 
-// writeTDSPacketStatus is writeTDSPacket with a caller-chosen status byte —
-// the non-EOM variant is needed when a message is fragmented across packets
-// (the EOM bit marks the final fragment only).
-func writeTDSPacketStatus(w io.Writer, typ, status byte, payload []byte) error {
-	return writeTDSPacketSPID(w, typ, status, 0, payload)
-}
-
-// writeTDSPacketSPID is writeTDSPacketStatus with a caller-chosen SPID
-// header field. The relay and the login path use SPID 0 (what every captured
+// writeTDSPacketSPID is writeTDSPacket with a caller-chosen SPID header
+// field. The relay and the login path use SPID 0 (what every captured
 // client/server packet in round 1 used); the ATTENTION packet (Task 9.4
 // kill-query) carries the backend SPID captured at login — the real ODBC
 // driver fills the field from the login response's ENVCHANGE SPID token.
+// Task 9.10: the write is checked for short writes (n != len).
 func writeTDSPacketSPID(w io.Writer, typ, status byte, spid uint16, payload []byte) error {
 	hdr := make([]byte, tdsHeaderLen)
 	hdr[0] = typ
@@ -94,8 +90,12 @@ func writeTDSPacketSPID(w io.Writer, typ, status byte, spid uint16, payload []by
 	binary.BigEndian.PutUint16(hdr[4:6], spid)
 	hdr[6] = 1 // packet id
 	hdr[7] = 0 // window
-	if _, err := w.Write(append(hdr, payload...)); err != nil {
+	n, err := w.Write(append(hdr, payload...))
+	if err != nil {
 		return err
+	}
+	if n != tdsHeaderLen+len(payload) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
@@ -228,11 +228,13 @@ func obfuscatePassword(pw string) []byte {
 // login7Info is the parsed view of a LOGIN7 message the proxy needs:
 // the token-as-username, the client-requested database (kept on the
 // backend login), plus the client's connection metadata mirrored into the
-// backend login7 so the session looks like the maker's own client.
+// backend login7 so the session looks like the maker's own client. The
+// client's raw password field is deliberately NOT parsed (Task 9.10
+// unnecessary-code removal): the token IS the credential — the backend
+// login7 always carries the RESOLVER password.
 type login7Info struct {
 	hostname string
 	username string
-	password []byte // RAW obfuscated bytes from the wire (never decoded — the token IS the credential)
 	appname  string
 	server   string
 	database string
@@ -285,9 +287,6 @@ func parseLogin7(payload []byte) (login7Info, error) {
 	}
 	if li.username, err = text(1); err != nil {
 		return li, err
-	}
-	if off, l, err := field(2); err == nil && l > 0 {
-		li.password = append([]byte(nil), payload[off:off+l*2]...)
 	}
 	if li.appname, err = text(3); err != nil {
 		return li, err

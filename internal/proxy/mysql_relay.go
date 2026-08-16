@@ -40,12 +40,17 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 				if p.gateHold(s, seq, payload) {
 					continue
 				}
+				s.writeMu.Lock() // serialize with drain replies (Task 9.10)
 				_ = writeMySQLPacket(client, seq+1, errPacket(1045, "42000", msg))
+				s.writeMu.Unlock()
 				p.publishBlocked(s, msg)
 				continue
 			}
 		}
-		if err := writeMySQLPacket(backend, seq, payload); err != nil {
+		s.writeMu.Lock() // serialize with the gate flush (Task 9.10)
+		err = writeMySQLPacket(backend, seq, payload)
+		s.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 	}
@@ -67,7 +72,10 @@ func (p *MySQLProxy) pipeBackendToClient(backend, client net.Conn, s *mysqlSessi
 		c.feed(payload)
 		done := c.done()
 		s.mu.Unlock()
-		if err := writeMySQLPacket(client, seq, payload); err != nil {
+		s.writeMu.Lock() // serialize with gate drain replies (Task 9.10)
+		err = writeMySQLPacket(client, seq, payload)
+		s.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 		if done {
@@ -97,11 +105,11 @@ func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *m
 	var kind, sql string
 	switch cmd {
 	case cmdQuery:
-		kind, sql = "query", trimSniffedSQL(body)
+		kind, sql = "query", redactSQL(trimSniffedSQL(body))
 	case cmdInitDB:
-		kind, sql = "use", "USE "+trimSniffedSQL(body)
+		kind, sql = "use", redactSQL("USE "+trimSniffedSQL(body))
 	case cmdPrepare:
-		kind, sql = "prepare", trimSniffedSQL(body)
+		kind, sql = "prepare", redactSQL(trimSniffedSQL(body))
 	case cmdExecute:
 		kind = "execute"
 		if len(body) >= 4 {
@@ -244,9 +252,7 @@ func (p *MySQLProxy) publishEvent(s *mysqlSession, ev *models.QueryEvent) {
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec != nil {
-		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
-	}
+	_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
 	// Task 8.8 query logging: every published query event is logged with
 	// full context (never the token value — the event carries no token).
 	// The captured result payload (columns/row_count/rows/truncated) is
@@ -277,9 +283,6 @@ func (p *MySQLProxy) refreshSessionLive(s *mysqlSession, tok *models.TokenPayloa
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec == nil {
-		return
-	}
 	_ = p.vs.SetSessionLive(context.Background(), s.id, rec, sessionLiveTTL)
 }
 

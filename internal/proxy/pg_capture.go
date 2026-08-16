@@ -29,7 +29,6 @@ type pgResultCapture struct {
 }
 
 func (c *pgResultCapture) done() bool { return c == nil || c.doneFlag }
-func (c *pgResultCapture) ok() bool   { return c != nil && c.status == "ok" }
 
 func (c *pgResultCapture) finish() {
 	if c.status == "" {

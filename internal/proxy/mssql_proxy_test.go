@@ -107,8 +107,8 @@ func TestTDSConnSeamRoundTrip(t *testing.T) {
 	// record" split across them.
 	part1 := []byte("hello ")
 	part2 := []byte("world-TLS-record")
-	_ = writeTDSPacketStatus(&wire, tdsPrelogin, 0, part1) // no EOM
-	_ = writeTDSPacketStatus(&wire, tdsPrelogin, tdsStatusEOM, part2)
+	_ = writeTDSPacketSPID(&wire, tdsPrelogin, 0, 0, part1) // no EOM
+	_ = writeTDSPacketSPID(&wire, tdsPrelogin, tdsStatusEOM, 0, part2)
 
 	seam := &tdsTLSConn{Conn: nopConn{&wire}, br: bufio.NewReader(&wire)}
 	want := "hello world-TLS-record"

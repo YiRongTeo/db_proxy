@@ -38,11 +38,15 @@ type pgSession struct {
 
 	// Task 8.13 grace hold: the client-side Backend (drain replies) and
 	// the backend pgFrontend (flush forwards held messages), plus the
-	// mutex-guarded gate state.
-	be     *pgproto3.Backend
-	front  *pgFrontend
-	gateMu sync.Mutex
-	gate   pgGateState
+	// mutex-guarded gate state. writeMu (Task 9.10, MSSQL-style)
+	// serializes ALL socket writes — relay forwards, gate flush, drain
+	// replies — so extended-protocol messages cannot overtake the held
+	// queue and packets never tear mid-write.
+	be      *pgproto3.Backend
+	front   *pgFrontend
+	writeMu sync.Mutex
+	gateMu  sync.Mutex
+	gate    pgGateState
 }
 
 // PGProxy runs PostgreSQL sessions on the Data Plane. Task 4.1 implements the

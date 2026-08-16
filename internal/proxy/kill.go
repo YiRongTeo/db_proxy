@@ -40,6 +40,12 @@ const (
 // read. The ctl:kill subscriber must never block on a dead backend.
 const killQueryTimeout = 10 * time.Second
 
+// mssqlAttnTimeout bounds how long the proxy's ATTENTION ack expectation
+// (attnPending) stays armed (Task 9.10): the backend normally acks within
+// the aborted batch's response, but a dead/hung backend must not poison the
+// DONE_ATTN swallow for the rest of the session.
+const mssqlAttnTimeout = 10 * time.Second
+
 // Killer fans a ctl:kill request out to the MySQL, PostgreSQL and MSSQL
 // proxies' registries. Session ids are generated per proxy ("sid-" + random
 // hex), so a live session lives on exactly one plane — but the ctl:kill

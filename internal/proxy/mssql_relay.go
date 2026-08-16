@@ -63,9 +63,16 @@ func readTDSMessageFrames(br *bufio.Reader) (frames []mssqlGateFrame, typ byte, 
 // With gate_wait_seconds > 0 a blocked message is QUEUED instead (no reply,
 // no forward): the client keeps waiting for a checker (the queue flushes in
 // order) or for the window to expire (drain). A drain does NOT latch (Task
-// 8.17): a re-attached watcher re-opens the gate. ATTENTION (0x06), LOGOUT
-// (0x0E) and every other packet type pass through untouched. Backend writes
-// take the session's writeMu so a concurrent kill-query ATTENTION can never
+// 8.17): a re-attached watcher re-opens the gate.
+//
+// Task 9.10: while a grace wait is ACTIVE every message is HELD (the relay
+// stall) — an ATTENTION or LOGOUT can never overtake the held queue. A
+// held ATTENTION is flagged on its entry: the flush forwards it byte-exact
+// (the backend acks it), the drain answers it with the DONE_ATTN
+// acknowledgement instead of an ERROR token. A client-initiated ATTENTION
+// also disarms attnPending — its ack must reach the client (the proxy's
+// own kill-query attention was superseded). Backend writes take the
+// session's writeMu so a concurrent kill-query ATTENTION can never
 // interleave mid-message.
 func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client net.Conn, s *mssqlSession, tok *models.TokenPayload, clientAddr string) {
 	for {
@@ -81,17 +88,46 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 			payload = append(payload, f.payload...)
 		}
 		p.sniffMSSQLCommand(typ, payload, s, tok, clientAddr)
+		if typ == tdsAttention {
+			// Task 9.10: a client-initiated ATTENTION supersedes any
+			// proxy-initiated attention ack expectation — the backend's
+			// DONE_ATTN for the CLIENT's own attention must reach the
+			// client, so the swallow is disarmed.
+			s.mu.Lock()
+			s.attnPending = false
+			s.mu.Unlock()
+		}
 		if msg := p.gateMSSQLBlocked(s, typ); msg != "" {
-			if p.gateMSSQLHold(s, frames) {
+			if p.gateMSSQLHold(s, frames, typ == tdsAttention) {
 				continue
 			}
 			p.gateMSSQLReject(client, s, msg)
+			continue
+		}
+		if p.gateMSSQLHolding(s) {
+			// Task 9.10 stall: never forward anything past the held queue.
+			if !p.gateMSSQLHold(s, frames, typ == tdsAttention) {
+				if typ == tdsAttention {
+					_ = writeTDSMessage(client, tdsTabular, buildTDSAttnAck())
+				} else {
+					p.gateMSSQLReject(client, s, gatingMessage(s.id))
+				}
+			}
 			continue
 		}
 		if err := p.forwardMSSQLFrames(s, frames); err != nil {
 			return
 		}
 	}
+}
+
+// gateMSSQLHolding reports whether a grace wait is currently active (Task
+// 9.10): while it is, the relay holds every subsequent message so nothing
+// can overtake the held queue.
+func (p *MSSQLProxy) gateMSSQLHolding(s *mssqlSession) bool {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	return s.gate.active
 }
 
 // forwardMSSQLFrames writes a client message's raw frames to the backend in
@@ -140,7 +176,9 @@ func (p *MSSQLProxy) gateMSSQLBlocked(s *mssqlSession, typ byte) string {
 // sniffed event is published immediately as status=error (the command never
 // reaches the backend, so no backend response will complete the capture).
 func (p *MSSQLProxy) gateMSSQLReject(client net.Conn, s *mssqlSession, msg string) {
+	s.writeMu.Lock() // serialize with the relay's client writes (Task 9.10)
 	_ = writeTDSMessage(client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
+	s.writeMu.Unlock()
 	p.publishMSSQLBlocked(s, msg)
 }
 
@@ -195,9 +233,15 @@ func (p *MSSQLProxy) pipeMSSQLBackendToClient(backendBR *bufio.Reader, client ne
 		// Attention ack swallow: a single-packet TABULAR message that is
 		// EXACTLY a DONE token carrying the DONE_ATTN bit (a 13-byte
 		// token stream can never span packets). Guarded by attnPending so
-		// only proxy-initiated attentions are consumed.
+		// only proxy-initiated attentions are consumed. Task 9.10: the
+		// expectation EXPIRES (attnPendingTimeout) — a backend that never
+		// acks must not poison the swallow for the session's lifetime.
 		s.mu.Lock()
 		attn := s.attnPending
+		if attn && time.Since(s.attnAt) > mssqlAttnTimeout {
+			attn = false
+			s.attnPending = false
+		}
 		s.mu.Unlock()
 		if attn && hdr[0] == tdsTabular && hdr[1]&tdsStatusEOM != 0 &&
 			len(payload) == 13 && payload[0] == 0xFD &&
@@ -213,7 +257,10 @@ func (p *MSSQLProxy) pipeMSSQLBackendToClient(backendBR *bufio.Reader, client ne
 		c.feed(payload, hdr[1]&tdsStatusEOM != 0)
 		done := c.done()
 		s.mu.Unlock()
-		if _, err := client.Write(append(hdr[:], payload...)); err != nil {
+		s.writeMu.Lock() // serialize with gate drain replies (Task 9.10)
+		_, werr := client.Write(append(hdr[:], payload...))
+		s.writeMu.Unlock()
+		if werr != nil {
 			return
 		}
 		if done {
@@ -238,7 +285,7 @@ func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession
 		if !ok {
 			return
 		}
-		kind, sql = "query", text
+		kind, sql = "query", redactSQL(text)
 	case tdsRPC:
 		name, ok := decodeMSSQLRPC(payload)
 		if !ok {
@@ -329,9 +376,7 @@ func (p *MSSQLProxy) publishEvent(s *mssqlSession, ev *models.QueryEvent) {
 	s.lastSeen = time.Now().UTC()
 	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
 	s.mu.Unlock()
-	if rec != nil {
-		_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
-	}
+	_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
 	// Task 8.8 query logging: every published query event is logged with
 	// full context (never the token value — the event carries no token).
 	// The captured result payload (columns/row_count/rows/truncated) is

@@ -38,8 +38,12 @@ type mysqlSession struct {
 	// Task 8.13 grace hold: the client/backend conns for the wait
 	// goroutine's flush (forward held commands to the backend) and drain
 	// (reply ERR 1045 to the client), plus the mutex-guarded gate state.
+	// writeMu (Task 9.10, MSSQL-style) serializes ALL socket writes —
+	// relay forwards, gate flush, drain replies — so packets never tear
+	// and held commands cannot overtake or be overtaken mid-write.
 	client  net.Conn
 	backend net.Conn
+	writeMu sync.Mutex
 	gateMu  sync.Mutex
 	gate    mysqlGateState
 }

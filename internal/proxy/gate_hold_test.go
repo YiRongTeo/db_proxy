@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +62,24 @@ func cleanupLiveRecord(t *testing.T, vs *store.ValkeyStore, sid string) {
 		time.Sleep(200 * time.Millisecond)
 		_ = vs.DelSessionLive(ctx, sid)
 	})
+}
+
+// gateWaitJoined waits (with a 2s timeout) for the session's gate wait
+// goroutine to exit — the Task 9.10 replacement for the removed done
+// channel: the wait goroutine is joined via the gate state's WaitGroup
+// (closeGateWait wg.Wait), so tests wait on the same join.
+func gateWaitJoined(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("gate wait goroutine did not exit (2s timeout)")
+	}
 }
 
 // --- unit: queue bounds ----------------------------------------------------
@@ -151,11 +170,7 @@ func TestMySQLGateHoldFlushOrder(t *testing.T) {
 	if active || n != 0 {
 		t.Errorf("after flush: active=%v queue=%d, want false/0", active, n)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // --- unit: timeout drain ---------------------------------------------------
@@ -199,11 +214,7 @@ func TestMySQLGateHoldTimeoutDrain(t *testing.T) {
 	}
 	// The wait goroutine finishes the drain (replies → audit events) —
 	// wait for it before asserting the events it stamps.
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after timeout drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	s.gateMu.Lock()
 	active, n := s.gate.active, len(s.gate.queue)
 	s.gateMu.Unlock()
@@ -249,11 +260,7 @@ func TestMySQLGateHoldReopensAfterWatch(t *testing.T) {
 	if pkt := readMySQLErrPacket(t, cpeer); !strings.Contains(string(pkt), "no checker connected within 1s") {
 		t.Errorf("drain ERR = %q, want the timeout message", pkt)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the first drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 
 	// Post-drain, STILL unwatched: the next command is blocked again and
 	// starts a FRESH grace wait (no latch) — drained when the new window
@@ -271,11 +278,7 @@ func TestMySQLGateHoldReopensAfterWatch(t *testing.T) {
 	if pkt := readMySQLErrPacket(t, cpeer); !strings.Contains(string(pkt), "no checker connected within 1s") {
 		t.Errorf("second drain ERR = %q, want the timeout message", pkt)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the second drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	if ev2.Status != "error" || !strings.Contains(ev2.Error, "no checker connected within 1s") {
 		t.Errorf("ev2 = status %q error %q, want error + timeout message (audit published)", ev2.Status, ev2.Error)
 	}
@@ -286,7 +289,7 @@ func TestMySQLGateHoldReopensAfterWatch(t *testing.T) {
 	// flush phase cannot race the drain timer (the gate re-evaluates per
 	// command — the widened window only affects NEW waits).
 	p.SetGateWaitSeconds(60)
-	if err := vs.SetWatch(context.Background(), s.id, time.Minute); err != nil {
+	if err := vs.SetWatchConn(context.Background(), s.id, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), s.id) })
@@ -312,11 +315,7 @@ func TestMySQLGateHoldReopensAfterWatch(t *testing.T) {
 	if seq != 0 || !bytes.Equal(got, payload) {
 		t.Errorf("flush packet seq=%d payload=% x, want seq 0 payload % x (byte-exact)", seq, got, payload)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the re-attach flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // --- unit: gate_wait_seconds=0 ---------------------------------------------
@@ -376,11 +375,7 @@ func TestMySQLGateHoldCloseCleanup(t *testing.T) {
 	if ev.Status != "error" || !strings.Contains(ev.Error, "no checker connected within 60s") {
 		t.Errorf("held event = status %q error %q, want error + timeout message", ev.Status, ev.Error)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine still running after session close")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // --- unit (PG mirror) ------------------------------------------------------
@@ -439,11 +434,7 @@ func TestPGGateHoldFlushOrder(t *testing.T) {
 	if active || n != 0 {
 		t.Errorf("after flush: active=%v queue=%d, want false/0", active, n)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // TestPGGateHoldTimeoutDrainAndReopens (Task 8.17): PG mirror — no watcher
@@ -505,11 +496,7 @@ func TestPGGateHoldTimeoutDrainAndReopens(t *testing.T) {
 	}
 	// Window expires → drain both held messages.
 	expectDrain(2)
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after PG timeout drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	if ev1.Status != "error" || !strings.Contains(ev1.Error, "no checker connected within 1s") {
 		t.Errorf("ev1 = status %q error %q, want error + timeout message", ev1.Status, ev1.Error)
 	}
@@ -530,11 +517,7 @@ func TestPGGateHoldTimeoutDrainAndReopens(t *testing.T) {
 		t.Fatal("post-drain message: not held, want a fresh grace wait (no latch)")
 	}
 	expectDrain(1)
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the second PG drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	if ev3.Status != "error" || !strings.Contains(ev3.Error, "no checker connected within 1s") {
 		t.Errorf("ev3 = status %q error %q, want error + timeout message (audit published)", ev3.Status, ev3.Error)
 	}
@@ -545,7 +528,7 @@ func TestPGGateHoldTimeoutDrainAndReopens(t *testing.T) {
 	// flush phase cannot race the drain timer (the gate re-evaluates per
 	// message — the widened window only affects NEW waits).
 	p.SetGateWaitSeconds(60)
-	if err := vs.SetWatch(context.Background(), s.id, time.Minute); err != nil {
+	if err := vs.SetWatchConn(context.Background(), s.id, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), s.id) })
@@ -572,9 +555,5 @@ func TestPGGateHoldTimeoutDrainAndReopens(t *testing.T) {
 	if !bytes.Equal(buf, want) {
 		t.Errorf("flush message = % x, want % x (byte-exact)", buf, want)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the re-attach flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }

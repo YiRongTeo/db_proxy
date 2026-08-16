@@ -135,9 +135,12 @@ func TestMSSQLAttentionAckSwallowed(t *testing.T) {
 	bbr := bufio.NewReader(bpeer)
 	cbr := bufio.NewReader(cpeer)
 	// The kill already happened: the ack is outstanding, the aborted
-	// batch's event is still pending (its response completes it).
+	// batch's event is still pending (its response completes it). The
+	// swallow-expiry clock (Task 9.10) starts when KillQuery arms the
+	// flag — mirror that here or the expectation expires instantly.
 	s.mu.Lock()
 	s.attnPending = true
+	s.attnAt = time.Now()
 	s.pending = &models.QueryEvent{SQL: "WAITFOR DELAY '00:00:30'", SessionID: s.id}
 	s.capture = &mssqlResultCapture{}
 	s.mu.Unlock()
@@ -238,7 +241,7 @@ func TestMSSQLGateDecision(t *testing.T) {
 		t.Errorf("read-access batch gated: %q, want pass", msg)
 	}
 	// Watcher present → pass.
-	if err := vs.SetWatch(ctx, s.id, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, s.id, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(ctx, s.id) })
@@ -291,10 +294,10 @@ func TestMSSQLGateRejectResponseShape(t *testing.T) {
 func TestMSSQLReadTDSMessageFrames(t *testing.T) {
 	p1, p2 := []byte("first-fragment"), []byte("second-fragment")
 	var wire bytes.Buffer
-	if err := writeTDSPacketStatus(&wire, tdsSQLBatch, 0, p1); err != nil {
+	if err := writeTDSPacketSPID(&wire, tdsSQLBatch, 0, 0, p1); err != nil {
 		t.Fatalf("write frame 1: %v", err)
 	}
-	if err := writeTDSPacketStatus(&wire, tdsSQLBatch, tdsStatusEOM, p2); err != nil {
+	if err := writeTDSPacketSPID(&wire, tdsSQLBatch, tdsStatusEOM, 0, p2); err != nil {
 		t.Fatalf("write frame 2: %v", err)
 	}
 	frames, typ, err := readTDSMessageFrames(bufio.NewReader(&wire))
@@ -423,14 +426,14 @@ func TestMSSQLGateHoldQueueBounds(t *testing.T) {
 		s.mu.Lock()
 		s.pending = &models.QueryEvent{SQL: fmt.Sprintf("SELECT %d", i), Username: "hold", SessionID: s.id}
 		s.mu.Unlock()
-		if !p.gateMSSQLHold(s, mssqlTestFrames(fmt.Sprintf("SELECT %d", i))) {
+		if !p.gateMSSQLHold(s, mssqlTestFrames(fmt.Sprintf("SELECT %d", i)), false) {
 			t.Fatalf("message %d: not held, want queued", i+1)
 		}
 	}
 	s.mu.Lock()
 	s.pending = &models.QueryEvent{SQL: "SELECT overflow", Username: "hold", SessionID: s.id}
 	s.mu.Unlock()
-	if p.gateMSSQLHold(s, mssqlTestFrames("SELECT overflow")) {
+	if p.gateMSSQLHold(s, mssqlTestFrames("SELECT overflow"), false) {
 		t.Error("17th message: held, want immediate reject (queue overflow)")
 	}
 	s.gateMu.Lock()
@@ -462,7 +465,7 @@ func TestMSSQLGateHoldFlushOrder(t *testing.T) {
 		s.pending = &models.QueryEvent{SQL: sql, Username: "hold", SessionID: s.id}
 		s.mu.Unlock()
 		frames[i] = mssqlTestFrames(sql)
-		if !p.gateMSSQLHold(s, frames[i]) {
+		if !p.gateMSSQLHold(s, frames[i], false) {
 			t.Fatalf("message %d: not held, want queued", i+1)
 		}
 	}
@@ -485,11 +488,7 @@ func TestMSSQLGateHoldFlushOrder(t *testing.T) {
 	if active || n != 0 {
 		t.Errorf("after flush: active=%v queue=%d, want false/0", active, n)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // TestMSSQLGateHoldTimeoutDrain: no watcher within the window → every held
@@ -512,13 +511,13 @@ func TestMSSQLGateHoldTimeoutDrain(t *testing.T) {
 	s.mu.Lock()
 	s.pending = ev1
 	s.mu.Unlock()
-	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1")) {
+	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1"), false) {
 		t.Fatal("message 1: not held, want queued")
 	}
 	s.mu.Lock()
 	s.pending = ev2
 	s.mu.Unlock()
-	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 2")) {
+	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 2"), false) {
 		t.Fatal("message 2: not held, want queued")
 	}
 
@@ -534,11 +533,7 @@ func TestMSSQLGateHoldTimeoutDrain(t *testing.T) {
 	}
 	// The wait goroutine finishes the drain (replies → audit events) —
 	// wait for it before asserting the events it stamps.
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after timeout drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	s.gateMu.Lock()
 	active, n := s.gate.active, len(s.gate.queue)
 	s.gateMu.Unlock()
@@ -566,7 +561,7 @@ func TestMSSQLGateHoldZeroWait(t *testing.T) {
 	if msg := p.gateMSSQLBlocked(s, tdsSQLBatch); msg == "" {
 		t.Fatal("unwatched batch: not blocked, want the gating message")
 	}
-	if p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1")) {
+	if p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1"), false) {
 		t.Error("gate_wait_seconds=0: message held, want immediate reject")
 	}
 }
@@ -595,7 +590,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	s.mu.Lock()
 	s.pending = ev1
 	s.mu.Unlock()
-	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1")) {
+	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 1"), false) {
 		t.Fatal("message 1: not held, want queued")
 	}
 	typ, payload, err := readTDSMessage(cbr)
@@ -605,11 +600,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	if msg := extractErrorMsg(payload); !strings.Contains(msg, "no checker connected within 1s") {
 		t.Errorf("drain ERROR = %q, want the timeout message", msg)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the first drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 
 	// Post-drain, STILL unwatched: the next message is blocked again and
 	// starts a FRESH grace wait (no latch) — drained when the new window
@@ -621,7 +612,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	if msg := p.gateMSSQLBlocked(s, tdsSQLBatch); msg == "" {
 		t.Error("post-drain unwatched message passed the gate, want blocked")
 	}
-	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 2")) {
+	if !p.gateMSSQLHold(s, mssqlTestFrames("SELECT 2"), false) {
 		t.Fatal("post-drain message: not held, want a fresh grace wait (no latch)")
 	}
 	typ, payload, err = readTDSMessage(cbr)
@@ -631,11 +622,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	if msg := extractErrorMsg(payload); !strings.Contains(msg, "no checker connected within 1s") {
 		t.Errorf("second drain ERROR = %q, want the timeout message", msg)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the second drain")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 	if ev2.Status != "error" || !strings.Contains(ev2.Error, "no checker connected within 1s") {
 		t.Errorf("ev2 = status %q error %q, want error + timeout message (audit published)", ev2.Status, ev2.Error)
 	}
@@ -646,7 +633,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	// flush phase cannot race the drain timer (the gate re-evaluates per
 	// message — the widened window only affects NEW waits).
 	p.SetGateWaitSeconds(60)
-	if err := vs.SetWatch(context.Background(), s.id, time.Minute); err != nil {
+	if err := vs.SetWatchConn(context.Background(), s.id, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), s.id) })
@@ -661,7 +648,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	// (the backend write blocks until the peer reads) — drive it in a
 	// goroutine, then read the flushed bytes.
 	held := make(chan bool, 1)
-	go func() { held <- p.gateMSSQLHold(s, frames) }()
+	go func() { held <- p.gateMSSQLHold(s, frames, false) }()
 	hdr, got, err := readTDSFrame(bbr)
 	if err != nil {
 		t.Fatalf("flush frame: %v", err)
@@ -672,11 +659,7 @@ func TestMSSQLGateHoldReopensAfterWatch(t *testing.T) {
 	if !bytes.Equal(hdr[:], frames[0].hdr[:]) || !bytes.Equal(got, frames[0].payload) {
 		t.Errorf("flush frame = hdr % x payload % x, want byte-exact % x / % x", hdr, got, frames[0].hdr, frames[0].payload)
 	}
-	select {
-	case <-s.gate.done:
-	case <-time.After(2 * time.Second):
-		t.Error("wait goroutine did not exit after the re-attach flush")
-	}
+	gateWaitJoined(t, &s.gate.wg)
 }
 
 // mssqlResponseError scans a TABULAR payload's token stream and reports

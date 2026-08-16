@@ -84,7 +84,7 @@ func TestMySQLWriteGateGraceHoldRunsAfterWatcher(t *testing.T) {
 	_ = rwClient.SetReadDeadline(time.Time{})
 
 	// Checker attaches WITHIN the window → the held query runs and returns.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -172,7 +172,7 @@ func TestMySQLWriteGateGraceHoldTimeout(t *testing.T) {
 
 	// Task 8.17 — the gate RE-OPENS: with a watcher attached NOW, the next
 	// command FLOWS (same client connection, no reconnect) and runs.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -250,7 +250,7 @@ func TestMySQLWriteGateReopensAfterWatchDrop(t *testing.T) {
 	cleanupLiveRecord(t, vs, sid)
 
 	// (a) Watcher present → queries run.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -297,7 +297,7 @@ func TestMySQLWriteGateReopensAfterWatchDrop(t *testing.T) {
 
 	// (c) Watcher RE-ATTACHES → the next query RUNS on the SAME client
 	// connection (no reconnect) and the row lands.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch re-attach: %v", err)
 	}
 	ins3 := append([]byte{cmdQuery}, "INSERT INTO demo_items (name) VALUES ('"+markerRun+"')"...)
@@ -540,7 +540,7 @@ func TestPGWriteGateGraceHoldRunsAfterWatcher(t *testing.T) {
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // restore the dial-time guard
 
 	// Checker attaches WITHIN the window → the held query runs and returns.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -602,7 +602,7 @@ func TestPGWriteGateGraceHoldTimeout(t *testing.T) {
 
 	// Task 8.17 — the gate RE-OPENS: with a watcher attached NOW, the next
 	// query FLOWS (same session, no reconnect) and returns rows.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -645,7 +645,7 @@ func TestPGWriteGateReopensAfterWatchDrop(t *testing.T) {
 	cleanupLiveRecord(t, vs, sid)
 
 	// (a) Watcher present → queries run.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -679,7 +679,7 @@ func TestPGWriteGateReopensAfterWatchDrop(t *testing.T) {
 
 	// (c) Watcher RE-ATTACHES → the next query RUNS (same session, no
 	// reconnect).
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch re-attach: %v", err)
 	}
 	pgSendQuery(t, front, "SELECT 3")

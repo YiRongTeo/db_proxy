@@ -25,7 +25,8 @@ func readMySQLPacket(r io.Reader) (seq byte, payload []byte, err error) {
 // packet lands in exactly one TCP segment / one TLS record. Splitting into two
 // Write calls produces two TLS records for one MySQL packet (4-byte header +
 // payload), which breaks the mysql C client's SSL_read path ('Lost connection
-// at reading authorization packet').
+// at reading authorization packet'). Task 9.10: the write is checked for
+// short writes (n != len).
 func writeMySQLPacket(w io.Writer, seq byte, payload []byte) error {
 	buf := make([]byte, 4+len(payload))
 	buf[0] = byte(len(payload))
@@ -33,6 +34,12 @@ func writeMySQLPacket(w io.Writer, seq byte, payload []byte) error {
 	buf[2] = byte(len(payload) >> 16)
 	buf[3] = seq
 	copy(buf[4:], payload)
-	_, err := w.Write(buf)
-	return err
+	n, err := w.Write(buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return io.ErrShortWrite
+	}
+	return nil
 }

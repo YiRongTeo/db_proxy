@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
@@ -27,6 +28,16 @@ import (
 // forward immediately (a re-attached checker clears the wait state; the
 // maker's next command flows without reconnecting). Enforcement is intact:
 // no command ever reaches the backend without a watcher at execution time.
+//
+// Task 9.10 — ordering + locking hardening. While a grace wait is ACTIVE,
+// the PG relay stalls EVERY subsequent client message (not just
+// Query/Parse/Execute) and the MSSQL relay stalls every message too, so
+// extended-protocol messages (Bind/Describe/Sync/Close) and ATTENTIONs can
+// never overtake the held queue — the prepared-statement success path stays
+// ordered. All gate I/O runs under the session's writeMu (snapshot the gate
+// state under gateMu, RELEASE it, then write) — gateMu is never held across
+// I/O — and the drain replies serialize with the relay's client writes. The
+// wait goroutine is JOINED at session teardown (closeGateWait wg.Wait).
 //
 // gate_wait_seconds = 0 (the proxy default — the pre-8.13 config value)
 // keeps the old behavior: blocked commands reject immediately.
@@ -69,11 +80,14 @@ type mysqlGateEntry struct {
 // mysqlGateState is the per-session Task 8.13 grace-hold state, guarded by
 // the session's gateMu (a dedicated mutex — the session mu guards the
 // pending/capture slots and is never held across gate transitions).
+// waiting/wg (Task 9.10) track the wait goroutine so closeGateWait can JOIN
+// it — the done channel it replaces is gone.
 type mysqlGateState struct {
-	active bool             // a grace wait is in progress (queue non-empty)
-	queue  []mysqlGateEntry // held commands, bounded (gateQueueMax)
-	stop   chan struct{}    // closed by whoever ends the wait (flush / drain / session close)
-	done   chan struct{}    // closed when the wait goroutine exits
+	active  bool             // a grace wait is in progress (queue non-empty)
+	queue   []mysqlGateEntry // held commands, bounded (gateQueueMax)
+	stop    chan struct{}    // closed by whoever ends the wait (flush / drain / session close)
+	waiting bool             // a wait goroutine is running (reset by every deactivation)
+	wg      sync.WaitGroup   // join the wait goroutine at session teardown (Task 9.10)
 }
 
 // gateHold queues a gated (blocked) command for the grace window instead of
@@ -92,8 +106,14 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 		// First held command: start the wait (grace timer + watch ticker).
 		s.gate.active = true
 		s.gate.stop = make(chan struct{})
-		s.gate.done = make(chan struct{})
-		go p.gateWaitLoop(s)
+		if !s.gate.waiting {
+			s.gate.waiting = true
+			s.gate.wg.Add(1)
+			go func() {
+				defer s.gate.wg.Done()
+				p.gateWaitLoop(s)
+			}()
+		}
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -116,9 +136,9 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 // gateWaitLoop is the per-wait goroutine: it re-checks for a watcher on a
 // short ticker (flushing the queue in order when one appears) and drains +
 // rejects the queue when the grace window expires. It exits as soon as the
-// wait is ended by any path (flush, drain, session close).
+// wait is ended by any path (flush, drain, session close); the caller joins
+// it via s.gate.wg (Task 9.10).
 func (p *MySQLProxy) gateWaitLoop(s *mysqlSession) {
-	defer close(s.gate.done)
 	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
 	defer timer.Stop()
 	ticker := time.NewTicker(gateWatchRecheckInterval)
@@ -150,8 +170,9 @@ func (p *MySQLProxy) gateWaitLoop(s *mysqlSession) {
 // subsequent commands flow normally. The held commands' sniffed events ride
 // the normal pending/capture pipeline (the last one publishes with its
 // backend response; earlier ones collapse like any pipelined commands).
-// The forwarding happens while still holding gateMu so a command arriving
-// mid-flush cannot overtake the held queue.
+// Task 9.10: the gate state is snapshotted under gateMu (NEVER held across
+// I/O) and the forwards take the session's writeMu, so a concurrent relay
+// forward can never interleave mid-packet or overtake the held queue.
 func (p *MySQLProxy) gateFlush(s *mysqlSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -159,16 +180,19 @@ func (p *MySQLProxy) gateFlush(s *mysqlSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
 	s.gate.stop = nil
+	s.gateMu.Unlock()
+	s.writeMu.Lock()
 	for _, e := range entries {
 		if err := writeMySQLPacket(s.backend, e.seq, e.payload); err != nil {
 			break
 		}
 	}
-	s.gateMu.Unlock()
+	s.writeMu.Unlock()
 }
 
 // gateTimeout drains the queue when the grace window expires: every held
@@ -182,6 +206,7 @@ func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
@@ -192,35 +217,46 @@ func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 
 // closeGateWait ends a grace wait on session teardown: the held commands
 // are drained with the same rejection as a timeout (the replies are
-// best-effort — the client is going away anyway) and the wait goroutine and
-// its timers are cleaned up.
+// best-effort — the client is going away anyway) and the wait goroutine is
+// JOINED (Task 9.10) so it cannot outlive the session or publish after
+// finishSession's DelSessionLive.
 func (p *MySQLProxy) closeGateWait(s *mysqlSession) {
 	s.gateMu.Lock()
-	if !s.gate.active {
+	if s.gate.active {
+		s.gate.active = false
+		s.gate.waiting = false
+		entries := s.gate.queue
+		s.gate.queue = nil
+		close(s.gate.stop)
+		s.gate.stop = nil
 		s.gateMu.Unlock()
-		return
+		p.gateRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	} else {
+		s.gateMu.Unlock()
 	}
-	s.gate.active = false
-	entries := s.gate.queue
-	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
-	s.gateMu.Unlock()
-	p.gateRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	// Join the wait goroutine (no-op when none was ever started — Wait on
+	// a zero counter returns immediately).
+	s.gate.wg.Wait()
 }
 
 // gateRejectEntries replies to the client for every held command (ERR 1045,
 // best-effort) and publishes each one's audit event as status=error with
 // the given message. The session's pending slot is cleared so the teardown
-// path cannot publish a duplicate "connection closed" event.
+// path cannot publish a duplicate "connection closed" event. Task 9.10: the
+// replies take the session's writeMu (serialized with the relay's client
+// writes); the audit publishes run lock-free afterwards.
 func (p *MySQLProxy) gateRejectEntries(s *mysqlSession, entries []mysqlGateEntry, msg string) {
 	s.mu.Lock()
 	s.pending = nil
 	s.capture = nil
 	s.mu.Unlock()
-	var lastEv *models.QueryEvent
+	s.writeMu.Lock()
 	for _, e := range entries {
 		_ = writeMySQLPacket(s.client, e.seq+1, errPacket(1045, "42000", msg))
+	}
+	s.writeMu.Unlock()
+	var lastEv *models.QueryEvent
+	for _, e := range entries {
 		if e.ev == nil || e.ev == lastEv {
 			continue // no event, or a later packet of the same multi-packet command
 		}
@@ -239,20 +275,25 @@ func (p *MySQLProxy) gateRejectEntries(s *mysqlSession, entries []mysqlGateEntry
 // length + payload — from a byte-exact Encode at queue time; the decoded
 // pgproto3 message cannot be stored because Backend.Receive reuses
 // flyweight structs across calls), whether it was a SimpleQuery (its drain
-// reply carries the trailing ReadyForQuery), and the audit event snapshot.
+// reply carries the trailing ReadyForQuery), whether it was a Sync (Task
+// 9.10: a drained Sync must also draw the ReadyForQuery that completes an
+// extended-protocol exchange), and the audit event snapshot.
 type pgGateEntry struct {
 	raw   []byte
 	query bool
+	sync  bool
 	ev    *models.QueryEvent
 }
 
 // pgGateState is the per-session Task 8.13 grace-hold state for PG,
-// guarded by the session's gateMu. Mirrors mysqlGateState.
+// guarded by the session's gateMu. Mirrors mysqlGateState (Task 9.10:
+// waiting/wg join instead of the removed done channel).
 type pgGateState struct {
-	active bool
-	queue  []pgGateEntry
-	stop   chan struct{}
-	done   chan struct{}
+	active  bool
+	queue   []pgGateEntry
+	stop    chan struct{}
+	waiting bool
+	wg      sync.WaitGroup
 }
 
 // gatePGHold queues a gated (blocked) PG message for the grace window
@@ -260,7 +301,9 @@ type pgGateState struct {
 // caller must NOT reply and must NOT forward. Returns false when the caller
 // must reject immediately (gate_wait_seconds=0, queue overflow, or an
 // Encode failure — the latter cannot happen in practice for messages just
-// decoded by pgproto3).
+// decoded by pgproto3). Task 9.10: also called for NON-SQL messages while a
+// wait is active (the relay stall) — the queue preserves extended-protocol
+// ordering.
 func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	if p.gateWaitSeconds <= 0 {
 		return false
@@ -269,8 +312,14 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	if !s.gate.active {
 		s.gate.active = true
 		s.gate.stop = make(chan struct{})
-		s.gate.done = make(chan struct{})
-		go p.gatePGWaitLoop(s)
+		if !s.gate.waiting {
+			s.gate.waiting = true
+			s.gate.wg.Add(1)
+			go func() {
+				defer s.gate.wg.Done()
+				p.gatePGWaitLoop(s)
+			}()
+		}
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -285,7 +334,8 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	ev := s.pending // audit snapshot — sniffPGMessage ran before the gate check
 	s.mu.Unlock()
 	_, isQuery := msg.(*pgproto3.Query)
-	s.gate.queue = append(s.gate.queue, pgGateEntry{raw: raw, query: isQuery, ev: ev})
+	_, isSync := msg.(*pgproto3.Sync)
+	s.gate.queue = append(s.gate.queue, pgGateEntry{raw: raw, query: isQuery, sync: isSync, ev: ev})
 	s.gateMu.Unlock()
 	// A watcher that appeared since the gate check unblocks the queue
 	// immediately — checked on every new message arrival, not only on the
@@ -298,7 +348,6 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 
 // gatePGWaitLoop is the PG mirror of gateWaitLoop.
 func (p *PGProxy) gatePGWaitLoop(s *pgSession) {
-	defer close(s.gate.done)
 	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
 	defer timer.Stop()
 	ticker := time.NewTicker(gateWatchRecheckInterval)
@@ -327,8 +376,10 @@ func (p *PGProxy) gatePGWaitLoop(s *pgSession) {
 // gatePGFlush forwards every held message to the backend IN ORDER — the
 // stored raw wire bytes written exactly as the normal relay write does
 // (front.conn.Write; pgproto3's Send is an unbuffered Encode+Write, so this
-// is byte-identical) — and clears the wait. Holds gateMu across the writes
-// so a message arriving mid-flush cannot overtake the held queue.
+// is byte-identical) — and clears the wait. Task 9.10: the state is
+// snapshotted under gateMu (never held across I/O) and the writes take the
+// session's writeMu, so a message arriving mid-flush cannot overtake the
+// held queue or interleave with a relay forward.
 func (p *PGProxy) gatePGFlush(s *pgSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -336,16 +387,19 @@ func (p *PGProxy) gatePGFlush(s *pgSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
 	s.gate.stop = nil
+	s.gateMu.Unlock()
+	s.writeMu.Lock()
 	for _, e := range entries {
 		if _, err := s.front.conn.Write(e.raw); err != nil {
 			break
 		}
 	}
-	s.gateMu.Unlock()
+	s.writeMu.Unlock()
 }
 
 // gatePGTimeout is the PG mirror of gateTimeout: drain + reject the held
@@ -357,6 +411,7 @@ func (p *PGProxy) gatePGTimeout(s *pgSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
@@ -365,38 +420,48 @@ func (p *PGProxy) gatePGTimeout(s *pgSession) {
 	p.gatePGRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 }
 
-// closePGGateWait is the PG mirror of closeGateWait (session teardown).
+// closePGGateWait is the PG mirror of closeGateWait (session teardown): the
+// held messages are drained with the same rejection as a timeout and the
+// wait goroutine is JOINED (Task 9.10).
 func (p *PGProxy) closePGGateWait(s *pgSession) {
 	s.gateMu.Lock()
-	if !s.gate.active {
+	if s.gate.active {
+		s.gate.active = false
+		s.gate.waiting = false
+		entries := s.gate.queue
+		s.gate.queue = nil
+		close(s.gate.stop)
+		s.gate.stop = nil
 		s.gateMu.Unlock()
-		return
+		p.gatePGRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	} else {
+		s.gateMu.Unlock()
 	}
-	s.gate.active = false
-	entries := s.gate.queue
-	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
-	s.gateMu.Unlock()
-	p.gatePGRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	s.gate.wg.Wait()
 }
 
 // gatePGRejectEntries replies to the client for every held message (FATAL
 // 28000; SimpleQuery messages also get the trailing ReadyForQuery a
-// simple-query response always ends with, mirroring gatePGReject) and
-// publishes each one's audit event as status=error. The pending slot is
-// cleared so the teardown path cannot publish a duplicate event.
+// simple-query response always ends with, mirroring gatePGReject — and a
+// held Sync draws the ReadyForQuery that completes an extended-protocol
+// exchange, Task 9.10) and publishes each one's audit event as
+// status=error. The pending slot is cleared so the teardown path cannot
+// publish a duplicate event. Replies run under the session's writeMu.
 func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg string) {
 	s.mu.Lock()
 	s.pending = nil
 	s.capture = nil
 	s.mu.Unlock()
-	var lastEv *models.QueryEvent
+	s.writeMu.Lock()
 	for _, e := range entries {
 		_ = s.be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000", Message: msg})
-		if e.query {
+		if e.query || e.sync {
 			_ = s.be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		}
+	}
+	s.writeMu.Unlock()
+	var lastEv *models.QueryEvent
+	for _, e := range entries {
 		if e.ev == nil || e.ev == lastEv {
 			continue
 		}
@@ -423,6 +488,12 @@ func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg s
 // (status=error). gate_wait_seconds=0 rejects immediately (the caller's
 // reject path). A drain does NOT latch (Task 8.17): the gate re-evaluates
 // per message — a re-attached watcher re-opens it.
+//
+// Task 9.10: while a wait is ACTIVE every message is held (the relay stall)
+// — an ATTENTION cannot overtake the held queue. A held ATTENTION entry is
+// flagged; the drain answers it with the DONE_ATTN acknowledgement (never
+// an ERROR token), and the flush forwards it byte-exact (the backend acks
+// it — the client's cancel intent is preserved).
 
 // mssqlGateFrame is one raw TDS packet of a held message: the 8-byte header
 // VERBATIM plus its payload, forwarded byte-exact on flush.
@@ -432,29 +503,35 @@ type mssqlGateFrame struct {
 }
 
 // mssqlGateEntry is one held message: its raw frames plus the audit event
-// snapshot taken at queue time.
+// snapshot taken at queue time. attn marks a held client ATTENTION (Task
+// 9.10): its drain reply is the DONE_ATTN ack, not an ERROR token.
 type mssqlGateEntry struct {
 	frames []mssqlGateFrame
+	attn   bool
 	ev     *models.QueryEvent
 }
 
 // mssqlGateState is the per-session Task 8.13 grace-hold state for the TDS
-// plane, guarded by the session's gateMu. Mirrors mysqlGateState.
+// plane, guarded by the session's gateMu. Mirrors mysqlGateState (Task
+// 9.10: waiting/wg join instead of the removed done channel).
 type mssqlGateState struct {
-	active bool
-	queue  []mssqlGateEntry
-	stop   chan struct{}
-	done   chan struct{}
+	active  bool
+	queue   []mssqlGateEntry
+	stop    chan struct{}
+	waiting bool
+	wg      sync.WaitGroup
 }
 
 // gateMSSQLHold queues a gated (blocked) TDS message for the grace window
 // instead of rejecting it. Returns true when the message was QUEUED — the
 // caller must NOT reply and must NOT forward: the client's response comes
-// later, either the real backend result (watcher flush) or the drain ERROR.
-// Returns false when the caller must reject immediately: gate_wait_seconds
-// = 0 (pre-8.13 behavior) or the queue is full (overflow rejects only the
-// new message — the queue keeps waiting).
-func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame) bool {
+// later, either the real backend result (watcher flush) or the drain ERROR
+// (a held ATTENTION gets the DONE_ATTN ack). Returns false when the caller
+// must reject immediately: gate_wait_seconds = 0 (pre-8.13 behavior) or the
+// queue is full (overflow rejects only the new message — the queue keeps
+// waiting). isAttn flags a client ATTENTION for the drain reply shape
+// (Task 9.10).
+func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame, isAttn bool) bool {
 	if p.gateWaitSeconds <= 0 {
 		return false
 	}
@@ -463,8 +540,14 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame) boo
 		// First held message: start the wait (grace timer + watch ticker).
 		s.gate.active = true
 		s.gate.stop = make(chan struct{})
-		s.gate.done = make(chan struct{})
-		go p.gateMSSQLWaitLoop(s)
+		if !s.gate.waiting {
+			s.gate.waiting = true
+			s.gate.wg.Add(1)
+			go func() {
+				defer s.gate.wg.Done()
+				p.gateMSSQLWaitLoop(s)
+			}()
+		}
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -473,7 +556,7 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame) boo
 	s.mu.Lock()
 	ev := s.pending // audit snapshot — sniffMSSQLCommand ran before the gate check
 	s.mu.Unlock()
-	s.gate.queue = append(s.gate.queue, mssqlGateEntry{frames: frames, ev: ev})
+	s.gate.queue = append(s.gate.queue, mssqlGateEntry{frames: frames, attn: isAttn, ev: ev})
 	s.gateMu.Unlock()
 	// A watcher that appeared since the gate check unblocks the queue
 	// immediately — checked on every new message arrival, not only on the
@@ -487,9 +570,9 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame) boo
 // gateMSSQLWaitLoop is the TDS mirror of gateWaitLoop: it re-checks for a
 // watcher on a short ticker (flushing the queue in order when one appears)
 // and drains + rejects the queue when the grace window expires. It exits as
-// soon as the wait is ended by any path (flush, drain, session close).
+// soon as the wait is ended by any path (flush, drain, session close); the
+// caller joins it via s.gate.wg (Task 9.10).
 func (p *MSSQLProxy) gateMSSQLWaitLoop(s *mssqlSession) {
-	defer close(s.gate.done)
 	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
 	defer timer.Stop()
 	ticker := time.NewTicker(gateWatchRecheckInterval)
@@ -516,10 +599,12 @@ func (p *MSSQLProxy) gateMSSQLWaitLoop(s *mssqlSession) {
 }
 
 // gateMSSQLFlush forwards every held message to the backend IN ORDER — each
-// frame written byte-exact (original header + payload) under the session's
-// writeMu, exactly as the normal forward path writes it — and clears the
-// wait: subsequent messages flow normally. Holds gateMu across the writes
-// so a message arriving mid-flush cannot overtake the held queue.
+// frame written byte-exact (original header + payload), exactly as the
+// normal forward path writes it — and clears the wait: subsequent messages
+// flow normally. Task 9.10: the state is snapshotted under gateMu (never
+// held across I/O) and the writes take the session's writeMu, so a message
+// arriving mid-flush cannot overtake the held queue or interleave with a
+// relay forward or ATTENTION.
 func (p *MSSQLProxy) gateMSSQLFlush(s *mssqlSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -527,29 +612,29 @@ func (p *MSSQLProxy) gateMSSQLFlush(s *mssqlSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
 	s.gate.stop = nil
+	s.gateMu.Unlock()
 	s.writeMu.Lock()
 	for _, e := range entries {
 		for _, f := range e.frames {
 			if _, err := s.backend.Write(append(f.hdr[:], f.payload...)); err != nil {
 				s.writeMu.Unlock()
-				s.gateMu.Unlock()
 				return
 			}
 		}
 	}
 	s.writeMu.Unlock()
-	s.gateMu.Unlock()
 }
 
 // gateMSSQLTimeout drains the queue when the grace window expires: every
 // held message is rejected to the client (ERROR token 18456 + the timeout
-// message) with an audit event. The session is NOT latched (Task 8.17): a
-// watcher that attaches later re-opens the gate — the maker's next message
-// flows.
+// message; a held ATTENTION gets its DONE_ATTN ack) with an audit event.
+// The session is NOT latched (Task 8.17): a watcher that attaches later
+// re-opens the gate — the maker's next message flows.
 func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
 	s.gateMu.Lock()
 	if !s.gate.active {
@@ -557,6 +642,7 @@ func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
 		return
 	}
 	s.gate.active = false
+	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
 	close(s.gate.stop)
@@ -568,35 +654,58 @@ func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
 // closeMSSQLGateWait ends a grace wait on session teardown: the held
 // messages are drained with the same rejection as a timeout (the replies
 // are best-effort — the client is going away anyway) and the wait goroutine
-// and its timers are cleaned up.
+// is JOINED (Task 9.10).
 func (p *MSSQLProxy) closeMSSQLGateWait(s *mssqlSession) {
 	s.gateMu.Lock()
-	if !s.gate.active {
+	if s.gate.active {
+		s.gate.active = false
+		s.gate.waiting = false
+		entries := s.gate.queue
+		s.gate.queue = nil
+		close(s.gate.stop)
+		s.gate.stop = nil
 		s.gateMu.Unlock()
-		return
+		p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	} else {
+		s.gateMu.Unlock()
 	}
-	s.gate.active = false
-	entries := s.gate.queue
-	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
-	s.gateMu.Unlock()
-	p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
+	s.gate.wg.Wait()
+}
+
+// buildTDSAttnAck builds the DONE_ATTN acknowledgement for a held client
+// ATTENTION (Task 9.10): a single DONE token (0xFD) with the DONE_ATTN
+// status bit (0x0020), curcmd 0, rowcount 0 — the 13-byte shape the real
+// server sends for an attention ack (live capture `fd 20 00 …`).
+func buildTDSAttnAck() []byte {
+	out := make([]byte, 13)
+	out[0] = 0xFD
+	out[1] = tdsDoneAttn
+	out[2] = 0x00
+	return out
 }
 
 // gateMSSQLRejectEntries replies to the client for every held message (a
-// TABULAR ERROR token + DONE_ERROR tail, best-effort) and publishes each
-// one's audit event as status=error with the given message. The pending
-// slot is cleared so the teardown path cannot publish a duplicate
-// "connection closed" event.
+// TABULAR ERROR token + DONE_ERROR tail; a held ATTENTION gets the
+// DONE_ATTN ack instead — Task 9.10) and publishes each one's audit event
+// as status=error with the given message. The pending slot is cleared so
+// the teardown path cannot publish a duplicate "connection closed" event.
+// Replies run under the session's writeMu (Task 9.10).
 func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGateEntry, msg string) {
 	s.mu.Lock()
 	s.pending = nil
 	s.capture = nil
 	s.mu.Unlock()
+	s.writeMu.Lock()
+	for _, e := range entries {
+		if e.attn {
+			_ = writeTDSMessage(s.client, tdsTabular, buildTDSAttnAck())
+		} else {
+			_ = writeTDSMessage(s.client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
+		}
+	}
+	s.writeMu.Unlock()
 	var lastEv *models.QueryEvent
 	for _, e := range entries {
-		_ = writeTDSMessage(s.client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
 		if e.ev == nil || e.ev == lastEv {
 			continue // no event, or a later frame of the same multi-frame message
 		}

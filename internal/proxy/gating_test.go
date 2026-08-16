@@ -229,7 +229,7 @@ func TestMySQLWriteGateDecision(t *testing.T) {
 	ctx := context.Background()
 	watchedSid := "sid-gate-unit-watched"
 	_ = vs.DelWatch(ctx, watchedSid)
-	if err := vs.SetWatch(ctx, watchedSid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, watchedSid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), watchedSid) })
@@ -277,7 +277,7 @@ func TestMySQLWriteGateDecision(t *testing.T) {
 // command errors (used to prove the gate fails closed).
 func newDeadStore(t *testing.T) *store.ValkeyStore {
 	t.Helper()
-	vs, err := store.NewValkeyStoreDirect(context.Background(), "127.0.0.1:6379", "", 0)
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestPGWriteGateDecision(t *testing.T) {
 	ctx := context.Background()
 	watchedSid := "sid-pg-gate-watched"
 	_ = vs.DelWatch(ctx, watchedSid)
-	if err := vs.SetWatch(ctx, watchedSid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, watchedSid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), watchedSid) })
@@ -455,7 +455,7 @@ func TestMySQLWriteGateWatcherPass(t *testing.T) {
 	started := recvSessionEvent(t, userCh)
 	sid := started.SessionID
 	cleanupLiveRecord(t, vs, sid)
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -556,7 +556,7 @@ func TestMySQLWriteGateWatcherRemovedMidSession(t *testing.T) {
 	cleanupLiveRecord(t, vs, sid)
 
 	// Watched → INSERT passes.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	insert := append([]byte{cmdQuery}, "INSERT INTO demo_items (name) VALUES ('"+marker+"')"...)
@@ -582,7 +582,7 @@ func TestMySQLWriteGateWatcherRemovedMidSession(t *testing.T) {
 	assertBlockedEvent(t, ev, sid, "select", "SELECT 1")
 
 	// Re-watched → the SAME session works again.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	if err := writeMySQLPacket(client, 0, sel); err != nil {
@@ -682,7 +682,7 @@ func TestPGWriteGateBlocksUnwatched(t *testing.T) {
 	assertBlockedEvent(t, ev, sid, "select", "SELECT 1")
 
 	// Watcher present → the same session's query passes.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -748,7 +748,7 @@ func TestMySQLWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
 	// The checker attaches BEFORE the maker connects — exactly what the
 	// token-time pending listing enables (watch:<sid> from the pending
 	// entry, before the session exists).
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
@@ -811,7 +811,7 @@ func TestPGWriteGateFirstQueryPassesWithTokenSid(t *testing.T) {
 	ln, done := startTestPGProxyWithCreds(t, vs, &bytes.Buffer{}, pgLiveCreds, 1)
 
 	// Checker attaches BEFORE the maker connects.
-	if err := vs.SetWatch(ctx, sid, time.Minute); err != nil {
+	if err := vs.SetWatchConn(ctx, sid, "test-conn", time.Minute); err != nil {
 		t.Fatalf("SetWatch: %v", err)
 	}
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
