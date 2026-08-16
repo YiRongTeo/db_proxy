@@ -164,7 +164,12 @@ func TestSessionsListsLiveDirectory(t *testing.T) {
 }
 
 // TestSessionsEmptyIsEmptyArray: with no sess:live keys, GET /api/sessions
-// returns 200 with an empty JSON array — never null.
+// returns 200 with an empty JSON array — never null. The directory is
+// SHARED with the store/api/cmd live suites (parallel packages write
+// sess:live records concurrently), so the test is self-contained: seed
+// exactly ONE fixture, assert it is listed, delete it, assert it is gone,
+// and when the directory happens to be truly empty at the final read,
+// assert the [] encoding (also pinned by the store suite).
 func TestSessionsEmptyIsEmptyArray(t *testing.T) {
 	srv, client := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
@@ -174,22 +179,53 @@ func TestSessionsEmptyIsEmptyArray(t *testing.T) {
 		t.Fatalf("NewValkeyStoreDirect: %v", err)
 	}
 	defer vs.Close()
-	clearLiveDirectory(t, vs)
 
+	// Seed one fixture through the store — exactly what the data plane's
+	// heartbeat writes (the sid is unique per run).
+	sid := "test-sid-empty-" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
+	seedLiveSession(t, vs, liveRecord{
+		SessionID: sid,
+		Username:  "alice",
+		DB:        "appdb",
+		LastSeen:  time.Now().UTC(),
+	})
+
+	// The fixture is listed.
 	resp, err := client.Get(srv.URL + "/api/sessions")
 	if err != nil {
 		t.Fatalf("GET /api/sessions: %v", err)
 	}
-	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
 		t.Fatalf("read /api/sessions body: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /api/sessions: status %d, want 200", resp.StatusCode)
 	}
-	if s := strings.TrimSpace(string(body)); s != "[]" {
-		t.Errorf("empty directory body = %s, want []", s)
+	if !strings.Contains(string(body), sid) {
+		t.Fatalf("seeded session not listed: %s", body)
+	}
+
+	// Delete it; the API must no longer list it.
+	clearLiveDirectory(t, vs)
+	resp, err = client.Get(srv.URL + "/api/sessions")
+	if err != nil {
+		t.Fatalf("GET /api/sessions (after delete): %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if strings.Contains(string(body), sid) {
+		t.Fatalf("deleted session still listed: %s", body)
+	}
+	if s := strings.TrimSpace(string(body)); s == "[]" {
+		return // genuinely empty — the [] encoding holds
+	}
+	// Foreign fixtures from parallel packages may be present: the body must
+	// still be a JSON ARRAY (never null) — parse it to prove the shape.
+	var arr []json.RawMessage
+	if err := json.Unmarshal(body, &arr); err != nil {
+		t.Fatalf("non-empty directory body is not a JSON array: %v (%s)", err, body)
 	}
 }
 

@@ -37,18 +37,20 @@ credentials_api:
   api_key: ""                # sent as X-Api-Key (env: ZT_CREDENTIALS_API_API_KEY)
   timeout_seconds: 5         # per-request timeout (env: ZT_CREDENTIALS_API_TIMEOUT_SECONDS)
 credentials:                  # Data Plane owns DB credentials (zero-trust); key format <dbtype>:<db_user>@<db_ip>:<db_port>
+                              # NO SECRETS IN COMMITTED CONFIGS — each password is a ${VAR} placeholder resolved from
+                              # .env (git-ignored, see .env.example) or the process environment; unset = load error.
   - key: "mysql:ro_user@127.0.0.1:3307"
-    password: "ro_pw"
+    password: "${ZT_CRED_MYSQL_RO_PASSWORD}"
   - key: "mysql:rw_user@127.0.0.1:3307"
-    password: "rw_pw"
+    password: "${ZT_CRED_MYSQL_RW_PASSWORD}"
   - key: "postgres:ro_user@127.0.0.1:5433"
-    password: "ro_pw"
+    password: "${ZT_CRED_PG_RO_PASSWORD}"
   # Phase 9 (Task 9.1): MSSQL 2022 test backend (mssql-test, host port 1434).
   # SQL logins seeded with CHECK_POLICY=OFF / CHECK_EXPIRATION=OFF (dev only).
   - key: "mssql:ro_user@127.0.0.1:1434"
-    password: "ro_pw"
+    password: "${ZT_CRED_MSSQL_RO_PASSWORD}"
   - key: "mssql:rw_user@127.0.0.1:1434"
-    password: "rw_pw"
+    password: "${ZT_CRED_MSSQL_RW_PASSWORD}"
 # Task 8.8 query logging (user directive 2026-08-13): every query passing
 # through the proxy is ALWAYS logged with full context (username, ticket_id,
 # db_user, db, db_type, stmt_type, status, session_id, sql). log_query_output

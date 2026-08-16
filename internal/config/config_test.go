@@ -16,7 +16,24 @@ const (
 	dataYAML    = "../../configs/data.yaml"
 )
 
+// setSecretEnv fills the environment with the secrets the COMMITTED
+// configs require (user directive 2026-08-17: no passwords in config
+// files — tests emulate the git-ignored .env via t.Setenv, which restores
+// the process env afterwards). Tests loading controlYAML/dataYAML call
+// this first; the configs' ${VAR} placeholders + fail-fast checks resolve
+// against it.
+func setSecretEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("ZT_AUTH_PASSWORD", "admin123")
+	t.Setenv("ZT_CRED_MYSQL_RO_PASSWORD", "ro_pw")
+	t.Setenv("ZT_CRED_MYSQL_RW_PASSWORD", "rw_pw")
+	t.Setenv("ZT_CRED_PG_RO_PASSWORD", "ro_pw")
+	t.Setenv("ZT_CRED_MSSQL_RO_PASSWORD", "ro_pw")
+	t.Setenv("ZT_CRED_MSSQL_RW_PASSWORD", "rw_pw")
+}
+
 func TestLoadControl(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadControl(controlYAML)
 	if err != nil {
 		t.Fatalf("LoadControl(%q) error: %v", controlYAML, err)
@@ -74,6 +91,7 @@ func TestLoadControl(t *testing.T) {
 // levels: the read-write preset is the ONLY write-gated target — the two
 // read-only presets carry access "read" and never gate.
 func TestDBPresetAccessValues(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadControl(controlYAML)
 	if err != nil {
 		t.Fatalf("LoadControl(%q) error: %v", controlYAML, err)
@@ -102,6 +120,7 @@ func TestDBPresetAccessValues(t *testing.T) {
 // json tags on DBPreset, encoding/json emits PascalCase keys and the
 // Angular maker-portal select renders empty options.
 func TestDBPresetJSONWireContract(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadControl(controlYAML)
 	if err != nil {
 		t.Fatalf("LoadControl(%q) error: %v", controlYAML, err)
@@ -156,6 +175,7 @@ func TestDBPresetJSONWireContract(t *testing.T) {
 }
 
 func TestLoadData(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadData(dataYAML)
 	if err != nil {
 		t.Fatalf("LoadData(%q) error: %v", dataYAML, err)
@@ -753,6 +773,7 @@ log_query_output: true
 // DISABLED — no DB dependency unless enabled — with the dev-target defaults
 // (host/port = mysql-test container, database zt_audit).
 func TestAuditMySQLDefaultsOff(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadControl(controlYAML)
 	if err != nil {
 		t.Fatalf("LoadControl(%q) error: %v", controlYAML, err)
@@ -1002,6 +1023,7 @@ gate_wait_seconds: 20
 // overhead — the proxies' metrics wrapper stays nil); listen/path defaults
 // are the committed 0.0.0.0:9464 /metrics.
 func TestMetricsDisabledByDefault(t *testing.T) {
+	setSecretEnv(t)
 	cfg, err := LoadData(dataYAML)
 	if err != nil {
 		t.Fatalf("LoadData(%q) error: %v", dataYAML, err)

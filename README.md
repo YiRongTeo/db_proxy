@@ -79,7 +79,8 @@ configs/         control.yaml, data.yaml (dev defaults; ZT_ env overrides)
 ## Get started
 
 See **[RUN.md](RUN.md)** — containers → `go run ./cmd/control` → `go run ./cmd/data` → curl a token →
-connect HeidiSQL/mysql/psql → Checker at `http://127.0.0.1:8080/checker` (login `admin/admin123`, dev only).
+connect HeidiSQL/mysql/psql → Checker at `http://127.0.0.1:8080/checker` (login `admin`, password from
+`.env` — `cp .env.example .env` first; the committed configs carry no secrets).
 
 ## Docs
 

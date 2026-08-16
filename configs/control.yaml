@@ -8,7 +8,7 @@ api:
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
   username: "admin"
-  password: "admin123"        # override via ZT_AUTH_PASSWORD
+  password: ""                # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUTH_PASSWORD in .env (see .env.example); empty = plane refuses to start
   session_ttl_hours: 8
 db_presets:
   - name: "MySQL read-only"
@@ -85,5 +85,5 @@ audit:
     host: "127.0.0.1"
     port: "3307"
     user: "root"            # dev container root (RUN.md §1.2); needs CREATE DATABASE — use a dedicated user in prod
-    password: "root_pw"     # dev only (same class as configs/data.yaml plaintext); override via ZT_AUDIT_MYSQL_PASSWORD
+    password: ""            # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUDIT_MYSQL_PASSWORD in .env (see .env.example); empty = plane refuses to start when enabled
     database: "zt_audit"

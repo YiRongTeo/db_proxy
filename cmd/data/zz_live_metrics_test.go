@@ -134,6 +134,14 @@ func TestLiveMetricsScrapeAndDeltas(t *testing.T) {
 		"ZT_METRICS_ENABLED=true", // default listen 0.0.0.0:9464 + path /metrics
 		"ZT_LISTEN_ADDR=:"+dataPort,
 		"ZT_GATE_WAIT_SECONDS=0", // blocked commands reject immediately (pre-8.13)
+		// Secrets (user directive 2026-08-17: committed configs carry none —
+		// the plane resolves the credentials list's ${VAR} placeholders from
+		// env, so the hermetic plane must supply them).
+		"ZT_CRED_MYSQL_RO_PASSWORD=ro_pw",
+		"ZT_CRED_MYSQL_RW_PASSWORD=rw_pw",
+		"ZT_CRED_PG_RO_PASSWORD=ro_pw",
+		"ZT_CRED_MSSQL_RO_PASSWORD=ro_pw",
+		"ZT_CRED_MSSQL_RW_PASSWORD=rw_pw",
 	)
 	plane := exec.Command(bin)
 	plane.Dir = root

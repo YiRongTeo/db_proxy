@@ -206,7 +206,11 @@ func readAudit(v *viper.Viper) (AuditConfig, error) {
 			{"audit.mysql.database", a.MySQL.Database},
 		} {
 			if f.val == "" {
-				return AuditConfig{}, fmt.Errorf("audit.mysql.enabled=true requires %s", f.name)
+				hint := ""
+				if f.name == "audit.mysql.password" {
+					hint = " (set ZT_AUDIT_MYSQL_PASSWORD in .env — see .env.example)"
+				}
+				return AuditConfig{}, fmt.Errorf("audit.mysql.enabled=true requires %s%s", f.name, hint)
 			}
 		}
 	}
@@ -214,7 +218,12 @@ func readAudit(v *viper.Viper) (AuditConfig, error) {
 }
 
 // LoadControl reads the Control Plane config (configs/control.yaml).
+// Secrets come from the environment (.env via LoadDotEnv or exported
+// variables), never from the committed file — see dotenv.go.
 func LoadControl(path string) (*ControlConfig, error) {
+	if err := LoadDotEnv(dotenvPath()); err != nil {
+		return nil, err
+	}
 	v := viper.New()
 	if err := load(v, path, map[string]any{
 		"http.addr": ":8080", "api.token_ttl_seconds": 300,
@@ -261,7 +270,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
 	}
 	if cfg.AuthPassword == "" {
-		return nil, fmt.Errorf("auth.password is required (set auth.password or ZT_AUTH_PASSWORD)")
+		return nil, fmt.Errorf("auth.password is required (set ZT_AUTH_PASSWORD in .env — see .env.example)")
 	}
 	if cfg.TokenTTL <= 0 {
 		return nil, fmt.Errorf("api.token_ttl_seconds must be > 0, got %d", cfg.TokenTTL)
@@ -343,7 +352,11 @@ type DataConfig struct {
 	Metrics MetricsConfig
 }
 
-// LoadData reads the Data Plane config (configs/data.yaml).
+// LoadData reads the Data Plane config (configs/data.yaml). Secrets come
+// from the environment (.env via LoadDotEnv or exported variables) — the
+// committed credentials list carries ${VAR} placeholders, expanded here;
+// an unset variable is a load error, never a silent empty password. See
+// dotenv.go.
 //
 // Task 8.7: credentials_source defaults to "config" (committed credentials
 // list); "api" switches to per-connect password fetches from
@@ -352,6 +365,9 @@ type DataConfig struct {
 // a load error — a data plane that cannot resolve passwords must never
 // start silently.
 func LoadData(path string) (*DataConfig, error) {
+	if err := LoadDotEnv(dotenvPath()); err != nil {
+		return nil, err
+	}
 	v := viper.New()
 	if err := load(v, path, map[string]any{
 		"listen.addr": ":3306", "listen.detect_delay_ms": 200,
@@ -448,7 +464,13 @@ func LoadData(path string) (*DataConfig, error) {
 		return nil, fmt.Errorf("unmarshal credentials: %w", err)
 	}
 	for _, c := range creds {
-		cfg.Credentials[c.Key] = c.Password
+		// Passwords are ${VAR} placeholders resolved from the environment
+		// (user directive 2026-08-17: no secrets in committed configs).
+		pw, err := expandEnv(c.Password)
+		if err != nil {
+			return nil, fmt.Errorf("credentials %s: %w", c.Key, err)
+		}
+		cfg.Credentials[c.Key] = pw
 	}
 	return cfg, nil
 }

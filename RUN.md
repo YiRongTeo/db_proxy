@@ -251,6 +251,24 @@ write-gate slots into the client→backend sniff (Task 9.4).
 
 Both planes read `configs/*.yaml` **relative to the repo root** — always start them from there.
 
+### 2.0 Secrets bootstrap (one-time)
+
+The committed configs carry **no passwords** — every secret (control-plane
+login, audit sink, backend DB credentials, valkey) is resolved from the
+git-ignored `.env` (or exported `ZT_*` variables) at plane startup. Create
+it once from the template:
+
+```bash
+cd /d/AI/hermes/Project/Project-D
+cp .env.example .env     # then edit .env to taste (dev defaults already match §1's container seeds)
+```
+
+Required: `ZT_AUTH_PASSWORD` (empty → the control plane refuses to start).
+`ZT_CRED_*` entries feed the data plane's credentials list via `${VAR}`
+placeholders in `configs/data.yaml`; an unset credential variable is a
+**load error**, never a silent empty password. `ZT_ENV_FILE` overrides the
+`.env` path (e.g. for CI). PM2 (§7) loads `.env` via `env_file` too.
+
 ### 2.1 Control Plane (:8080 — REST + WS hub + Angular SPA)
 
 ```bash
@@ -561,8 +579,10 @@ For PostgreSQL use psql or any PG client pointed at the same `127.0.0.1:3306`.
 | `http://127.0.0.1:8080/checker` | Checker dashboard — live audit feed (`channel=*` = all queries) |
 | `http://127.0.0.1:8080/login` | Login |
 
-Login: **admin / admin123** — dev-only defaults, change via `configs/control.yaml`
-(`auth.username` / `auth.password`) or env `ZT_AUTH_USERNAME` / `ZT_AUTH_PASSWORD`.
+Login: **admin** with the password from `.env` (`ZT_AUTH_PASSWORD` — copy
+`.env.example` to `.env` first; the committed configs carry NO secrets).
+Override the username via `configs/control.yaml` (`auth.username`) or
+`ZT_AUTH_USERNAME`.
 
 Checker is **monitor-only** for statements in v1 (live audit; no approval of queries). UI tokens
 can only target the `db_presets` allowlist from `configs/control.yaml`. Phase 8 adds per-session

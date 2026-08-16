@@ -7,3 +7,5 @@ configs/*.local.yaml
 .superpowers/
 build/
 *.zip
+.env
+.env.local

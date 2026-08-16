@@ -20,8 +20,12 @@
  *   script: 'go',
  *   args:   'run ./cmd/control',          // or './cmd/data'
  *
- * Required env: ZT_API_API_KEY gates POST /api/token for external callers.
- * Dev-only default admin login: admin/admin123 (override via ZT_AUTH_USERNAME / ZT_AUTH_PASSWORD).
+ * Secrets come from .env (git-ignored; cp .env.example .env) — each app
+ * loads it via PM2's env_file AND the planes re-read it at startup, so
+ * ZT_AUTH_PASSWORD / ZT_CRED_* / ZT_AUDIT_MYSQL_PASSWORD never live in
+ * committed files. Required env: ZT_API_API_KEY gates POST /api/token for
+ * external callers (also via .env).
+ * Dev-only default admin login: admin/<ZT_AUTH_PASSWORD from .env>.
  */
 module.exports = {
   apps: [
@@ -33,6 +37,7 @@ module.exports = {
       exec_mode: 'fork', // single process — Valkey is the shared state, not process memory
       watch: false,
       autorestart: true,
+      env_file: '.env', // git-ignored secrets (cp .env.example .env)
       env: {
         ZT_API_API_KEY: 'change-me', // placeholder — set a real key (empty disables external issuance)
       },
@@ -52,6 +57,7 @@ module.exports = {
       exec_mode: 'fork',
       watch: false,
       autorestart: true,
+      env_file: '.env', // git-ignored secrets (cp .env.example .env)
       env: {},
       error_file: 'logs/data-error.log',
       out_file: 'logs/data-out.log',
