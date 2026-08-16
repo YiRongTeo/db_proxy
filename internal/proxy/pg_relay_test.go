@@ -26,7 +26,7 @@ var pgLiveCreds = map[string]string{"postgres:ro_user@127.0.0.1:5433": "ro_pw"}
 
 // startTestPGProxyWithCreds is startTestPGProxy with a caller-supplied
 // credential map (used by relay tests that connect to the live backend).
-func startTestPGProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, creds map[string]string, n int) (net.Listener, <-chan struct{}) {
+func startTestPGProxyWithCreds(t *testing.T, vs Store, logBuf *bytes.Buffer, creds map[string]string, n int) (net.Listener, <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -395,15 +395,16 @@ func TestPGProxyForwardsClientDatabase(t *testing.T) {
 }
 
 // TestPGProxyBackendUnavailable: when the backend connect fails (no
-// credentials), the session ends with FATAL 28000 'backend unavailable' after
-// the welcome sequence.
+// credentials), the session ends with FATAL 28000 'backend unavailable'.
+// The backend connect now runs BEFORE any welcome is sent (review 2026-08-16
+// reorder: the client is only told the session is up once the deadline-bounded
+// pid capture has succeeded), so the FATAL is the first and only message.
 func TestPGProxyBackendUnavailable(t *testing.T) {
 	vs := proxyTestStore(t)
 	ln, done := startTestPGProxy(t, vs, &bytes.Buffer{}, 1) // empty creds
 	token := pgLiveToken(t, vs)
 
 	front := pgDialDB(t, ln, token, false, "appdb")
-	pgReadUntilReady(t, front)
 
 	er := pgReadFatalError(t, front)
 	if er.Message != "backend unavailable" {

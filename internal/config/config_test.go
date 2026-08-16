@@ -266,6 +266,9 @@ func TestLoadControlSentinelShape(t *testing.T) {
 	path := writeTempConfig(t, `
 http:
   addr: ":8443"
+auth:
+  username: admin
+  password: secret
 valkey:
   mode: sentinel
   addr: "10.0.0.5:6379"
@@ -332,6 +335,9 @@ func TestValkeySentinelAuth(t *testing.T) {
 		path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -353,6 +359,9 @@ valkey:
 		path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -376,6 +385,9 @@ valkey:
 		path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -438,6 +450,9 @@ func TestTLSOffState(t *testing.T) {
 	path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 tls:
   enabled: false
   cert_file: "certs/does-not-exist.crt"
@@ -771,6 +786,9 @@ func TestAuditMySQLParsesEnabled(t *testing.T) {
 	path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 audit:
   mysql:
     enabled: true
@@ -839,6 +857,9 @@ func TestAuditMySQLEnvOverride(t *testing.T) {
 	path := writeTempConfig(t, `
 http:
   addr: ":8080"
+auth:
+  username: admin
+  password: secret
 `)
 	cfg, err := LoadControl(path)
 	if err != nil {
@@ -1098,4 +1119,127 @@ metrics:
 	if _, err := LoadData(path); err != nil {
 		t.Fatalf("LoadData(%q) error: %v, want nil (disabled block inert)", path, err)
 	}
+}
+
+// TestLoadControlAuthFailFast (review round 3) guards the control-plane auth
+// fail-fast: AutomaticEnv is set, so an EMPTY env override (e.g.
+// ZT_AUTH_PASSWORD="") silently overrides the defaults map and would leave
+// the plane with an empty password. An empty auth.username/auth.password or
+// a non-positive api.token_ttl_seconds is a load error naming the field —
+// a plane with unguessable-empty credentials or an instant-expiry token
+// must never start silently.
+func TestLoadControlAuthFailFast(t *testing.T) {
+	const valid = `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+valkey:
+  mode: direct
+  addr: "127.0.0.1:6379"
+`
+
+	t.Run("valid config loads", func(t *testing.T) {
+		cfg, err := LoadControl(writeTempConfig(t, valid))
+		if err != nil {
+			t.Fatalf("LoadControl(valid) error: %v", err)
+		}
+		if cfg.AuthUser != "admin" || cfg.AuthPassword != "secret" {
+			t.Errorf("AuthUser/AuthPassword = %q/%q, want admin/secret", cfg.AuthUser, cfg.AuthPassword)
+		}
+		if cfg.TokenTTL != 300 {
+			t.Errorf("TokenTTL = %d, want 300 (default)", cfg.TokenTTL)
+		}
+	})
+
+	t.Run("empty env override fails fast", func(t *testing.T) {
+		// The file has a good password; the empty env override wins (viper
+		// AutomaticEnv) and must be rejected, not silently accepted.
+		t.Setenv("ZT_AUTH_PASSWORD", "")
+		_, err := LoadControl(writeTempConfig(t, valid))
+		if err == nil {
+			t.Fatal("LoadControl: want error when ZT_AUTH_PASSWORD is empty, got nil")
+		}
+		if !strings.Contains(err.Error(), "auth.password") {
+			t.Errorf("error %q missing the auth.password hint", err.Error())
+		}
+	})
+
+	t.Run("empty username env override fails fast", func(t *testing.T) {
+		t.Setenv("ZT_AUTH_USERNAME", "")
+		_, err := LoadControl(writeTempConfig(t, valid))
+		if err == nil {
+			t.Fatal("LoadControl: want error when ZT_AUTH_USERNAME is empty, got nil")
+		}
+		if !strings.Contains(err.Error(), "auth.username") {
+			t.Errorf("error %q missing the auth.username hint", err.Error())
+		}
+	})
+
+	t.Run("empty password in file fails fast", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: ""
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl: want error for empty auth.password in file, got nil")
+		}
+		if !strings.Contains(err.Error(), "auth.password") {
+			t.Errorf("error %q missing the auth.password hint", err.Error())
+		}
+	})
+
+	t.Run("missing auth block fails fast", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl: want error when auth block is absent, got nil")
+		}
+	})
+
+	t.Run("ttl zero fails fast", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+api:
+  token_ttl_seconds: 0
+auth:
+  username: admin
+  password: secret
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl: want error for token_ttl_seconds=0, got nil")
+		}
+		if !strings.Contains(err.Error(), "token_ttl_seconds") {
+			t.Errorf("error %q missing the token_ttl_seconds hint", err.Error())
+		}
+	})
+
+	t.Run("ttl negative fails fast", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+api:
+  token_ttl_seconds: -5
+auth:
+  username: admin
+  password: secret
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl: want error for token_ttl_seconds=-5, got nil")
+		}
+		if !strings.Contains(err.Error(), "token_ttl_seconds") {
+			t.Errorf("error %q missing the token_ttl_seconds hint", err.Error())
+		}
+	})
 }

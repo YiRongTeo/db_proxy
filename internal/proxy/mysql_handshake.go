@@ -18,10 +18,8 @@ const (
 	capPluginAuth       = 1 << 19
 	capPluginAuthData   = 1 << 21
 
-	cmdQuit    = 0x01
 	cmdInitDB  = 0x02
 	cmdQuery   = 0x03
-	cmdPing    = 0x0e
 	cmdPrepare = 0x16
 	cmdExecute = 0x17
 )

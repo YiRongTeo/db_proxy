@@ -191,37 +191,46 @@ func TestDispatchMSSQLNilClosesConn(t *testing.T) {
 	}
 }
 
-// fakeMSSQLProxy records that handleConn was invoked and that the peeked
-// 0x12 prelogin byte is still readable through the shared bufio.Reader.
-type fakeMSSQLProxy struct {
-	called bool
-	b      byte
-}
-
-func (f *fakeMSSQLProxy) handleConn(_ context.Context, _ net.Conn, br *bufio.Reader) {
-	f.called = true
-	if b, err := br.Peek(1); err == nil {
-		f.b = b[0]
-	}
-}
-
 // TestDispatchMSSQLRoutesToHandler: a 0x12-prefixed connection routes to the
-// mssql handler (not pg/mysql), and the handler sees the prelogin byte
-// through the same bufio.Reader the dispatcher peeked.
+// REAL mssql handler (not pg/mysql), and the prelogin byte peeked by decide
+// survives the dispatcher's shared bufio.Reader into the handler's own read.
+// Review 2026-08-16: the mssqlProxy interface + fake were removed — the
+// dispatcher holds the concrete *MSSQLProxy, and the prelogin round trip
+// against the real handler proves routing + byte preservation.
 func TestDispatchMSSQLRoutesToHandler(t *testing.T) {
 	server, client := dialPair(t)
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
-	fake := &fakeMSSQLProxy{}
-	d := NewDispatcher(logger, nil, nil, fake, 100*time.Millisecond, 8)
-	if _, err := client.Write([]byte{0x12, 0x01, 0x00}); err != nil {
-		t.Fatalf("write: %v", err)
+	mssql := NewMSSQLProxy(logger, nil, &ConfigCredResolver{}, nil)
+	d := NewDispatcher(logger, nil, nil, mssql, 100*time.Millisecond, 8)
+	// A FULL prelogin packet: decide peeked the 0x12 first byte and the
+	// handler must still see it (through br) when it parses the packet.
+	if err := writeTDSPacket(client, tdsPrelogin, buildPrelogin(encryptOff)); err != nil {
+		t.Fatalf("write prelogin: %v", err)
 	}
-	d.dispatch(context.Background(), server)
-	if !fake.called {
-		t.Fatal("expected mssql handler to be invoked for 0x12 first byte")
+	done := make(chan struct{})
+	go func() {
+		d.dispatch(context.Background(), server)
+		close(done)
+	}()
+	// The handler answers the prelogin with its TABULAR response — its
+	// arrival proves the mssql handler ran on THIS conn and consumed the
+	// peeked bytes.
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	typ, payload, err := readTDSMessage(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("read prelogin response: %v", err)
 	}
-	if fake.b != 0x12 {
-		t.Fatalf("handler peeked byte = %#x, want 0x12 (peeked bytes preserved)", fake.b)
+	if typ != tdsTabular {
+		t.Fatalf("prelogin response packet type = %#x, want %#x (TABULAR)", typ, tdsTabular)
+	}
+	if enc, err := parsePrelogin(payload); err != nil || enc != encryptNotSup {
+		t.Fatalf("prelogin response encryption = %#x (err %v), want %#x (ENCRYPT_NOT_SUP)", enc, err, encryptNotSup)
+	}
+	client.Close() // the handler's LOGIN7 read fails → handleConn returns
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not return within 5s of client close")
 	}
 }

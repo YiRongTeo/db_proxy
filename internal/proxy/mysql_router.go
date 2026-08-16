@@ -13,6 +13,13 @@ import (
 	"zerotrust-proxy/internal/models"
 )
 
+// threadIDCaptureTimeout bounds the thread-id probe on BOTH planes (review
+// round 3): a backend that accepts the probe but never answers must degrade
+// to 0 and never hang session setup. The deadline is set before the probe
+// and cleared when the capture returns (defer), so the relay phase stays
+// deadline-free. A var (not const) so tests can shrink it.
+var threadIDCaptureTimeout = 5 * time.Second
+
 // captureMySQLThreadID asks the freshly connected backend for its connection
 // id — SELECT CONNECTION_ID() on the RAW conn while the backend session is
 // still idle (before the OK packet is written to the client, so there is no
@@ -24,7 +31,14 @@ import (
 // packet, non-result-set reply (e.g. a stub backend answering OK), unparsable
 // cell — logs and returns 0. The session proceeds with threadID 0; the
 // session directory simply lacks connection context for kill-query.
+// Review round 3: the probe runs under a read deadline (threadIDCaptureTimeout)
+// so a stalled backend degrades to 0 instead of hanging the session setup.
 func captureMySQLThreadID(backend net.Conn, log *slog.Logger) int64 {
+	if err := backend.SetReadDeadline(time.Now().Add(threadIDCaptureTimeout)); err != nil {
+		log.Warn("thread id capture: set read deadline failed", "err", err)
+		return 0
+	}
+	defer backend.SetReadDeadline(time.Time{})
 	if err := writeMySQLPacket(backend, 0, append([]byte{cmdQuery}, "SELECT CONNECTION_ID()"...)); err != nil {
 		log.Warn("thread id capture: write failed", "err", err)
 		return 0
@@ -34,7 +48,11 @@ func captureMySQLThreadID(backend net.Conn, log *slog.Logger) int64 {
 	for {
 		_, payload, err := readMySQLPacket(backend)
 		if err != nil {
-			log.Warn("thread id capture: read failed", "err", err)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Warn("thread id capture: backend did not answer within deadline", "timeout", threadIDCaptureTimeout)
+			} else {
+				log.Warn("thread id capture: read failed", "err", err)
+			}
 			return 0
 		}
 		if len(payload) == 0 {

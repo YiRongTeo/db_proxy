@@ -13,7 +13,6 @@ import (
 
 	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
-	"zerotrust-proxy/internal/store"
 )
 
 // mysqlSession tracks one established MySQL session: the pending (sniffed but
@@ -58,7 +57,7 @@ type mysqlSession struct {
 // maxConns, and no Serve loop here — one handleConn per accepted connection.
 type MySQLProxy struct {
 	log      *slog.Logger
-	vs       *store.ValkeyStore
+	vs       Store
 	creds    CredResolver  // backend password source: config list or credential API (Task 8.7)
 	tlsCfg   *tls.Config   // non-nil → CLIENT_SSL advertised + SSLRequest upgraded (Task 7.4); nil = plaintext
 	serverID atomic.Uint32 // per-session connection id for the handshake
@@ -94,7 +93,7 @@ type MySQLProxy struct {
 // handshake before auth (client-side TLS, data plane listener). creds
 // resolves the backend DB password per connect (Task 8.7: config list or
 // credential API — the password is never stored or logged).
-func NewMySQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *MySQLProxy {
+func NewMySQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
 		log:      log,
 		vs:       vs,
@@ -295,7 +294,13 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		// auth=2 cli) → the auth-phase reply must be seq 3, not 2.
 		authReplySeq = 3
 	}
-	if len(payload) > 0 && payload[0] == 0xff {
+	// Client refusal: a WELL-FORMED ERR packet (0xff + 2-byte error code +
+	// '#' + 5-byte SQLSTATE + message) — review round 3 replaced the loose
+	// single-0xff-byte test with the full packet shape, so a payload whose
+	// first byte merely happens to be 0xff falls through to
+	// parseHandshakeResponse, which validates the full caps/protocol-4.1
+	// shape and rejects malformed responses there.
+	if len(payload) >= 9 && payload[0] == 0xff && payload[3] == '#' {
 		return // client refused
 	}
 	token, database, err := parseHandshakeResponse(payload)
@@ -311,7 +316,13 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// 3. single-use token validation (GETDEL — atomic read+delete)
 	tok, err := p.vs.GetDeleteToken(ctx, token)
 	if err != nil {
-		p.log.Error("token lookup", "err", err)
+		// Review 2026-08-16: a store failure must be REPORTED to the
+		// client (ERR 1045, mirroring the other rejection paths) and
+		// funneled into connections.rejected{reason=store_error} —
+		// previously the connection died silently.
+		p.metrics.ConnectionsRejected("mysql", "store_error")
+		p.log.Error("token lookup", "err", err, "client", clientAddr)
+		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "token validation failed"))
 		return
 	}
 	if tok == nil {
@@ -343,10 +354,6 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	defer backend.Close()
 
-	// 5. OK — session established (seq 2 plaintext / 3 under TLS)
-	if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
-		return
-	}
 	// Task 8.11: the session id comes from the TOKEN when present — the
 	// control plane stamps it at issue time so checkers can watch the
 	// session BEFORE the maker connects (the gating-deadlock fix). Tokens
@@ -359,16 +366,21 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
-	// relay pipes to exit and the defers below to run. Task 8.2: the
-	// backend thread id is captured NOW (backend idle, client not yet
-	// told the session is up) and the session is entered in the directory
-	// with a started lifecycle event.
+	// relay pipes to exit and the defers below to run.
+	//
+	// Review round 3 (register-before-capture, capture-before-OK): the
+	// session is entered in the kill/checker registry BEFORE the thread-id
+	// probe, and the probe runs BEFORE the OK packet — a kill or watcher
+	// can find the session the moment it exists, and the client is only
+	// told the session is up once the backend's connection id is captured
+	// (backend idle, no client traffic to interleave). The probe is
+	// deadline-bounded (threadIDCaptureTimeout) and degrades to threadID 0
+	// on any failure, so session setup can never hang on a stalled backend.
 	s := &mysqlSession{
 		id:        sid,
 		client:    client,
 		backend:   backend,
 		db:        database,
-		threadID:  captureMySQLThreadID(backend, p.log),
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
 		tok:       tok,
@@ -376,6 +388,14 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		closer:    func() { client.Close(); backend.Close() },
 	}
 	p.registerSession(s)
+	s.threadID = captureMySQLThreadID(backend, p.log)
+
+	// 5. OK — session established (seq 2 plaintext / 3 under TLS). Sent
+	// only after register + capture, so the session is fully visible
+	// (killable, thread id known) when the client learns it is up.
+	if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
+		return
+	}
 	p.metrics.ConnectionsTotal("mysql", "ok")
 	p.metrics.ConnectionsActiveInc("mysql")
 	defer p.metrics.ConnectionsActiveDec("mysql")

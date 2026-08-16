@@ -261,7 +261,7 @@ func TestMySQLWriteGateDecision(t *testing.T) {
 	if msg := p.checkWriteGate(s, cmdInitDB); msg != "" {
 		t.Errorf("COM_INIT_DB: blocked with %q, want allowed", msg)
 	}
-	if msg := p.checkWriteGate(s, cmdQuit); msg != "" {
+	if msg := p.checkWriteGate(s, 0x01); msg != "" { // COM_QUIT
 		t.Errorf("COM_QUIT: blocked with %q, want allowed", msg)
 	}
 	// Store error → FAIL CLOSED: the command is blocked like an absent watcher.

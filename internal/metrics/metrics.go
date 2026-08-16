@@ -179,6 +179,23 @@ func (m *Metrics) ConnectionsTotal(dbType, result string) {
 		))
 }
 
+// ConnectionsRejected records one rejected connection attempt with a
+// reason attribute (review 2026-08-16: the GETDEL store-error funnel gap).
+// The result attribute stays "rejected" so the series aggregates with the
+// other rejected counts; reason distinguishes the failure mode
+// (e.g. "store_error" — the token store errored during GETDEL).
+func (m *Metrics) ConnectionsRejected(dbType, reason string) {
+	if m == nil {
+		return
+	}
+	m.connectionsTotal.Add(context.Background(), 1,
+		metric.WithAttributes(
+			attribute.String("db_type", dbType),
+			attribute.String("result", "rejected"),
+			attribute.String("reason", reason),
+		))
+}
+
 // ConnectionsActiveInc marks one session established.
 func (m *Metrics) ConnectionsActiveInc(dbType string) {
 	if m == nil {

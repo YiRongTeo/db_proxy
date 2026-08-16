@@ -46,6 +46,7 @@ func TestNilGuard(t *testing.T) {
 	m.TokensValidated()
 	m.TokensRejected("invalid")
 	m.ConnectionsTotal("mysql", "ok")
+	m.ConnectionsRejected("mysql", "store_error")
 	m.ConnectionsActiveInc("mysql")
 	m.ConnectionsActiveDec("mysql")
 	m.QueriesTotal("mysql", "select", "ok")
@@ -88,6 +89,7 @@ func TestInstrumentWiring(t *testing.T) {
 	m.TokensRejected("wrong_db_type")
 	m.ConnectionsTotal("mysql", "ok")
 	m.ConnectionsTotal("mysql", "rejected")
+	m.ConnectionsRejected("mysql", "store_error")
 	m.ConnectionsActiveInc("mysql")
 	m.QueriesTotal("mysql", "select", "ok")
 	m.GateBlocks("mysql")
@@ -122,18 +124,27 @@ func TestInstrumentWiring(t *testing.T) {
 	}
 
 	d = sum("connections.total")
-	if len(d.DataPoints) != 2 {
-		t.Fatalf("connections.total points = %d, want 2 (ok, rejected)", len(d.DataPoints))
+	if len(d.DataPoints) != 3 {
+		t.Fatalf("connections.total points = %d, want 3 (ok, rejected, rejected+store_error)", len(d.DataPoints))
 	}
-	results := map[string]int64{}
+	var okCount, rejectedCount, storeErrCount int64
 	for _, p := range d.DataPoints {
 		if attrString(p.Attributes, "db_type") != "mysql" {
 			t.Errorf("connections.total db_type = %q, want mysql", attrString(p.Attributes, "db_type"))
 		}
-		results[attrString(p.Attributes, "result")] = p.Value
+		switch attrString(p.Attributes, "result") {
+		case "ok":
+			okCount = p.Value
+		case "rejected":
+			if attrString(p.Attributes, "reason") == "store_error" {
+				storeErrCount = p.Value
+			} else {
+				rejectedCount = p.Value
+			}
+		}
 	}
-	if results["ok"] != 1 || results["rejected"] != 1 {
-		t.Errorf("connections.total results = %v, want ok=1 rejected=1", results)
+	if okCount != 1 || rejectedCount != 1 || storeErrCount != 1 {
+		t.Errorf("connections.total = ok:%d rejected:%d rejected+store_error:%d, want 1/1/1", okCount, rejectedCount, storeErrCount)
 	}
 
 	// connections.active is an Int64UpDownCounter — the SDK reports it as

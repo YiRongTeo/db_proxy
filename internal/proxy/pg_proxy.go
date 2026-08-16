@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgproto3/v2"
 	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
-	"zerotrust-proxy/internal/store"
 )
 
 // pgSession tracks one established PostgreSQL session: the pending (sniffed
@@ -66,7 +65,7 @@ type pgSession struct {
 // and connection limiting — one handleConn per accepted connection.
 type PGProxy struct {
 	log    *slog.Logger
-	vs     *store.ValkeyStore
+	vs     Store
 	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
 	tlsCfg *tls.Config  // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
 
@@ -101,7 +100,7 @@ type PGProxy struct {
 // before the real StartupMessage (client-side TLS, data plane listener).
 // creds resolves the backend DB password per connect (Task 8.7: config list
 // or credential API — the password is never stored or logged).
-func NewPGProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
+func NewPGProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
 	return &PGProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*pgSession)}
 }
 
@@ -303,7 +302,14 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// single-use token validation (GETDEL — atomic read+delete)
 	tok, err := p.vs.GetDeleteToken(ctx, token)
 	if err != nil {
+		// Review 2026-08-16: a store failure must be REPORTED to the
+		// client (FATAL 28000, mirroring the other rejection paths) and
+		// funneled into connections.rejected{reason=store_error} —
+		// previously the connection died silently.
+		p.metrics.ConnectionsRejected("postgres", "store_error")
 		p.log.Error("token lookup", "err", err, "client", clientAddr)
+		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
+			Message: "token validation failed"})
 		return
 	}
 	if tok == nil {
@@ -326,16 +332,11 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		return
 	}
 	p.metrics.TokensValidated()
-
-	// welcome the client — auth is complete
-	_ = be.Send(&pgproto3.AuthenticationOk{})
-	_ = be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"})
-	_ = be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
-	_ = be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
-	_ = be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"})
-	_ = be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: 4242})
-	_ = be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
-	_ = client.SetDeadline(time.Time{}) // handshake done — relay phase is deadline-free
+	// The client has spoken — the handshake deadline has done its job. Clear
+	// it now so the backend connect (which can take up to its own bounded
+	// timeout) can still report the failure to the client afterwards; the
+	// relay phase is deadline-free by design.
+	_ = client.SetDeadline(time.Time{})
 
 	// 4. backend session with the CLIENT-requested database (PG clients send
 	// it in the STARTUP message — mirror of the MySQL CONNECT_WITH_DB flow);
@@ -362,15 +363,20 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// Session established: create the per-session state (pending event +
 	// response capture + kill-registry entry) before the relay starts. The
 	// closer is the Task 6.4 kill hook — closing both conns forces both
-	// relay pipes to exit and the defers below to run. Task 8.2: the
-	// backend pid is captured NOW (backend idle) and the session is
-	// entered in the directory with a started lifecycle event.
+	// relay pipes to exit and the defers below to run.
+	//
+	// Review round 3 (register-before-capture, capture-before-welcome): the
+	// session is entered in the kill/checker registry BEFORE the pid probe,
+	// and the probe runs BEFORE the welcome sequence — a kill or watcher
+	// can find the session the moment it exists, and the client is only
+	// told the session is up once the backend's pid is captured (backend
+	// idle, no client traffic to interleave). The probe is deadline-bounded
+	// (threadIDCaptureTimeout) and degrades to threadID 0 on any failure.
 	s := &pgSession{
 		id:        sid,
 		be:        be,
 		front:     front,
 		db:        sm.Parameters["database"],
-		threadID:  capturePGThreadID(front, p.log),
 		startedAt: time.Now().UTC(),
 		lastSeen:  time.Now().UTC(),
 		tok:       tok,
@@ -378,6 +384,33 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		closer:    func() { client.Close(); front.Close() },
 	}
 	p.registerSession(s)
+	s.threadID = capturePGThreadID(front, p.log)
+
+	// welcome the client — auth is complete. Sent only after register +
+	// capture. Each Send is CHECKED (review 2026-08-16): a dead client
+	// aborts the session at the first failed write instead of stranding it
+	// in a half-welcomed state.
+	if err := be.Send(&pgproto3.AuthenticationOk{}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: 4242}); err != nil {
+		return
+	}
+	if err := be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
+		return
+	}
 	p.metrics.ConnectionsTotal("postgres", "ok")
 	p.metrics.ConnectionsActiveInc("postgres")
 	defer p.metrics.ConnectionsActiveDec("postgres")

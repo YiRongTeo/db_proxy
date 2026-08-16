@@ -134,5 +134,7 @@ func main() {
 	log.Info("shutting down")
 	shCtx, shCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shCancel()
-	_ = srv.Shutdown(shCtx)
+	if err := srv.Shutdown(shCtx); err != nil {
+		log.Warn("shutdown", "err", err)
+	}
 }

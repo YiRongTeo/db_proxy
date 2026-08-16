@@ -7,24 +7,14 @@ import (
 	"zerotrust-proxy/internal/metrics"
 )
 
-// SessionKiller is the data-plane kill interface: force-close a live session
-// by id, reporting whether a session was found, or abort ONLY its in-flight
-// query, leaving the session alive (Task 8.3 two-level kill). Both MySQLProxy
-// and PGProxy implement it through their per-session registries (the closer
-// closes the client AND backend conns, so the relay pipes exit and handleConn
-// tears the session down). Compile-time assertions below pin both
-// implementations.
-type SessionKiller interface {
-	KillSession(id string) bool
-	KillQuery(id string) bool
-}
-
-var (
-	_ SessionKiller = (*MySQLProxy)(nil)
-	_ SessionKiller = (*PGProxy)(nil)
-	_ SessionKiller = (*MSSQLProxy)(nil)
-	_ SessionKiller = (*Killer)(nil)
-)
+// The data-plane kill contract (Task 8.3 two-level kill): force-close a
+// live session by id, reporting whether a session was found, or abort ONLY
+// its in-flight query, leaving the session alive. MySQLProxy, PGProxy and
+// MSSQLProxy all implement KillSession/KillQuery through their per-session
+// registries (the closer closes the client AND backend conns, so the relay
+// pipes exit and handleConn tears the session down). Review 2026-08-16:
+// the one-method mssqlProxy-style interface was removed as unnecessary —
+// the Killer now holds the concrete proxy types directly.
 
 // Kill modes for the ctl:kill payload (Task 8.3 two-level kill). The mode
 // field is OPTIONAL — absent means KillModeConnection, preserving the Task
@@ -54,9 +44,9 @@ const mssqlAttnTimeout = 10 * time.Second
 // collision on another plane cannot leave a session alive;
 // KillSession/KillQuery are fast mutex-guarded map lookups on a miss.
 type Killer struct {
-	mysql SessionKiller
-	pg    SessionKiller
-	mssql SessionKiller // Task 9.2: TDS sessions (kill-query N/A until 9.4)
+	mysql *MySQLProxy
+	pg    *PGProxy
+	mssql *MSSQLProxy // Task 9.2: TDS sessions (kill-query N/A until 9.4)
 
 	// metrics (Task 9.8): kills.total is recorded here — the ctl:kill
 	// handler — per APPLIED kill (successful KillSession/KillQuery), by
@@ -64,7 +54,7 @@ type Killer struct {
 	metrics *metrics.Metrics
 }
 
-func NewKiller(mysql, pg, mssql SessionKiller) *Killer {
+func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy) *Killer {
 	return &Killer{mysql: mysql, pg: pg, mssql: mssql}
 }
 

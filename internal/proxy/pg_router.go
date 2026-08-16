@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v5"
@@ -22,7 +23,14 @@ import (
 // Task 8.2 degrade-gracefully rule: ANY failure — send/receive error,
 // ErrorResponse, unparsable cell — logs and returns 0. The session proceeds
 // with pid 0; the session directory simply lacks connection context.
+// Review round 3: the probe runs under a read deadline (threadIDCaptureTimeout)
+// so a stalled backend degrades to 0 instead of hanging the session setup.
 func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
+	if err := front.conn.SetReadDeadline(time.Now().Add(threadIDCaptureTimeout)); err != nil {
+		log.Warn("thread id capture: set read deadline failed", "err", err)
+		return 0
+	}
+	defer front.conn.SetReadDeadline(time.Time{})
 	if err := front.f.Send(&pgproto3.Query{String: "SELECT pg_backend_pid()"}); err != nil {
 		log.Warn("thread id capture: send failed", "err", err)
 		return 0
@@ -31,7 +39,11 @@ func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
 	for {
 		msg, err := front.f.Receive()
 		if err != nil {
-			log.Warn("thread id capture: receive failed", "err", err)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Warn("thread id capture: backend did not answer within deadline", "timeout", threadIDCaptureTimeout)
+			} else {
+				log.Warn("thread id capture: receive failed", "err", err)
+			}
 			return 0
 		}
 		switch m := msg.(type) {
@@ -108,12 +120,17 @@ func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, res Cre
 	if err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable connect_timeout=10",
-		t.DBIP, t.DBPort, t.DBUser, pw)
+	// Review round 3: the password is set via the parsed config FIELDS (not
+	// DSN interpolation) so a password containing spaces, quotes, or
+	// backslashes cannot corrupt the DSN parameter syntax. user= is also
+	// applied as a field for the same reason.
+	dsn := fmt.Sprintf("host=%s port=%s sslmode=disable connect_timeout=10", t.DBIP, t.DBPort)
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
+	cfg.User = t.DBUser
+	cfg.Password = pw
 	if dbName == "" {
 		dbName = defaultPGDatabase
 	}

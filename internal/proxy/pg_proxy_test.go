@@ -25,7 +25,7 @@ import (
 // + handleConn (real TCP — the 10s handshake deadline and 'N' write need a
 // real conn, not net.Pipe). No backend credentials — sessions that pass the
 // auth handshake hit the FATAL backend-unavailable path.
-func startTestPGProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, n int) (net.Listener, <-chan struct{}) {
+func startTestPGProxy(t *testing.T, vs Store, logBuf *bytes.Buffer, n int) (net.Listener, <-chan struct{}) {
 	t.Helper()
 	return startTestPGProxyWithCreds(t, vs, logBuf, map[string]string{}, n)
 }
@@ -121,8 +121,11 @@ func waitPGDone(t *testing.T, done <-chan struct{}) {
 func TestPGProxySSLRefused(t *testing.T) {
 	vs := proxyTestStore(t)
 	logBuf := &bytes.Buffer{}
-	ln, done := startTestPGProxy(t, vs, logBuf, 1)
-	token := pgTestToken(t, vs, "postgres")
+	// Review round 3 (capture-before-welcome): the welcome now follows the
+	// backend connect + pid capture, so a full-handshake test needs the
+	// live pg-test backend.
+	ln, done := startTestPGProxyWithCreds(t, vs, logBuf, pgLiveCreds, 1)
+	token := pgLiveToken(t, vs)
 
 	front := pgDial(t, ln, token, true) // asserts the exact 'N' byte
 
@@ -142,6 +145,10 @@ func TestPGProxySSLRefused(t *testing.T) {
 	if rq == nil || rq.TxStatus != 'I' {
 		t.Fatalf("expected ReadyForQuery TxStatus 'I', got %+v", rq)
 	}
+	// Real backend session (review-2026-08-16 order): end it explicitly.
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
+	}
 	waitPGDone(t, done)
 }
 
@@ -151,8 +158,11 @@ func TestPGProxySSLRefused(t *testing.T) {
 func TestPGProxyValidTokenHandshake(t *testing.T) {
 	vs := proxyTestStore(t)
 	logBuf := &bytes.Buffer{}
-	ln, done := startTestPGProxy(t, vs, logBuf, 1)
-	token := pgTestToken(t, vs, "postgres")
+	// Review round 3 (capture-before-welcome): the welcome now follows the
+	// backend connect + pid capture, so a full-handshake test needs the
+	// live pg-test backend.
+	ln, done := startTestPGProxyWithCreds(t, vs, logBuf, pgLiveCreds, 1)
+	token := pgLiveToken(t, vs)
 
 	front := pgDial(t, ln, token, false)
 
@@ -171,6 +181,10 @@ func TestPGProxyValidTokenHandshake(t *testing.T) {
 	}
 	if rq == nil || rq.TxStatus != 'I' {
 		t.Fatalf("expected ReadyForQuery TxStatus 'I', got %+v", rq)
+	}
+	// Real backend session (review-2026-08-16 order): end it explicitly.
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
 	}
 	waitPGDone(t, done)
 
@@ -209,12 +223,34 @@ func TestPGProxyWrongDBType(t *testing.T) {
 	waitPGDone(t, done)
 }
 
+// TestPGProxyStoreErrorReplies (review 2026-08-16 ITEM 5): a store failure
+// during token validation must send FATAL 28000 to the client (not a silent
+// close) and funnel into connections.rejected{reason=store_error}.
+func TestPGProxyStoreErrorReplies(t *testing.T) {
+	real, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(real.Close)
+	vs := &erroringStore{ValkeyStore: real}
+	ln, done := startTestPGProxy(t, vs, &bytes.Buffer{}, 1)
+	front := pgDial(t, ln, "any-token", false)
+	er := pgReadFatalError(t, front)
+	if er.Message != "token validation failed" {
+		t.Fatalf("message: got %q, want %q", er.Message, "token validation failed")
+	}
+	waitPGDone(t, done)
+}
+
 // (e) Single-use: the same token accepted once; a second session with it is
 // rejected with FATAL 28000 (GETDEL consumed it on the first handshake).
 func TestPGProxyTokenSingleUse(t *testing.T) {
 	vs := proxyTestStore(t)
-	ln, done := startTestPGProxy(t, vs, &bytes.Buffer{}, 2)
-	token := pgTestToken(t, vs, "postgres")
+	// Review round 3 (capture-before-welcome): the first session's
+	// welcome now follows the backend connect + pid capture, so the
+	// full-handshake assertion needs the live pg-test backend.
+	ln, done := startTestPGProxyWithCreds(t, vs, &bytes.Buffer{}, pgLiveCreds, 2)
+	token := pgLiveToken(t, vs)
 
 	// first session: full handshake (its ReadyForQuery proves the auth path
 	// completed; done below closes only after BOTH sessions end)
@@ -222,6 +258,12 @@ func TestPGProxyTokenSingleUse(t *testing.T) {
 	_, _, _, rq := pgReadUntilReady(t, front)
 	if rq == nil || rq.TxStatus != 'I' {
 		t.Fatalf("first session: expected ReadyForQuery 'I', got %+v", rq)
+	}
+	// End the first session explicitly: the test listener accepts sessions
+	// sequentially, so session 2 only gets served once session 1 closes
+	// (review-2026-08-16 order — a real backend session stays open).
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
 	}
 
 	// second session with the same token: rejected
@@ -239,7 +281,7 @@ func TestPGProxyTokenSingleUse(t *testing.T) {
 // sequential sessions (Task 7.5): SSLRequests are answered with 'S' and the
 // session continues over TLS. Skips when the dev certs are absent (same
 // policy as the MySQL TLS tests).
-func startTestPGProxyTLS(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, creds map[string]string, n int) (net.Listener, <-chan struct{}) {
+func startTestPGProxyTLS(t *testing.T, vs Store, logBuf *bytes.Buffer, creds map[string]string, n int) (net.Listener, <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -420,8 +462,11 @@ func TestPGProxySessionOverTLS(t *testing.T) {
 // path is byte-identical to the non-TLS listener.
 func TestPGProxyPlaintextOnTLSListener(t *testing.T) {
 	vs := proxyTestStore(t)
-	ln, done := startTestPGProxyTLS(t, vs, &bytes.Buffer{}, map[string]string{}, 1)
-	token := pgTestToken(t, vs, "postgres")
+	// Review round 3 (capture-before-welcome): the welcome now follows the
+	// backend connect + pid capture, so the full-handshake assertion needs
+	// the live pg-test backend.
+	ln, done := startTestPGProxyTLS(t, vs, &bytes.Buffer{}, pgLiveCreds, 1)
+	token := pgLiveToken(t, vs)
 
 	front := pgDial(t, ln, token, false) // no SSLRequest → plaintext path
 	authOK, _, _, rq := pgReadUntilReady(t, front)
@@ -430,6 +475,13 @@ func TestPGProxyPlaintextOnTLSListener(t *testing.T) {
 	}
 	if rq == nil || rq.TxStatus != 'I' {
 		t.Fatalf("expected ReadyForQuery 'I', got %+v", rq)
+	}
+	// With the review-2026-08-16 order the welcome reflects a REAL backend
+	// session, so the session stays open until the client leaves: end it
+	// explicitly with Terminate (the backend closes the wire in response;
+	// pgDialDB's t.Cleanup closes the client conn as a backstop).
+	if err := front.Send(&pgproto3.Terminate{}); err != nil {
+		t.Fatalf("send Terminate: %v", err)
 	}
 	waitPGDone(t, done)
 }

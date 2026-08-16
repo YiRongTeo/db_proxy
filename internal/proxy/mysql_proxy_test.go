@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,18 @@ func proxyTestStore(t *testing.T) *store.ValkeyStore {
 	}
 	t.Cleanup(vs.Close)
 	return vs
+}
+
+// erroringStore wraps a real store and fails every token validation — enough
+// for NewValkeyStore to construct normally (real valkey) while every GETDEL
+// returns an error (review 2026-08-16 ITEM 5: the client must receive the
+// error packet instead of a silent close).
+type erroringStore struct {
+	*store.ValkeyStore
+}
+
+func (e *erroringStore) GetDeleteToken(ctx context.Context, token string) (*models.TokenPayload, error) {
+	return nil, errors.New("fake store: token validation unavailable")
 }
 
 func waitSubAck(t *testing.T, acked <-chan struct{}) {
@@ -90,14 +103,14 @@ func buildTestHandshakeResponse(token string) []byte {
 // returns the listener plus a channel closed when the session ends. The
 // Dispatcher (Task 3.5) is not wired yet, so the test acts as it: accept +
 // bufio.Reader + handleConn.
-func startTestProxy(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer) (net.Listener, <-chan struct{}) {
+func startTestProxy(t *testing.T, vs Store, logBuf *bytes.Buffer) (net.Listener, <-chan struct{}) {
 	t.Helper()
 	return startTestProxyWithCreds(t, vs, logBuf, map[string]string{"mysql:ro_user@127.0.0.1:3307": "ro_pw"})
 }
 
 // startTestProxyWithCreds is startTestProxy with a caller-supplied credential
 // map (used by tests that point the backend at a fake listener).
-func startTestProxyWithCreds(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.Buffer, creds map[string]string) (net.Listener, <-chan struct{}) {
+func startTestProxyWithCreds(t *testing.T, vs Store, logBuf *bytes.Buffer, creds map[string]string) (net.Listener, <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -196,8 +209,8 @@ func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 
 	// Non-sniffed commands (COM_QUIT, COM_PING) must publish nothing, even
 	// after a response completes.
-	p.sniffCommand(s, cmdQuit, nil, tok, "127.0.0.1:55555")
-	p.sniffCommand(s, cmdPing, nil, tok, "127.0.0.1:55555")
+	p.sniffCommand(s, 0x01, nil, tok, "127.0.0.1:55555") // COM_QUIT
+	p.sniffCommand(s, 0x0e, nil, tok, "127.0.0.1:55555") // COM_PING
 	completePending(p, s)
 	expectNoEvent(t, out)
 }
@@ -396,6 +409,50 @@ func TestMySQLSessionTokenRejection(t *testing.T) {
 
 // --- Task 3.7: sniffed-SQL NUL trim ----------------------------------------
 
+// TestMySQLSessionStoreErrorReplies (review 2026-08-16 ITEM 5): a store
+// failure during token validation must send ERR 1045 to the client (not a
+// silent close) and funnel into connections.rejected{reason=store_error}.
+func TestMySQLSessionStoreErrorReplies(t *testing.T) {
+	real, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(real.Close)
+	vs := &erroringStore{ValkeyStore: real}
+	var logBuf bytes.Buffer
+	ln, done := startTestProxy(t, vs, &logBuf)
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, _, err := readMySQLPacket(client); err != nil {
+		t.Fatalf("read handshake: %v", err)
+	}
+	if err := writeMySQLPacket(client, 1, buildTestHandshakeResponse("any-token")); err != nil {
+		t.Fatalf("write handshake response: %v", err)
+	}
+	seq, resp, err := readMySQLPacket(client)
+	if err != nil {
+		t.Fatalf("read store-error reply: %v", err)
+	}
+	if seq != 2 || len(resp) < 9 || resp[0] != 0xff {
+		t.Fatalf("expected ERR packet seq 2, got seq=%d resp=% x", seq, resp)
+	}
+	if code := binary.LittleEndian.Uint16(resp[1:3]); code != 1045 {
+		t.Errorf("error code = %d, want 1045", code)
+	}
+	if !strings.Contains(string(resp[9:]), "token validation failed") {
+		t.Errorf("error message = %q, want it to contain %q", resp[9:], "token validation failed")
+	}
+	client.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleConn did not return within 5s of client close")
+	}
+}
+
 // TestSniffCommandTrimsTrailingNUL: real COM_QUERY/COM_INIT_DB/COM_STMT_PREPARE
 // payloads are NUL-terminated; the published event SQL must carry neither the
 // NUL nor any whitespace after it, while a payload without a NUL is unchanged.
@@ -577,7 +634,7 @@ func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
 	if err := writeMySQLPacket(client, 0, query); err != nil {
 		t.Fatalf("write COM_QUERY: %v", err)
 	}
-	if err := writeMySQLPacket(client, 1, []byte{cmdPing}); err != nil {
+	if err := writeMySQLPacket(client, 1, []byte{0x0e}); err != nil {
 		t.Fatalf("write COM_PING: %v", err)
 	}
 
@@ -597,8 +654,8 @@ func TestMySQLSessionRelayByteExactToBackend(t *testing.T) {
 	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(0, query)) {
 		t.Errorf("backend received % x\nwant byte-exact % x (seq 0, trailing NUL preserved)", got, want(0, query))
 	}
-	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(1, []byte{cmdPing})) {
-		t.Errorf("backend received % x\nwant byte-exact % x (seq 1 passed through, not renumbered)", got, want(1, []byte{cmdPing}))
+	if got := recvBackendPacket(t, backendRecv); !bytes.Equal(got, want(1, []byte{0x0e})) {
+		t.Errorf("backend received % x\nwant byte-exact % x (seq 1 passed through, not renumbered)", got, want(1, []byte{0x0e}))
 	}
 
 	// Both OK replies come back to the client through the relay.

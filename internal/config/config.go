@@ -19,6 +19,11 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 	v.SetConfigFile(path)
 	v.SetEnvPrefix("ZT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	// AllowEmptyEnv: an env var that is SET but empty (e.g. ZT_AUTH_PASSWORD="")
+	// is a real override, not an absence — viper otherwise ignores empty env
+	// vars and the guard below could never see the empty value. This is what
+	// makes the auth fail-fast (review round 3) fire on empty env overrides.
+	v.AllowEmptyEnv(true)
 	v.AutomaticEnv()
 	if err := v.ReadInConfig(); err != nil {
 		return fmt.Errorf("read config %s: %w", path, err)
@@ -121,8 +126,11 @@ type DBPreset struct {
 // calls (rather than UnmarshalKey) so nested defaults (mode=direct, ssl
 // disabled) apply even when the file omits keys — the old flat shape
 // valkey: {addr, password, db} therefore still parses unchanged.
-func readValkey(v *viper.Viper) ValkeyConfig {
-	return ValkeyConfig{
+// Review round 3: sentinel mode without master_name is a load error (fail
+// fast naming the field) — a sentinel-mode plane that cannot discover its
+// master must never start silently.
+func readValkey(v *viper.Viper) (ValkeyConfig, error) {
+	vc := ValkeyConfig{
 		Mode:             v.GetString("valkey.mode"),
 		Addr:             v.GetString("valkey.addr"),
 		MasterName:       v.GetString("valkey.master_name"),
@@ -139,6 +147,10 @@ func readValkey(v *viper.Viper) ValkeyConfig {
 			SkipVerify: v.GetBool("valkey.ssl.skip_verify"),
 		},
 	}
+	if vc.Mode == "sentinel" && vc.MasterName == "" {
+		return ValkeyConfig{}, fmt.Errorf("valkey.mode=sentinel requires valkey.master_name")
+	}
+	return vc, nil
 }
 
 // readTLS returns nil (plaintext) when tls.enabled is false or absent — the
@@ -236,9 +248,27 @@ func LoadControl(path string) (*ControlConfig, error) {
 		AuthPassword:  v.GetString("auth.password"),
 		SessionTTL:    v.GetInt("auth.session_ttl_hours"),
 		TLS:           tlsCfg,
-		Valkey:        readValkey(v),
 		Audit:         auditCfg,
 	}
+	// Review round 3: auth fail-fast — AutomaticEnv is set, so an empty env
+	// override (e.g. ZT_AUTH_PASSWORD="") silently overrides the defaults map
+	// and would produce a control plane with an empty password. An empty
+	// username/password or a non-positive token TTL is a load error naming
+	// the field; a plane with unguessable-empty credentials must never start.
+	if cfg.AuthUser == "" {
+		return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
+	}
+	if cfg.AuthPassword == "" {
+		return nil, fmt.Errorf("auth.password is required (set auth.password or ZT_AUTH_PASSWORD)")
+	}
+	if cfg.TokenTTL <= 0 {
+		return nil, fmt.Errorf("api.token_ttl_seconds must be > 0, got %d", cfg.TokenTTL)
+	}
+	vc, err := readValkey(v)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Valkey = vc
 	// UnmarshalKey must run on the same viper instance that read the file,
 	// otherwise it would unmarshal against a fresh, empty store.
 	if err := v.UnmarshalKey("db_presets", &cfg.DBPresets); err != nil {
@@ -396,7 +426,6 @@ func LoadData(path string) (*DataConfig, error) {
 		DetectDelayMS:     v.GetInt("listen.detect_delay_ms"),
 		MaxConns:          v.GetInt("listen.max_conns"),
 		TLS:               tlsCfg,
-		Valkey:            readValkey(v),
 		LogQueryOutput:    v.GetBool("log_query_output"),
 		GateWaitSeconds:   gateWait,
 		CredentialsSource: source,
@@ -404,6 +433,11 @@ func LoadData(path string) (*DataConfig, error) {
 		Credentials:       map[string]string{},
 		Metrics:           mcfg,
 	}
+	vc, err := readValkey(v)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Valkey = vc
 	var creds []struct {
 		Key      string `mapstructure:"key"`
 		Password string `mapstructure:"password"`

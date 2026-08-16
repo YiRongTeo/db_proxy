@@ -16,7 +16,6 @@ import (
 
 	"zerotrust-proxy/internal/metrics"
 	"zerotrust-proxy/internal/models"
-	"zerotrust-proxy/internal/store"
 )
 
 // mssqlSession tracks one established TDS session. It serves as the kill
@@ -62,7 +61,7 @@ type mssqlSession struct {
 // accept loop — one handleConn per accepted connection.
 type MSSQLProxy struct {
 	log    *slog.Logger
-	vs     *store.ValkeyStore
+	vs     Store
 	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
 	tlsCfg *tls.Config  // non-nil → PRELOGIN answers ENCRYPT_ON + 0x12-wrapped TLS upgrade (Task 9.2); nil = plaintext
 
@@ -86,7 +85,7 @@ type MSSQLProxy struct {
 // non-nil makes the proxy answer ENCRYPT_ON and upgrade to TLS before the
 // LOGIN7 (client-side TLS, data plane listener). creds resolves the backend
 // DB password per connect (Task 8.7: config list or credential API).
-func NewMSSQLProxy(log *slog.Logger, vs *store.ValkeyStore, creds CredResolver, tlsCfg *tls.Config) *MSSQLProxy {
+func NewMSSQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MSSQLProxy {
 	return &MSSQLProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*mssqlSession)}
 }
 

@@ -75,7 +75,7 @@ func startEdgeBackend(t *testing.T) (addr string, recv chan []byte, closed chan 
 						return
 					}
 					recv <- append(append([]byte{}, hdr...), payload...)
-					if len(payload) > 0 && payload[0] == cmdQuit {
+					if len(payload) > 0 && payload[0] == 0x01 { // COM_QUIT
 						return // real servers close after COM_QUIT without replying
 					}
 					if err := writeMySQLPacket(conn, hdr[3]+1, okPacket()); err != nil {
@@ -345,7 +345,7 @@ func TestEdgeCOMQuitClosesSessionCleanly(t *testing.T) {
 	client := establishSession(t, ln.Addr().String(), token)
 
 	// COM_QUIT, empty payload, seq 0 — as real clients send it.
-	if err := writeMySQLPacket(client, 0, []byte{cmdQuit}); err != nil {
+	if err := writeMySQLPacket(client, 0, []byte{0x01}); err != nil { // COM_QUIT, empty payload
 		t.Fatalf("write COM_QUIT: %v", err)
 	}
 
@@ -359,7 +359,7 @@ func TestEdgeCOMQuitClosesSessionCleanly(t *testing.T) {
 	}
 
 	// The backend received the COM_QUIT byte-exact, then closed without replying.
-	if pkt := recvBackendPacket(t, backendRecv); !bytes.Equal(pkt, []byte{0x01, 0x00, 0x00, 0x00, cmdQuit}) {
+	if pkt := recvBackendPacket(t, backendRecv); !bytes.Equal(pkt, []byte{0x01, 0x00, 0x00, 0x00, 0x01}) { // header + COM_QUIT
 		t.Fatalf("backend received % x, want byte-exact COM_QUIT header+payload", pkt)
 	}
 	select {
@@ -460,7 +460,7 @@ func TestEdgeOversizedLengthClaimFailsGracefully(t *testing.T) {
 	// Dispatcher still live: a fresh session completes end to end.
 	token2 := issueToken(t, vs, port, "")
 	c2 := establishSession(t, ln.Addr().String(), token2)
-	if err := writeMySQLPacket(c2, 0, []byte{cmdPing}); err != nil {
+	if err := writeMySQLPacket(c2, 0, []byte{0x0e}); err != nil {
 		t.Fatalf("second session write COM_PING: %v", err)
 	}
 	if seq, resp, err := readMySQLPacket(c2); err != nil || seq != 1 || len(resp) == 0 || resp[0] != 0x00 {
@@ -536,7 +536,7 @@ func TestEdgeStallingBackendConnectIsBounded(t *testing.T) {
 	// Dispatcher still live: a full session against a healthy backend completes.
 	token2 := issueToken(t, vs, healthyPort, "")
 	c2 := establishSession(t, ln.Addr().String(), token2)
-	if err := writeMySQLPacket(c2, 0, []byte{cmdPing}); err != nil {
+	if err := writeMySQLPacket(c2, 0, []byte{0x0e}); err != nil {
 		t.Fatalf("healthy session write COM_PING: %v", err)
 	}
 	if seq, resp, err := readMySQLPacket(c2); err != nil || seq != 1 || len(resp) == 0 || resp[0] != 0x00 {
@@ -592,7 +592,7 @@ func TestEdgeGarbageFirstPacketDoesNotKillDispatcher(t *testing.T) {
 	// round trip against the fake backend).
 	token := issueToken(t, vs, port, "")
 	c := establishSession(t, ln.Addr().String(), token)
-	if err := writeMySQLPacket(c, 0, []byte{cmdPing}); err != nil {
+	if err := writeMySQLPacket(c, 0, []byte{0x0e}); err != nil {
 		t.Fatalf("valid conn write COM_PING: %v", err)
 	}
 	if seq, resp, err := readMySQLPacket(c); err != nil || seq != 1 || len(resp) == 0 || resp[0] != 0x00 {

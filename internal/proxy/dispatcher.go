@@ -26,22 +26,17 @@ type Dispatcher struct {
 	log         *slog.Logger
 	mysql       *MySQLProxy
 	pg          *PGProxy
-	mssql       mssqlProxy // nil until Task 9.2 wires the TDS proxy
+	mssql       *MSSQLProxy // TDS plane (Task 9.2); nil only in tests — drop branch below stays nil-safe
 	detectDelay time.Duration
 	conns       atomic.Int64
 	maxConns    int64
 }
 
-// mssqlProxy is the TDS wire-handler contract satisfied by the MSSQL proxy
-// (Task 9.2: prelogin + login7 auth, then relay/capture/gating). Until that
-// proxy exists the dispatcher holds nil and drops a detected MSSQL client
-// with a warn — mirroring the pre-Phase-4 PostgreSQL path — so the router
-// never panics on a nil receiver.
-type mssqlProxy interface {
-	handleConn(ctx context.Context, c net.Conn, br *bufio.Reader)
-}
-
-func NewDispatcher(log *slog.Logger, mysql *MySQLProxy, pg *PGProxy, mssql mssqlProxy, detectDelay time.Duration, maxConns int64) *Dispatcher {
+// NewDispatcher wires the three plane handlers. Review 2026-08-16: the
+// one-method mssqlProxy interface was removed as unnecessary — the field
+// is the concrete *MSSQLProxy (nil = TDS not wired; the drop branch below
+// stays nil-safe on the concrete pointer).
+func NewDispatcher(log *slog.Logger, mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy, detectDelay time.Duration, maxConns int64) *Dispatcher {
 	return &Dispatcher{log: log, mysql: mysql, pg: pg, mssql: mssql, detectDelay: detectDelay, maxConns: maxConns}
 }
 
