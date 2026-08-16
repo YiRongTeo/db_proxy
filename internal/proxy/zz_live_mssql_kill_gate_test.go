@@ -207,6 +207,12 @@ func TestMSSQLLiveKillQueryAbortsAndSessionSurvives(t *testing.T) {
 	if cap2 := captureMSSQLResponse(resp); cap2.status != "ok" || len(cap2.rows) != 1 {
 		t.Fatalf("SELECT 1 after kill-query: status=%q rows=%d — session did not survive", cap2.status, len(cap2.rows))
 	}
+	// Drain the SELECT 1 event BEFORE the idle check: its publish (which
+	// clears the session's pending slot) runs in the relay goroutine a
+	// beat after the client read completes — without the drain, the idle
+	// KillQuery assertion below races the publish and intermittently sees
+	// the still-pending slot (flake observed in the 2026-08-17 full suite).
+	recvQueryEvent(t, out)
 
 	// Now idle (the abort completed and cleared the pending slot): a second
 	// kill-query is refused — nothing in flight to cancel.

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -34,6 +33,11 @@ type pgSession struct {
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
+	// cancelKey (review 2026-08-17) is the per-session random secret the
+	// proxy hands the client in BackendKeyData and validates on a
+	// CancelRequest — the PG cancel model (pid + secret). Random per
+	// session: the old fabricated {42, 4242} for every session is gone.
+	cancelKey uint32
 
 	// Task 8.13 grace hold: the client-side Backend (drain replies) and
 	// the backend pgFrontend (flush forwards held messages), plus the
@@ -86,6 +90,12 @@ type PGProxy struct {
 
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
+
+	// Cancel registry (review 2026-08-17): sessions are keyed by their
+	// backend pid once captured, so a client CancelRequest (pid + secret)
+	// can be serviced instead of silently dropped.
+	cancelMu sync.Mutex
+	cancels  map[uint32]*pgSession
 }
 
 // NewPGProxy builds a PostgreSQL session handler. tlsCfg nil keeps the
@@ -100,6 +110,7 @@ func NewPGProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Conf
 		creds:            creds,
 		tlsCfg:           tlsCfg,
 		sessions:         make(map[string]*pgSession),
+		cancels:          make(map[uint32]*pgSession),
 	}
 }
 
@@ -191,41 +202,86 @@ func (p *PGProxy) KillQuery(id string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
 	defer cancel()
-	front, err := connectPostgresBackend(ctx, s.tok, p.creds, s.db)
+	ok, err := p.cancelBackendExchange(ctx, s) // shared with the CancelRequest path (review 2026-08-17)
 	if err != nil {
-		p.log.Warn("kill query: backend connect failed", "session_id", id, "err", err)
+		p.log.Warn("kill query: cancel exchange failed", "session_id", id, "err", err)
 		return false
 	}
-	defer front.Close()
-	// Bound the exchange: a dead backend must not pin the ctl:kill
-	// subscriber (pgproto3 Receive is a blocking conn read, not ctx-aware).
-	_ = front.conn.SetDeadline(time.Now().Add(killQueryTimeout))
-	if err := front.Send(&pgproto3.Query{String: fmt.Sprintf("SELECT pg_cancel_backend(%d)", s.threadID)}); err != nil {
-		p.log.Warn("kill query: send failed", "session_id", id, "err", err)
+	if !ok {
+		p.log.Warn("kill query: pg_cancel_backend returned false", "session_id", id, "pid", s.threadID)
 		return false
 	}
-	canceled := false
-	for {
-		msg, err := front.Receive()
-		if err != nil {
-			p.log.Warn("kill query: receive failed", "session_id", id, "err", err)
-			return false
-		}
-		switch m := msg.(type) {
-		case *pgproto3.DataRow:
-			if len(m.Values) == 1 {
-				canceled = string(m.Values[0]) == "t"
-			}
-		case *pgproto3.ErrorResponse:
-			p.log.Warn("kill query: backend error", "session_id", id, "pid", s.threadID, "err", m.Message)
-			return false
-		case *pgproto3.ReadyForQuery:
-			if canceled {
-				return true
-			}
-			p.log.Warn("kill query: pg_cancel_backend returned false", "session_id", id, "pid", s.threadID)
-			return false
-		}
+	return true
+}
+
+// registerCancel enters the session in the cancel registry under its
+// backend pid (review 2026-08-17). Sessions whose pid was never captured
+// (threadID 0 — Task 8.2 degrade rule) are not cancellable via
+// CancelRequest, mirroring KillQuery's degrade behavior.
+func (p *PGProxy) registerCancel(s *pgSession) {
+	if s.threadID == 0 {
+		return
+	}
+	p.cancelMu.Lock()
+	defer p.cancelMu.Unlock()
+	p.cancels[uint32(s.threadID)] = s
+}
+
+// unregisterCancel removes the session from the cancel registry on
+// teardown. The identity guard prevents a reused pid from clobbering a
+// newer session's entry.
+func (p *PGProxy) unregisterCancel(s *pgSession) {
+	if s.threadID == 0 {
+		return
+	}
+	p.cancelMu.Lock()
+	defer p.cancelMu.Unlock()
+	if p.cancels[uint32(s.threadID)] == s {
+		delete(p.cancels, uint32(s.threadID))
+	}
+}
+
+// cancelLookup resolves a CancelRequest's (pid, secret) to a live session,
+// or nil when the pid is unknown or the secret does not match — a
+// mismatched cancel is a silent no-op, exactly like the real backend.
+func (p *PGProxy) cancelLookup(pid, key uint32) *pgSession {
+	p.cancelMu.Lock()
+	defer p.cancelMu.Unlock()
+	s := p.cancels[pid]
+	if s == nil || s.cancelKey != key {
+		return nil
+	}
+	return s
+}
+
+// handleCancelRequest services one client CancelRequest (PQcancel / psql
+// Ctrl-C — review 2026-08-17: previously dropped while a fabricated
+// BackendKeyData was advertised). On a (pid, secret) match the session's
+// in-flight query is aborted via pg_cancel_backend on a SECOND backend
+// connection with the session's own credentials (same-role cancel,
+// mirroring KillQuery). Per PG semantics the cancel connection is closed
+// WITHOUT any response — the client learns the outcome from its original
+// connection (ErrorResponse 57014).
+func (p *PGProxy) handleCancelRequest(client net.Conn, startup pgproto3.FrontendMessage) {
+	cr, ok := startup.(*pgproto3.CancelRequest)
+	if !ok {
+		return // unknown startup packet — nothing to service
+	}
+	s := p.cancelLookup(cr.ProcessID, cr.SecretKey)
+	if s == nil {
+		p.log.Debug("cancel request ignored", "pid", cr.ProcessID) // unknown/mismatched — silent no-op
+		return
+	}
+	p.log.Info("cancel request", "session_id", s.id, "pid", cr.ProcessID)
+	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
+	defer cancel()
+	ok, err := p.cancelBackendExchange(ctx, s)
+	if err != nil {
+		p.log.Warn("cancel: exchange failed", "session_id", s.id, "err", err)
+		return
+	}
+	if !ok {
+		p.log.Warn("cancel: pg_cancel_backend returned false", "session_id", s.id, "pid", s.threadID)
 	}
 }
 
@@ -294,7 +350,12 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	sm, ok := startupMsg.(*pgproto3.StartupMessage)
 	if !ok {
-		return // CancelRequest or unknown startup packet
+		// CancelRequest (or an unknown startup packet): service PG
+		// cancels (review 2026-08-17 — previously dropped silently while
+		// a fabricated cancel key was advertised). The connection is
+		// closed without a response either way, per PG semantics.
+		p.handleCancelRequest(client, startupMsg)
+		return
 	}
 	token := sm.Parameters["user"] // token-as-username
 
@@ -389,6 +450,11 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	p.registerSession(s)
 	s.threadID = capturePGThreadID(front, p.log)
+	// Review 2026-08-17: per-session random cancel secret + registry entry
+	// under the backend pid — the BackendKeyData below now carries a real,
+	// cancellable identity instead of the fabricated {42, 4242}.
+	s.cancelKey = newCancelKey()
+	p.registerCancel(s)
 
 	// welcome the client — auth is complete. Sent only after register +
 	// capture. Each Send is CHECKED (review 2026-08-16): a dead client
@@ -409,7 +475,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	if err := be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}); err != nil {
 		return
 	}
-	if err := be.Send(&pgproto3.BackendKeyData{ProcessID: 42, SecretKey: 4242}); err != nil {
+	if err := be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(s.threadID), SecretKey: s.cancelKey}); err != nil {
 		return
 	}
 	if err := be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
@@ -419,6 +485,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	p.metrics.ConnectionsActiveInc("postgres")
 	defer p.metrics.ConnectionsActiveDec("postgres")
 	defer p.unregisterSession(s.id)
+	defer p.unregisterCancel(s) // review 2026-08-17: cancel registry hygiene
 	// Deferred in this order so teardown is: closePGGateWait (Task 8.13 —
 	// any grace-held messages drain with the timeout rejection and the
 	// wait goroutine is cleaned up) → flushPendingOnClose (any unanswered

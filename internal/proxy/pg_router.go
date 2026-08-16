@@ -68,6 +68,41 @@ func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
 	}
 }
 
+// cancelBackendExchange runs "SELECT pg_cancel_backend(<pid>)" on a SECOND
+// backend connection with the session's credentials (PostgreSQL permits
+// same-role cancel) and consumes the full exchange. Bounded by ctx and a
+// conn deadline; returns whether the backend answered 't'. Shared by
+// KillQuery (Task 8.3) and the client CancelRequest path (review
+// 2026-08-17 — de-duplicated from KillQuery's inline exchange).
+func (p *PGProxy) cancelBackendExchange(ctx context.Context, s *pgSession) (bool, error) {
+	front, err := connectPostgresBackend(ctx, s.tok, p.creds, s.db)
+	if err != nil {
+		return false, err
+	}
+	defer front.Close()
+	_ = front.conn.SetDeadline(time.Now().Add(killQueryTimeout))
+	if err := front.Send(&pgproto3.Query{String: fmt.Sprintf("SELECT pg_cancel_backend(%d)", s.threadID)}); err != nil {
+		return false, err
+	}
+	canceled := false
+	for {
+		msg, err := front.Receive()
+		if err != nil {
+			return false, err
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			if len(m.Values) == 1 {
+				canceled = string(m.Values[0]) == "t"
+			}
+		case *pgproto3.ErrorResponse:
+			return false, fmt.Errorf("pg_cancel_backend: %s", m.Message)
+		case *pgproto3.ReadyForQuery:
+			return canceled, nil
+		}
+	}
+}
+
 // pgFrontend wraps the hijacked backend connection with a pgproto3 Frontend
 // (we act as the client toward the real PostgreSQL server).
 type pgFrontend struct {
