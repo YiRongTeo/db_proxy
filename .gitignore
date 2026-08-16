@@ -6,3 +6,4 @@ web/dist/
 configs/*.local.yaml
 .superpowers/
 build/
+*.zip
