@@ -56,11 +56,6 @@ export interface SessionInfo {
   status?: string; // pending | active (Task 8.11)
 }
 
-/** Response of POST /api/kill (202 — kill queued on the ctl:kill channel). */
-export interface KillResponse {
-  killed: string;
-}
-
 /**
  * One live query event streamed over /ws/checker
  * (internal/models.QueryEvent — ts is RFC3339 as marshalled by Go's time.Time).
@@ -132,10 +127,11 @@ export class ApiService {
   /**
    * POST /api/kill — queue a data-plane session kill (202 when accepted).
    * mode selects the kill scope (Task 8.3): 'query' aborts the in-flight
-   * query only; 'connection' terminates the whole backend session.
+   * query only; 'connection' terminates the whole backend session. The 202
+   * body is unused by the UI (Task 9.11: no KillResponse type needed).
    */
-  killSession(sessionId: string, mode: 'query' | 'connection'): Observable<KillResponse> {
-    return this.http.post<KillResponse>(
+  killSession(sessionId: string, mode: 'query' | 'connection'): Observable<unknown> {
+    return this.http.post(
       '/api/kill',
       { session_id: sessionId, mode },
       { withCredentials: true },

@@ -38,18 +38,12 @@
                 nz-input
                 placeholder="e.g. OPS-1234"
                 [ngModel]="ticketId()"
-                (ngModelChange)="ticketId.set($event)"
+                (ngModelChange)="onTicketChange($event)"
                 [disabled]="submitting()"
               />
             </nz-input-group>
           </nz-form-control>
         </nz-form-item>
-
-        <!-- Hidden payload fields filled from the selected preset -->
-        <input type="hidden" name="db_type" [ngModel]="dbType()" />
-        <input type="hidden" name="db_user" [ngModel]="dbUser()" />
-        <input type="hidden" name="db_ip" [ngModel]="dbIp()" />
-        <input type="hidden" name="db_port" [ngModel]="dbPort()" />
 
         <nz-form-item>
           <nz-form-control>

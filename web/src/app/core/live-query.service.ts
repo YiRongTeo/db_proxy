@@ -16,8 +16,9 @@ import { QueryEvent } from './api.service';
  * Task 8.15 seam: `connectState` is the ACCURATE socket state, driven by real
  * socket events (openObserver / error / complete), never by optimism. The
  * legacy `connected` signal keeps its documented optimistic semantics
- * (true right after connect()) for the Connect/Stop button, but it is now
- * also explicitly cleared in disconnect() — previously it could only flip
+ * (true right after connect()) for tests and any remaining consumers; the
+ * checker toolbar is driven by `connectState` (Task 9.11), and `connected`
+ * is explicitly cleared in disconnect() — previously it could only flip
  * false via the socket's error/complete callbacks, which rxjs 7.8 never fires
  * for a socket closed before it opened (AnonymousSubject.complete() is a
  * no-op while the destination is still the pre-open ReplaySubject), leaving
@@ -49,12 +50,10 @@ export class LiveQueryService implements OnDestroy {
     this.disconnect();
     const gen = ++this.generation;
     const url = `${location.origin.replace(/^http/, 'ws')}/ws/checker?channel=${encodeURIComponent(channel)}`;
-    // rxjs 7.8.2 ignores withCredentials at runtime (cookies ride along on
-    // same-origin WebSockets automatically) and its type omits the key; keep it
-    // per the service contract and widen the type so the intent is explicit.
-    const config: WebSocketSubjectConfig<QueryEvent> & { withCredentials: boolean } = {
+    // Task 9.11: no withCredentials key — rxjs 7.8.2 ignores it at runtime
+    // (cookies ride along on same-origin WebSockets automatically).
+    const config: WebSocketSubjectConfig<QueryEvent> = {
       url,
-      withCredentials: true,
       // The real "socket opened" notification (rxjs fires openObserver.next
       // from its onopen handler). The subscription's next() only sees messages,
       // so without this the service could never tell open from connecting.

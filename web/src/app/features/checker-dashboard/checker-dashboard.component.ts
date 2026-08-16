@@ -10,6 +10,7 @@ import {
   viewChild,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
 import { NzAlertModule } from 'ng-zorro-antd/alert';
 import { NzButtonModule } from 'ng-zorro-antd/button';
 import { NzCardModule } from 'ng-zorro-antd/card';
@@ -23,6 +24,7 @@ import { NzTableModule } from 'ng-zorro-antd/table';
 import { NzTagModule } from 'ng-zorro-antd/tag';
 import { NzTooltipModule } from 'ng-zorro-antd/tooltip';
 import { ApiService, QueryEvent, SessionInfo } from '../../core/api.service';
+import { AuthService } from '../../core/auth.service';
 import { LiveQueryService } from '../../core/live-query.service';
 
 /** Kind → nz-tag color mapping (brief 2.8: query=blue, prepare=purple, execute=orange, use=cyan). */
@@ -46,6 +48,24 @@ export interface OutputColumn {
   title: string;
   key: string;
 }
+
+/**
+ * Task 9.11 hardening constants:
+ * - Lifecycle-event ids are folded into the selector exactly once; the seen
+ *   set is capped so a long-lived dashboard cannot grow it unboundedly.
+ * - The killed map (rows marked dead by connection kill / session end) is
+ *   capped the same way; entries for events that already left the ring
+ *   buffer are dropped first (they are gone from the table anyway).
+ * - Optimistic pending overrides (action=issued) are pruned when the
+ *   /api/sessions list misses them for PENDING_MAX_MISSES consecutive pulls
+ *   (the control plane never recorded the issue) or once they outlive the
+ *   token TTL (PENDING_MAX_AGE_MS — generous backstop over the 5 min default).
+ */
+const MAX_SEEN_LIFECYCLE = 1000;
+const MAX_KILLED = 1000;
+const PENDING_MAX_MISSES = 3;
+const PENDING_MAX_AGE_MS = 10 * 60 * 1000; // token TTL default is 5 min
+const REFRESH_DEBOUNCE_MS = 200; // lifecycle bursts → one directory re-pull
 
 /**
  * The checker's ACCURATE relation to the live feed (Task 8.15):
@@ -98,6 +118,8 @@ export type FeedStatus = 'live-feed' | 'watching' | 'disconnected' | 'session-en
 export class CheckerDashboardComponent implements OnInit, OnDestroy {
   private readonly live = inject(LiveQueryService);
   private readonly api = inject(ApiService);
+  private readonly auth = inject(AuthService);
+  private readonly router = inject(Router);
   private readonly message = inject(NzMessageService);
   private readonly scrollHost = viewChild.required<ElementRef<HTMLDivElement>>('scrollHost');
 
@@ -105,13 +127,11 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   readonly autoScroll = signal(true);
 
   readonly events = this.live.events;
-  /** Legacy optimistic socket flag — keeps the Connect/Stop toggle behavior. */
-  readonly connected = this.live.connected;
 
   /** Event id whose output table is expanded (single-row expansion). */
   readonly expanded = signal<string | null>(null);
 
-  /** Event id → killed (connection kill accepted by the control plane). */
+  /** Event id → killed (connection kill accepted or the session ended over the WS). */
   readonly killed = signal<Record<string, boolean>>({});
 
   /** Live data-plane session directory (Task 8.4) backing the session selector. */
@@ -124,6 +144,24 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   readonly selectedSessionInfo = computed(
     () => this.sessions().find((s) => s.session_id === this.selectedSession()) ?? null,
   );
+
+  /**
+   * Rows for the current mode (Task 9.11 — review CRITICAL 9.11a): session
+   * mode shows ONLY the selected session's events. Before this the session
+   * table rendered the whole ring buffer, so buffered rows of OTHER sessions
+   * appeared under the selected session (misattribution).
+   */
+  readonly visibleEvents = computed(() => {
+    const sid = this.selectedSession();
+    if (sid === '*') return this.live.events();
+    return this.live.events().filter((e) => e.session_id === sid);
+  });
+
+  /** True while the REAL socket is open (drives Connect/Stop + channel lockout). */
+  readonly feedOpen = computed(() => this.live.connectState() === 'open');
+
+  /** True when the WebSocket dropped with an error (surfaced as a banner). */
+  readonly wsError = computed(() => this.live.connectState() === 'error');
 
   /** True while watching a session whose action=ended event has arrived (Task 8.15). */
   readonly sessionEnded = signal(false);
@@ -143,7 +181,7 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     return 'live-feed';
   });
 
-  /** Status tag text: "live feed", "watching sid · username", "session ended", "disconnected". */
+  /** Status tag text: "live feed", "watching sid · username", "session ended", "connection lost"/"disconnected". */
   readonly statusLabel = computed(() => {
     switch (this.feedStatus()) {
       case 'live-feed':
@@ -153,7 +191,8 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
       case 'session-ended':
         return 'session ended';
       default:
-        return 'disconnected';
+        // Task 9.11: surface the WS error distinctly from a clean disconnect.
+        return this.live.connectState() === 'error' ? 'connection lost' : 'disconnected';
     }
   });
 
@@ -195,7 +234,7 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   /** Table colspan: 10 columns in live-all mode, 6 in session mode (constant columns removed). */
   readonly tableColspan = computed(() => (this.selectedSession() === '*' ? 10 : 6));
 
-  /** Lifecycle event ids already folded into the directory refresh (idempotency). */
+  /** Lifecycle event ids already folded into the directory refresh (idempotency; capped). */
   private readonly seenLifecycle = new Set<string>();
 
   /**
@@ -204,9 +243,20 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
    * moment it is issued — BEFORE the maker ever connects — so the checker
    * can select it and arm the gate (subscribe to sess:<sid>) ahead of the
    * connection; the /api/sessions re-pull then overlays the authoritative
-   * record on top. Removed on started/ended.
+   * record on top. Removed on started/ended — and pruned by Task 9.11 when
+   * the API list keeps missing them (see pullSessions).
    */
   private readonly pendingOverrides = new Map<string, SessionInfo>();
+
+  /** Consecutive API pulls that missed each pending override (Task 9.11 pruning). */
+  private readonly pendingMisses = new Map<string, number>();
+
+  /** Pending debounced directory re-pull (lifecycle bursts → one call). */
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Memoized per-event derived data (events are immutable; the WeakMap dies with the event object). */
+  private readonly columnsCache = new WeakMap<QueryEvent, OutputColumn[]>();
+  private readonly rowsCache = new WeakMap<QueryEvent, Record<string, string>[]>();
 
   constructor() {
     // Auto-scroll: whenever the ring buffer grows (or the toggle flips on),
@@ -227,6 +277,9 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
       for (const ev of this.live.events()) {
         if (ev.kind !== 'session' || !ev.action || !ev.session_id) continue;
         if (this.seenLifecycle.has(ev.id)) continue;
+        // Task 9.11: cap the seen-set (ring buffer is 500, so clearing at
+        // 1000 only ever re-folds events that are already out of it).
+        if (this.seenLifecycle.size >= MAX_SEEN_LIFECYCLE) this.seenLifecycle.clear();
         this.seenLifecycle.add(ev.id);
         this.applyLifecycle(ev);
       }
@@ -237,7 +290,9 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
    * Fold one unseen session lifecycle event into the selector directory.
    * issued → optimistic pending entry (waiting for maker); started → the
    * pending override is dropped (the data plane record is active now);
-   * ended → override dropped and the directory re-pull removes the session.
+   * ended → override dropped, the buffered rows of that session are marked
+   * killed (Task 9.11 — the WS path must mark dead rows, not just the 202
+   * toolbar path), and the directory re-pull removes the session.
    * An ended event for the SELECTED session flips the derived status to
    * 'session-ended' (Task 8.15); started/issued for it clear that state.
    */
@@ -247,11 +302,14 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
       this.pendingOverrides.set(sid, this.pendingSession(ev));
     } else if (ev.action === 'started' || ev.action === 'ended') {
       this.pendingOverrides.delete(sid);
+      if (ev.action === 'ended') {
+        this.markSessionKilled(sid);
+      }
     }
     if (sid === this.selectedSession()) {
       this.sessionEnded.set(ev.action === 'ended');
     }
-    this.refreshSessions();
+    this.scheduleRefreshSessions();
   }
 
   /** A minimal pending directory entry derived from an action=issued event. */
@@ -269,12 +327,15 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.refreshSessions();
-    this.connect();
+    this.connect(); // pulls the session directory on the way in (Task 9.11)
   }
 
   connect(): void {
     this.live.connect(this.channel().trim() || '*');
+    // Task 9.11: every (re)connect refreshes the session directory — sessions
+    // may have appeared or ended while the feed was down, and the selector
+    // must not keep stale entries.
+    this.refreshSessions();
   }
 
   stop(): void {
@@ -282,22 +343,73 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   }
 
   /**
-   * Re-pull the session directory from /api/sessions (init + lifecycle events).
-   * The authoritative API list is overlaid with optimistic pending entries
-   * (action=issued) that the API may not have picked up yet, so a just-issued
-   * session stays selectable — and the gate arming — even if the re-pull
-   * races the control plane's record write (Task 8.12).
+   * Re-pull the session directory from /api/sessions (init + connect + test
+   * seams). The authoritative API list is overlaid with optimistic pending
+   * entries (action=issued) that the API may not have picked up yet, so a
+   * just-issued session stays selectable — and the gate arming — even if the
+   * re-pull races the control plane's record write (Task 8.12). A pending
+   * entry that the API keeps missing is pruned (Task 9.11, see pullSessions).
    */
   refreshSessions(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+    this.pullSessions();
+  }
+
+  /** Debounced directory re-pull for lifecycle-event bursts (Task 9.11). */
+  private scheduleRefreshSessions(): void {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.pullSessions();
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  private pullSessions(): void {
     this.api.sessions().subscribe({
       next: (list) => {
         const byId = new Map(list.map((s) => [s.session_id, s]));
         for (const [sid, pending] of this.pendingOverrides) {
-          if (!byId.has(sid)) byId.set(sid, pending);
+          if (byId.has(sid)) {
+            // The API record is authoritative — the override is not needed.
+            this.pendingOverrides.delete(sid);
+            this.pendingMisses.delete(sid);
+            continue;
+          }
+          const ageMs = Date.now() - new Date(pending.started_at).getTime();
+          const misses = (this.pendingMisses.get(sid) ?? 0) + 1;
+          if (misses >= PENDING_MAX_MISSES || ageMs > PENDING_MAX_AGE_MS) {
+            // Ghost: the control plane never recorded the issue (or the token
+            // outlived its TTL without a connection) — stop showing it.
+            this.pendingOverrides.delete(sid);
+            this.pendingMisses.delete(sid);
+            continue;
+          }
+          this.pendingMisses.set(sid, misses);
+          byId.set(sid, pending);
         }
         this.sessions.set(Array.from(byId.values()));
       },
-      error: () => undefined, // keep the last known directory; the selector stays usable
+      error: (err: { status?: number }) => {
+        if (err?.status === 401) {
+          // Task 9.11: the session cookie expired — clear the UI session
+          // FIRST, then send the user to /login. Without the logout the stale
+          // user signal keeps the authGuard happy and the SPA loops on 401s.
+          this.handleUnauthorized();
+          return;
+        }
+        // keep the last known directory; the selector stays usable
+      },
+    });
+  }
+
+  /** 401: best-effort server logout, always clear the UI session, then go to /login. */
+  private handleUnauthorized(): void {
+    this.auth.logout().subscribe({
+      complete: () => void this.router.navigate(['/login']),
+      error: () => void this.router.navigate(['/login']),
     });
   }
 
@@ -362,22 +474,44 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   }
 
   /**
-   * Dynamic headers for the read-only output table. Uses event.columns when
-   * present; otherwise the documented PG extended-protocol fallback: a single
-   * "value" column when rows are single-field, or cell-index headers when rows
-   * carry multiple fields with no column names.
+   * Dynamic headers for the read-only output table (memoized per event
+   * object — Task 9.11: the template calls this twice per row, and the
+   * ring-buffer events are immutable). Uses event.columns when present;
+   * otherwise the documented PG extended-protocol fallback: a single
+   * "value" column when rows are single-field, or cell-index headers when
+   * rows carry multiple fields with no column names.
    */
   outputColumns(ev: QueryEvent): OutputColumn[] {
+    const cached = this.columnsCache.get(ev);
+    if (cached) return cached;
     const cols = ev.columns ?? [];
-    if (cols.length > 0) return cols.map((c, i) => ({ title: c, key: `c${i}` }));
-    const width = (ev.rows ?? []).reduce((m, r) => Math.max(m, r.length), 0);
-    if (width <= 1) return [{ title: 'value', key: 'c0' }];
-    return Array.from({ length: width }, (_, i) => ({ title: String(i), key: `c${i}` }));
+    let result: OutputColumn[];
+    if (cols.length > 0) {
+      result = cols.map((c, i) => ({ title: c, key: `c${i}` }));
+    } else {
+      const width = (ev.rows ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+      result =
+        width <= 1
+          ? [{ title: 'value', key: 'c0' }]
+          : Array.from({ length: width }, (_, i) => ({ title: String(i), key: `c${i}` }));
+    }
+    this.columnsCache.set(ev, result);
+    return result;
   }
 
-  /** Rows re-mapped to {c0, c1, …} objects so cells render as plain text (read-only by construction). */
+  /** Rows re-mapped to {c0, c1, …} objects (memoized, see outputColumns). */
   outputRows(ev: QueryEvent): Record<string, string>[] {
-    return (ev.rows ?? []).map((r) => Object.fromEntries(r.map((cell, i) => [`c${i}`, cell])));
+    const cached = this.rowsCache.get(ev);
+    if (cached) return cached;
+    const rows = (ev.rows ?? []).map((r) => Object.fromEntries(r.map((cell, i) => [`c${i}`, cell])));
+    this.rowsCache.set(ev, rows);
+    return rows;
+  }
+
+  /** Compact UTC clock time for the Ts cell (RFC3339 → HH:MM:SS). */
+  formatTs(ts: string): string {
+    if (!ts || Number.isNaN(Date.parse(ts))) return ts || '—';
+    return new Date(ts).toISOString().slice(11, 19);
   }
 
   /**
@@ -410,19 +544,36 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
     if (sid === '*') return;
     this.api.killSession(sid, 'connection').subscribe({
       next: () => {
-        this.killed.update((m) => {
-          const next = { ...m };
-          for (const ev of this.live.events()) {
-            if (ev.session_id === sid) next[ev.id] = true;
-          }
-          return next;
-        });
+        this.markSessionKilled(sid);
         this.message.success(`kill queued for session ${sid}`);
       },
       error: (err: { status?: number }) => {
         const detail = err?.status ? `HTTP ${err.status}` : 'network error';
         this.message.error(`kill failed for session ${sid}: ${detail}`);
       },
+    });
+  }
+
+  /**
+   * Mark every buffered row of a session killed (Task 9.11 — shared by the
+   * 202 toolbar path and the WS ended-event path). The killed map is capped:
+   * once it outgrows MAX_KILLED, marks for events that already left the ring
+   * buffer are dropped (they are gone from the table anyway), which always
+   * brings it back under the cap because the buffer itself is ≤500.
+   */
+  private markSessionKilled(sid: string): void {
+    this.killed.update((m) => {
+      const next = { ...m };
+      for (const ev of this.visibleEvents()) {
+        if (ev.session_id === sid) next[ev.id] = true;
+      }
+      if (Object.keys(next).length <= MAX_KILLED) return next;
+      const kept = new Set(this.live.events().map((e) => e.id));
+      const capped: Record<string, boolean> = {};
+      for (const id of Object.keys(next)) {
+        if (kept.has(id)) capped[id] = true;
+      }
+      return capped;
     });
   }
 
@@ -435,6 +586,10 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
     this.live.disconnect(); // no leaks: drop the WebSocket on navigation away
   }
 }

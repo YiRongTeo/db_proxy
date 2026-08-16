@@ -1,9 +1,16 @@
+import { Component, signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { provideRouter, Router } from '@angular/router';
 import { of, throwError } from 'rxjs';
 import { ApiService, QueryEvent, SessionInfo } from '../../core/api.service';
+import { AuthService } from '../../core/auth.service';
 import { LiveQueryService } from '../../core/live-query.service';
 import { NzMessageService } from 'ng-zorro-antd/message';
 import { CheckerDashboardComponent } from './checker-dashboard.component';
+
+/** Landing route for the 401 → /login navigation assertions (Task 9.11). */
+@Component({ template: '', standalone: true })
+class StubCmp {}
 
 /** Fake WebSocket wired through the LiveQueryService.socketCtor seam (see live-query.service.spec.ts). */
 class FakeWebSocket {
@@ -74,10 +81,16 @@ function session(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 /** A kind=session lifecycle event as published by the control/data planes (Task 8.2/8.11). */
-function lifecycle(action: 'started' | 'issued' | 'ended', sid: string): QueryEvent {
+function lifecycle(
+  action: 'started' | 'issued' | 'ended',
+  sid: string,
+  overrides: Partial<QueryEvent> = {},
+): QueryEvent {
   return {
     id: `life-${action}-${sid}`,
-    ts: '2026-08-11T08:00:00Z',
+    // Task 9.11: issued events feed the pending-override started_at, which is
+    // age-pruned against the token TTL — so lifecycle ts must be "now".
+    ts: new Date().toISOString(),
     kind: 'session',
     action,
     username: 'alice',
@@ -89,6 +102,7 @@ function lifecycle(action: 'started' | 'issued' | 'ended', sid: string): QueryEv
     sql: '',
     client_addr: '10.0.0.99',
     session_id: sid,
+    ...overrides,
   };
 }
 
@@ -150,11 +164,20 @@ async function selectorOptions(fixture: ComponentFixture<CheckerDashboardCompone
   return options.map((o) => o.textContent?.trim() ?? '');
 }
 
+/** Wait out the lifecycle-driven directory-refresh debounce (Task 9.11). */
+function flushRefresh(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 300));
+}
+
 describe('CheckerDashboardComponent', () => {
   let service: LiveQueryService;
   let api: {
     killSession: ReturnType<typeof vi.fn>;
     sessions: ReturnType<typeof vi.fn>;
+  };
+  let auth: {
+    user: ReturnType<typeof signal>;
+    logout: ReturnType<typeof vi.fn>;
   };
   let message: { success: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
 
@@ -164,12 +187,18 @@ describe('CheckerDashboardComponent', () => {
       killSession: vi.fn(() => of({ killed: 'queued' })),
       sessions: vi.fn(() => of([])),
     };
+    auth = {
+      user: signal<string | null>(null),
+      logout: vi.fn(() => of(null)),
+    };
     message = { success: vi.fn(), error: vi.fn() };
     TestBed.configureTestingModule({
       imports: [CheckerDashboardComponent],
       providers: [
+        provideRouter([{ path: 'login', component: StubCmp }]),
         LiveQueryService,
         { provide: ApiService, useValue: api },
+        { provide: AuthService, useValue: auth },
         { provide: NzMessageService, useValue: message },
       ],
     });
@@ -344,7 +373,10 @@ describe('CheckerDashboardComponent', () => {
     const errRow = rows[1] as HTMLElement;
     const errTag = errRow.querySelector('.ant-tag-error') as HTMLElement;
     expect(errTag?.textContent?.trim()).toBe('error');
-    expect(errTag?.getAttribute('title')).toBe('relation "nope" does not exist');
+    // Task 9.11: the duplicated attr.title is gone — the nz-tooltip owns the
+    // message (no redundant native title attribute).
+    expect(errTag?.getAttribute('title')).toBeNull();
+    expect(errTag?.hasAttribute('nz-tooltip')).toBe(true);
 
     const noneRow = rows[2] as HTMLElement;
     expect(noneRow.querySelector('.ant-tag-success')).toBeNull();
@@ -621,7 +653,7 @@ describe('CheckerDashboardComponent', () => {
 
     directory = [session()];
     fake.emit(lifecycle('started', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // Task 9.11: lifecycle re-pulls are debounced
     fixture.detectChanges();
     expect(fixture.componentInstance.sessions().length).toBe(1);
     let labels = await selectorOptions(fixture);
@@ -634,7 +666,7 @@ describe('CheckerDashboardComponent', () => {
 
     directory = [];
     fake.emit(lifecycle('ended', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // debounced re-pull removes the session
     fixture.detectChanges();
     expect(fixture.componentInstance.sessions().length).toBe(0);
     labels = await selectorOptions(fixture);
@@ -724,7 +756,7 @@ describe('CheckerDashboardComponent', () => {
     fake.open();
 
     fake.emit(lifecycle('issued', 'sess-pend1'));
-    await fixture.whenStable();
+    await flushRefresh(); // Task 9.11: lifecycle re-pulls are debounced
     fixture.detectChanges();
 
     // The optimistic entry survives even though the API returned an empty list.
@@ -748,7 +780,7 @@ describe('CheckerDashboardComponent', () => {
     fake.open();
 
     fake.emit(lifecycle('issued', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // Task 9.11: lifecycle re-pulls are debounced
     fixture.detectChanges();
     expect(fixture.componentInstance.sessions()[0].status).toBe('pending');
 
@@ -756,7 +788,7 @@ describe('CheckerDashboardComponent', () => {
     // publishing started — the re-pull now returns the active shape.
     directory = [session({ status: 'active' })];
     fake.emit(lifecycle('started', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // debounced re-pull picks up the active record
     fixture.detectChanges();
 
     expect(fixture.componentInstance.sessions().length).toBe(1);
@@ -779,13 +811,13 @@ describe('CheckerDashboardComponent', () => {
     fake.open();
 
     fake.emit(lifecycle('issued', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // Task 9.11: lifecycle re-pulls are debounced
     fixture.detectChanges();
     expect(fixture.componentInstance.sessions().length).toBe(1);
 
     directory = [];
     fake.emit(lifecycle('ended', 'sess-abc123'));
-    await fixture.whenStable();
+    await flushRefresh(); // debounced re-pull removes the session
     fixture.detectChanges();
 
     expect(fixture.componentInstance.sessions().length).toBe(0);
@@ -865,7 +897,7 @@ describe('CheckerDashboardComponent', () => {
     expect(fixture.componentInstance.feedStatus()).toBe('watching');
   });
 
-  it('flips to disconnected when the socket errors', async () => {
+  it('flips to disconnected and surfaces the connection-lost banner when the socket errors', async () => {
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
     const fake = FakeWebSocket.instances[0];
@@ -876,8 +908,12 @@ describe('CheckerDashboardComponent', () => {
     fake.fail();
     fixture.detectChanges();
 
+    // Task 9.11: a WS error is surfaced distinctly from a clean disconnect.
     const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
-    expect(tag.textContent?.trim()).toBe('disconnected');
+    expect(tag.textContent?.trim()).toBe('connection lost');
+    const alert = fixture.nativeElement.querySelector('.ws-error-alert') as HTMLElement;
+    expect(alert).not.toBeNull();
+    expect(alert.textContent).toContain('connection lost');
     expect(service.connected()).toBe(false);
     expect(service.connectState()).toBe('error');
   });
@@ -1158,7 +1194,7 @@ describe('CheckerDashboardComponent', () => {
     expect(channelCol.classList.contains('ant-col-lg-10')).toBe(true);
   });
 
-  it('shows channel input, connect/stop, kill-connection and the status tag on the grid', () => {
+  it('shows channel input, connect/stop, kill-connection and the status tag on the grid', async () => {
     const fixture = TestBed.createComponent(CheckerDashboardComponent);
     fixture.detectChanges();
 
@@ -1169,12 +1205,19 @@ describe('CheckerDashboardComponent', () => {
     expect(input).not.toBeNull();
     expect(input.disabled).toBe(false); // editable until the feed connects
 
-    // Connect/stop toggle: Stop while the optimistic flag is up (the socket
-    // was created on init), Connect after a disconnect.
+    // Connect/stop toggle (Task 9.11): driven by the REAL socket state —
+    // Connect until the socket actually opens, Stop while it is open,
+    // Connect again after a disconnect.
     const buttons = () =>
       Array.from(grid.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(buttons()).toContain('Connect');
+    expect(buttons()).not.toContain('Stop');
+
+    FakeWebSocket.instances[0].open();
+    fixture.detectChanges();
     expect(buttons()).toContain('Stop');
     expect(buttons()).not.toContain('Connect');
+
     fixture.componentInstance.stop();
     fixture.detectChanges();
     expect(buttons()).toContain('Connect');
@@ -1187,5 +1230,224 @@ describe('CheckerDashboardComponent', () => {
     const tag = grid.querySelector('.status-tag') as HTMLElement;
     expect(tag).not.toBeNull();
     expect(tag.textContent?.trim()).toBe('disconnected');
+  });
+
+  // ---- Task 9.11: review remediation (round 1 behavioral specs) --------------
+
+  it('session mode shows ONLY the selected session\'s events (review 9.11a misattribution)', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    // A row of ANOTHER session sits in the ring buffer while still in live-all mode.
+    FakeWebSocket.instances[0].emit(
+      event({ id: 'evt-other', session_id: 'sess-other', sql: 'SELECT other' }),
+    );
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelectorAll('tbody tr').length).toBe(1);
+
+    // Selecting the session narrows the table to ITS events only — the
+    // buffered foreign row must not be attributed to it.
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[1];
+    fake.open();
+    fake.emit(event({ id: 'evt-own', session_id: 'sess-abc123', sql: 'SELECT own' }));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(service.events().length).toBe(2); // ring buffer keeps both
+    expect(fixture.componentInstance.visibleEvents().length).toBe(1); // filtered view
+
+    const rows = fixture.nativeElement.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(1);
+    const row = rows[0] as HTMLElement;
+    expect(row.textContent).toContain('SELECT own');
+    expect(row.textContent).not.toContain('SELECT other');
+    expect(row.textContent).not.toContain('sess-other');
+  });
+
+  it('401 from /api/sessions logs out and navigates to /login (no auth loop)', async () => {
+    api.sessions = vi.fn(() => throwError(() => ({ status: 401 })));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    // handleUnauthorized fires logout() → navigate() — let the navigation settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(auth.logout).toHaveBeenCalledTimes(1);
+    const router = TestBed.inject(Router);
+    expect(router.url).toBe('/login');
+  });
+
+  it('prunes a pending override after 3 consecutive /api/sessions misses (ghost token)', async () => {
+    api.sessions = vi.fn(() => of([])); // the API never records the issue
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    FakeWebSocket.instances[0].emit(lifecycle('issued', 'sess-ghost'));
+    await flushRefresh(); // debounced pull #1 misses it → miss 1
+    fixture.detectChanges();
+    expect(fixture.componentInstance.sessions().length).toBe(1); // still optimistic
+
+    fixture.componentInstance.refreshSessions(); // miss 2 — still shown
+    expect(fixture.componentInstance.sessions().length).toBe(1);
+
+    fixture.componentInstance.refreshSessions(); // miss 3 ≥ PENDING_MAX_MISSES → pruned
+    expect(fixture.componentInstance.sessions().length).toBe(0);
+    const labels = await selectorOptions(fixture);
+    expect(labels).toEqual(['live (all)']);
+  });
+
+  it('kill connection is disabled once the watched session has ended', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[1].open();
+    fixture.detectChanges();
+
+    const btn = () =>
+      fixture.nativeElement.querySelector('.kill-connection-btn') as HTMLButtonElement;
+    expect(btn().disabled).toBe(false); // watching a live session
+
+    FakeWebSocket.instances[1].emit(lifecycle('ended', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.feedStatus()).toBe('session-ended');
+    expect(btn().disabled).toBe(true); // nothing left to kill
+  });
+
+  it('a WS ended event marks the session\'s buffered rows killed (WS kill path)', async () => {
+    api.sessions = vi.fn(() => of([session()]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    FakeWebSocket.instances[0].open();
+
+    fixture.componentInstance.onSessionSelect('sess-abc123');
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const fake = FakeWebSocket.instances[1];
+    fake.open();
+
+    fake.emit(event({ id: 'evt-a', session_id: 'sess-abc123', sql: 'SELECT 1' }));
+    fake.emit(event({ id: 'evt-b', session_id: 'sess-abc123', sql: 'SELECT 2' }));
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(fixture.componentInstance.killed()).toEqual({}); // rows live before the end
+
+    fake.emit(lifecycle('ended', 'sess-abc123'));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    // The ended lifecycle row joins the two query rows — all marked dead.
+    const rows = fixture.nativeElement.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(3);
+    for (const row of Array.from(rows)) {
+      const el = row as HTMLElement;
+      const killedTag = Array.from(el.querySelectorAll('nz-tag')).find(
+        (t) => t.textContent?.trim() === 'killed',
+      );
+      expect(killedTag).toBeDefined();
+      expect((killedTag as HTMLElement).classList.contains('ant-tag-red')).toBe(true);
+      // No kill-query popconfirm on dead rows; the disabled kill button stays.
+      expect(el.querySelector('button[nz-popconfirm]')).toBeNull();
+      const killBtn = Array.from(el.querySelectorAll('button')).find(
+        (b) => b.textContent?.trim() === 'kill',
+      ) as HTMLButtonElement | undefined;
+      expect(killBtn).toBeDefined();
+      expect(killBtn!.disabled).toBe(true);
+    }
+  });
+
+  it('renders the compact UTC clock in the Ts cell and keeps the full timestamp in title', async () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    FakeWebSocket.instances[0].open();
+
+    FakeWebSocket.instances[0].emit(event({ ts: '2026-08-11T08:05:09Z' }));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const cell = fixture.nativeElement.querySelector('tbody tr .cell-ts') as HTMLElement;
+    expect(cell.textContent?.trim()).toBe('08:05:09'); // HH:MM:SS UTC
+    expect(cell.getAttribute('title')).toBe('2026-08-11T08:05:09Z'); // full RFC3339 for hover
+
+    const comp = fixture.componentInstance;
+    expect(comp.formatTs('2026-08-11T08:05:09Z')).toBe('08:05:09');
+    expect(comp.formatTs('2026-08-11T08:05:09.123456+02:00')).toBe('06:05:09'); // any tz → UTC clock
+    expect(comp.formatTs('')).toBe('—');
+    expect(comp.formatTs('not-a-date')).toBe('not-a-date'); // invalid passthrough, no crash
+  });
+
+  it('renders the DB column from the event db field in live-all mode', async () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    FakeWebSocket.instances[0].open();
+
+    FakeWebSocket.instances[0].emit(event({ db: 'salesdb' }));
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const row = fixture.nativeElement.querySelector('tbody tr') as HTMLElement;
+    // live-all layout: Ts, Kind, Username, DB, Target, Ticket, Status, Output, Kill, SQL
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => td.textContent?.trim());
+    expect(cells[3]).toBe('salesdb');
+  });
+
+  it('memoizes the derived output columns and rows per event object', () => {
+    const comp = TestBed.createComponent(CheckerDashboardComponent).componentInstance;
+    const ev = event({ columns: ['id', 'name'], rows: [['1', 'alpha']] });
+
+    expect(comp.outputColumns(ev)).toBe(comp.outputColumns(ev)); // same object identity
+    expect(comp.outputRows(ev)).toBe(comp.outputRows(ev));
+    expect(comp.outputColumns(ev)).toEqual([
+      { title: 'id', key: 'c0' },
+      { title: 'name', key: 'c1' },
+    ]);
+    expect(comp.outputRows(ev)).toEqual([{ c0: '1', c1: 'alpha' }]);
+  });
+
+  it('wires nzShowSearch on the session selector', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+
+    const select = fixture.nativeElement.querySelector('.session-select') as HTMLElement;
+    expect(select).not.toBeNull();
+    // Angular 21 renders the static nzShowSearch input as the host attribute
+    // `nzshowsearch` (and nz-select adds the ant-select-show-search class).
+    expect(select.hasAttribute('nzshowsearch')).toBe(true);
+    expect(select.classList.contains('ant-select-show-search')).toBe(true);
+  });
+
+  it('coalesces a lifecycle burst into ONE debounced directory re-pull', async () => {
+    api.sessions = vi.fn(() => of([]));
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges(); // init → connect() → refreshSessions()
+    await fixture.whenStable();
+    expect(api.sessions).toHaveBeenCalledTimes(1);
+
+    const fake = FakeWebSocket.instances[0];
+    fake.open();
+    fake.emit(lifecycle('started', 'sess-1'));
+    fake.emit(lifecycle('started', 'sess-2'));
+    fake.emit(lifecycle('ended', 'sess-3'));
+    await flushRefresh(); // debounce window folds the burst into one pull
+    fixture.detectChanges();
+
+    expect(api.sessions).toHaveBeenCalledTimes(2); // init + one coalesced re-pull
   });
 });

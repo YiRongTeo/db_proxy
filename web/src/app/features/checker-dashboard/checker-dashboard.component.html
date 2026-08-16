@@ -7,23 +7,22 @@
     <nz-row nzAlign="middle" [nzGutter]="[16, 12]">
       <nz-col [nzXs]="24" [nzSm]="24" [nzMd]="13" [nzLg]="14">
         <div class="session-row">
-          <span class="channel-label">Session</span>
+          <span class="channel-label" id="session-label">Session</span>
           <nz-select
             class="session-select"
             nzDropdownClassName="checker-session-dropdown"
+            nzShowSearch
+            [attr.aria-label]="'Session (live all or a single data-plane session)'"
             [ngModel]="selectedSession()"
             (ngModelChange)="onSessionSelect($event)"
           >
             <nz-option nzValue="*" nzLabel="live (all)"></nz-option>
             @for (s of sessions(); track s.session_id) {
-              <nz-option
-                [nzValue]="s.session_id"
-                [nzLabel]="sessionLabel(s)"
-                [nzCustomContent]="true"
-              >
-                <span class="session-option-label">{{ sessionLabel(s) }}</span>
+              @let label = sessionLabel(s);
+              <nz-option [nzValue]="s.session_id" [nzLabel]="label" [nzCustomContent]="true">
+                <span class="session-option-label">{{ label }}</span>
                 @if (isPending(s)) {
-                  <nz-tag nzColor="gold" class="waiting-tag">waiting</nz-tag>
+                  <nz-tag nzColor="gold">waiting</nz-tag>
                 }
               </nz-option>
             }
@@ -38,7 +37,7 @@
 
       <nz-col [nzXs]="24" [nzSm]="24" [nzMd]="11" [nzLg]="10">
         <div class="channel-row">
-          <span class="channel-label">Channel</span>
+          <span class="channel-label" id="channel-label">Channel</span>
           <nz-input-group nzCompact class="channel-group">
             <input
               id="channel"
@@ -46,21 +45,23 @@
               nz-input
               class="channel-input"
               placeholder="* or username"
+              aria-label="Channel"
               [ngModel]="channel()"
               (ngModelChange)="channel.set($event)"
-              [disabled]="connected()"
+              [disabled]="feedOpen()"
               (keydown.enter)="connect()"
             />
-            @if (connected()) {
-              <button nz-button nzDanger (click)="stop()">Stop</button>
+            @if (feedOpen()) {
+              <button nz-button nzDanger (click)="stop()" aria-label="Stop the live feed">Stop</button>
             } @else {
-              <button nz-button nzType="primary" (click)="connect()">Connect</button>
+              <button nz-button nzType="primary" (click)="connect()" aria-label="Connect the live feed">Connect</button>
             }
           </nz-input-group>
         </div>
       </nz-col>
 
-      <!-- Task 8.15: ONE connection-kill for the SELECTED session (rows keep kill query only). -->
+      <!-- Task 8.15: ONE connection-kill for the SELECTED session (rows keep kill query only).
+           Task 9.11: disabled once the session has ended — there is nothing left to kill. -->
       <nz-col [nzXs]="24" [nzSm]="8" [nzMd]="6" [nzLg]="6">
         <button
           class="kill-connection-btn"
@@ -68,14 +69,16 @@
           nzDanger
           nz-popconfirm
           [nzPopconfirmTitle]="'Kill connection for session ' + shortenSid(selectedSession()) + '?'"
-          [disabled]="selectedSession() === '*'"
+          [disabled]="selectedSession() === '*' || feedStatus() === 'session-ended'"
+          [attr.aria-label]="'Kill connection for session ' + shortenSid(selectedSession())"
           (nzOnConfirm)="killSelectedConnection()"
         >kill connection</button>
       </nz-col>
 
-      <!-- Task 8.15: accurate status — derived from the real socket state + selection + session lifecycle. -->
+      <!-- Task 8.15: accurate status — derived from the real socket state + selection + session lifecycle.
+           Task 9.11: aria-live so screen readers announce feed-state changes. -->
       <nz-col [nzXs]="12" [nzSm]="8" [nzMd]="6" [nzLg]="6">
-        <nz-tag class="status-tag" [nzColor]="statusColor()">
+        <nz-tag class="status-tag" role="status" aria-live="polite" [nzColor]="statusColor()">
           {{ statusLabel() }}
         </nz-tag>
       </nz-col>
@@ -113,10 +116,20 @@
     </div>
   }
 
+  <!-- Task 9.11: surface a WS error distinctly from a clean disconnect. -->
+  @if (wsError()) {
+    <nz-alert
+      class="ws-error-alert"
+      nzType="error"
+      nzShowIcon
+      nzMessage="Live feed connection lost — the WebSocket closed with an error. Press Connect to retry."
+    />
+  }
+
   <div #scrollHost class="table-scroll-host">
     <nz-table
       class="checker-table"
-      [nzData]="events()"
+      [nzData]="visibleEvents()"
       [nzFrontPagination]="false"
       [nzShowPagination]="false"
       [nzSize]="'small'"
@@ -138,9 +151,9 @@
         </tr>
       </thead>
       <tbody>
-        @for (ev of events(); track ev.id) {
+        @for (ev of visibleEvents(); track ev.id) {
           <tr>
-            <td class="cell-ts">{{ ev.ts }}</td>
+            <td class="cell-ts" [attr.title]="ev.ts">{{ formatTs(ev.ts) }}</td>
             <td class="cell-kinds">
               <nz-tag [nzColor]="kindColor(ev.kind)">{{ ev.kind }}</nz-tag>
               @if (ev.stmt_type) {
@@ -152,7 +165,7 @@
             </td>
             @if (selectedSession() === '*') {
               <td>{{ ev.username }}</td>
-              <td>{{ ev.db_type }}</td>
+              <td>{{ ev.db }}</td>
               <td class="cell-mono">{{ target(ev) }}</td>
               <td>{{ ev.ticket_id || '—' }}</td>
             }
@@ -164,7 +177,6 @@
                   nzColor="error"
                   nz-tooltip
                   [nzTooltipTitle]="ev.error || 'error'"
-                  [attr.title]="ev.error || 'error'"
                 >error</nz-tag>
               } @else {
                 —
@@ -176,6 +188,7 @@
                 nzSize="small"
                 (click)="toggleOutput(ev)"
                 [disabled]="!hasOutput(ev)"
+                [attr.aria-label]="'View query output for event ' + ev.id"
               >view</button>
             </td>
             <td>
@@ -189,6 +202,7 @@
                     nzSize="small"
                     nz-popconfirm
                     [nzPopconfirmTitle]="'Kill query on ' + ev.session_id + '?'"
+                    [attr.aria-label]="'Kill query on session ' + ev.session_id"
                     (nzOnConfirm)="killQuery(ev)"
                   >kill query</button>
                 }

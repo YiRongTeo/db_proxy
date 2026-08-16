@@ -75,7 +75,10 @@ export class MakerPortalComponent implements OnInit {
       error: (err) => {
         this.presetsLoading.set(false);
         if (err.status === 401) {
-          this.router.navigate(['/login']);
+          // Task 9.11: clear the UI session BEFORE leaving — otherwise the
+          // stale user signal keeps the authGuard happy and the SPA loops
+          // on 401s.
+          this.handleUnauthorized();
           return;
         }
         this.presetsError.set('Could not load database presets — is the control plane reachable?');
@@ -95,6 +98,13 @@ export class MakerPortalComponent implements OnInit {
     this.dbIp.set(preset.db_ip);
     this.dbPort.set(preset.db_port);
     // A new target invalidates any previously issued token.
+    this.result.set(null);
+    this.submitError.set(null);
+  }
+
+  /** Ticket input change: a new ticket invalidates the previously issued token (Task 9.11). */
+  onTicketChange(value: string): void {
+    this.ticketId.set(value);
     this.result.set(null);
     this.submitError.set(null);
   }
@@ -127,12 +137,20 @@ export class MakerPortalComponent implements OnInit {
         error: (err) => {
           this.submitting.set(false);
           if (err.status === 401) {
-            this.router.navigate(['/login']);
+            this.handleUnauthorized();
             return;
           }
           this.submitError.set(err.error?.error ?? 'Token request failed — try again.');
         },
       });
+  }
+
+  /** 401: best-effort server logout, always clear the UI session, then go to /login. */
+  private handleUnauthorized(): void {
+    this.auth.logout().subscribe({
+      complete: () => void this.router.navigate(['/login']),
+      error: () => void this.router.navigate(['/login']),
+    });
   }
 
   onCopy(): void {

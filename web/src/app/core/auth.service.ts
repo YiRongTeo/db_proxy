@@ -25,7 +25,9 @@ export class AuthService {
 
   login(username: string, password: string): Observable<LoginResponse> {
     return this.api.login(username, password).pipe(
-      tap(() => this.user.set(username)),
+      // Task 9.11: mirror the SERVER-confirmed username from the response —
+      // not the argument, which the server may normalize.
+      tap((res) => this.user.set(res.username)),
     );
   }
 

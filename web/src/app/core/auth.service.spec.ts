@@ -63,4 +63,26 @@ describe('AuthService.restoreSession', () => {
     expect(auth.restored()).toBe(true);
     expect(auth.user()).toBe('admin');
   });
+
+  // ---- Task 9.11: review remediation (auth loop + normalized username) --------
+
+  it('login mirrors the SERVER-confirmed username into user, not the typed argument', () => {
+    api.login.mockReturnValue(of({ username: 'alice' })); // server normalizes 'Alice ' → 'alice'
+
+    auth.login('Alice ', 'pw').subscribe();
+
+    expect(api.login).toHaveBeenCalledWith('Alice ', 'pw');
+    expect(auth.user()).toBe('alice'); // res.username wins over the argument
+    expect(auth.isLoggedIn()).toBe(true);
+  });
+
+  it('logout clears the UI session even when the server call fails', () => {
+    auth.user.set('admin');
+    api.logout.mockReturnValue(throwError(() => ({ status: 500 })));
+
+    auth.logout().subscribe({ error: () => undefined });
+
+    expect(auth.user()).toBeNull();
+    expect(auth.isLoggedIn()).toBe(false);
+  });
 });

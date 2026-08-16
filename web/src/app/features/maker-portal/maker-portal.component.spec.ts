@@ -1,7 +1,7 @@
-import { signal } from '@angular/core';
+import { Component, signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
-import { provideRouter } from '@angular/router';
-import { of } from 'rxjs';
+import { provideRouter, Router } from '@angular/router';
+import { of, throwError } from 'rxjs';
 import { ApiService, DbPreset, TokenResponse } from '../../core/api.service';
 import { AuthService } from '../../core/auth.service';
 import { MakerPortalComponent } from './maker-portal.component';
@@ -16,10 +16,18 @@ const PRESET: DbPreset = {
 
 const TOKEN: TokenResponse = { token: 'sess_test123', host: '127.0.0.1', port: '3306', expires_in: 300 };
 
+/** Landing route for the 401 → /login navigation assertions (Task 9.11). */
+@Component({ template: '', standalone: true })
+class StubCmp {}
+
 describe('MakerPortalComponent', () => {
   let api: {
     dbPresets: ReturnType<typeof vi.fn>;
     requestToken: ReturnType<typeof vi.fn>;
+  };
+  let auth: {
+    user: ReturnType<typeof signal>;
+    logout: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -27,12 +35,16 @@ describe('MakerPortalComponent', () => {
       dbPresets: vi.fn(() => of([PRESET])),
       requestToken: vi.fn(() => of(TOKEN)),
     };
+    auth = {
+      user: signal('alice'),
+      logout: vi.fn(() => of(null)),
+    };
     TestBed.configureTestingModule({
       imports: [MakerPortalComponent],
       providers: [
-        provideRouter([]),
+        provideRouter([{ path: 'login', component: StubCmp }]),
         { provide: ApiService, useValue: api },
-        { provide: AuthService, useValue: { user: signal('alice') } },
+        { provide: AuthService, useValue: auth },
       ],
     });
   });
@@ -119,5 +131,53 @@ describe('MakerPortalComponent', () => {
     expect(comp.result()).toEqual(TOKEN);
     const tokenInput = fixture.nativeElement.querySelector('.token-input') as HTMLInputElement;
     expect(tokenInput.value).toBe(TOKEN.token);
+  });
+
+  // ---- Task 9.11: review remediation (round 1 behavioral specs) --------------
+
+  it('a 401 on preset load logs out and navigates to /login (no auth loop)', async () => {
+    api.dbPresets = vi.fn(() => throwError(() => ({ status: 401 })));
+    const fixture = makeFixture();
+    await fixture.whenStable();
+    // handleUnauthorized fires logout() → navigate() — let the navigation settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(auth.logout).toHaveBeenCalledTimes(1);
+    expect(TestBed.inject(Router).url).toBe('/login');
+  });
+
+  it('changing the ticket id invalidates the previously issued token', async () => {
+    const fixture = makeFixture();
+    const comp = fixture.componentInstance;
+    comp.onPresetChange(PRESET.name);
+    comp.ticketId.set('OPS-1111');
+
+    comp.submit();
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(comp.result()).toEqual(TOKEN); // issued for OPS-1111
+
+    comp.onTicketChange('OPS-2222');
+
+    expect(comp.ticketId()).toBe('OPS-2222');
+    expect(comp.result()).toBeNull(); // stale token cleared
+    expect(comp.submitError()).toBeNull();
+  });
+
+  it('a 401 on token submit logs out, navigates to /login, and clears the submitting flag', async () => {
+    api.requestToken = vi.fn(() => throwError(() => ({ status: 401 })));
+    const fixture = makeFixture();
+    const comp = fixture.componentInstance;
+    comp.onPresetChange(PRESET.name);
+    comp.ticketId.set('OPS-1234');
+
+    comp.submit();
+    await fixture.whenStable();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(auth.logout).toHaveBeenCalledTimes(1);
+    expect(TestBed.inject(Router).url).toBe('/login');
+    expect(comp.submitting()).toBe(false);
+    expect(comp.result()).toBeNull();
   });
 });
