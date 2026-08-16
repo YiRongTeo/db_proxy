@@ -298,8 +298,13 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	}
 	token := sm.Parameters["user"] // token-as-username
 
-	// single-use token validation (GETDEL — atomic read+delete)
-	tok, err := p.vs.GetDeleteToken(ctx, token)
+	// single-use token validation (GETDEL — atomic read+delete).
+	// Bounded (review 2026-08-17): a hung store must not pin the session
+	// goroutine at auth — the client gets the store-error rejection after
+	// storeCallTimeout instead of hanging forever.
+	sctx, scancel := storeCallCtx()
+	tok, err := p.vs.GetDeleteToken(sctx, token)
+	scancel()
 	if err != nil {
 		// Review 2026-08-16: a store failure must be REPORTED to the
 		// client (FATAL 28000, mirroring the other rejection paths) and

@@ -389,7 +389,12 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	_ = client.SetDeadline(time.Time{})
 
 	// 5. single-use token validation (GETDEL — atomic read+delete).
-	tok, err := p.vs.GetDeleteToken(ctx, token)
+	// Bounded (review 2026-08-17): a hung store must not pin the session
+	// goroutine at auth — the client gets the store-error rejection after
+	// storeCallTimeout instead of hanging forever.
+	sctx, scancel := storeCallCtx()
+	tok, err := p.vs.GetDeleteToken(sctx, token)
+	scancel()
 	if err != nil {
 		p.log.Error("token lookup", "err", err, "client", clientAddr)
 		p.metrics.ConnectionsTotal("mssql", "rejected")

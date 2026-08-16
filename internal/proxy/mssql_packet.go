@@ -28,6 +28,19 @@ const (
 	tdsDoneAttn   = 0x0020     // DONE token status bit: attention acknowledged (MS-TDS 2.2.7.10)
 )
 
+// tdsMaxHandshakeMsg caps the assembled size of a PRE-AUTH TDS message
+// (PRELOGIN / LOGIN7 — a few KB in practice): an endless multi-packet
+// stream cannot grow the buffer without bound (review 2026-08-17 — the 10s
+// handshake deadline bounds the stream in TIME only). A var (not const) so
+// tests can shrink it.
+var tdsMaxHandshakeMsg = 64 << 10
+
+// tdsMaxRelayMsg caps one relayed client message (see
+// readTDSMessageFrames): real SQL batches are far smaller, so the cap only
+// ever trips on a broken or hostile client; it bounds per-session memory
+// (review 2026-08-17). A var (not const) so tests can shrink it.
+var tdsMaxRelayMsg = 16 << 20
+
 // PreLogin option tokens (MS-TDS 2.2.6.3).
 const (
 	preloginVersion    = 0x00
@@ -113,6 +126,12 @@ func readTDSMessage(br *bufio.Reader) (typ byte, payload []byte, err error) {
 		}
 		if typ == 0 {
 			typ = t
+		}
+		// Cap the assembled message (review 2026-08-17): an endless
+		// multi-packet stream must not grow the buffer without bound —
+		// the handshake deadline bounds it in TIME only.
+		if len(buf)+len(p) > tdsMaxHandshakeMsg {
+			return 0, nil, fmt.Errorf("tds: message too large (%d bytes)", len(buf)+len(p))
 		}
 		buf = append(buf, p...)
 		if status&tdsStatusEOM != 0 {

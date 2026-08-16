@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -109,7 +108,12 @@ func (g *gateCore) waitLoop(pub *sessionPublisher, sid string, seconds int, flus
 			timeout()
 			return
 		case <-ticker.C:
-			watched, err := pub.vs.WatchActive(context.Background(), sid)
+			// Bounded store call (review 2026-08-17): a hung valkey must
+			// not pin the wait goroutine — the recheck times out and the
+			// grace timer still drains the queue on schedule.
+			ctx, cancel := storeCallCtx()
+			watched, err := pub.vs.WatchActive(ctx, sid)
+			cancel()
 			if err != nil {
 				pub.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", sid, "err", err)
 				continue
@@ -187,8 +191,12 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 	s.gateMu.Unlock()
 	// A watcher that appeared since the gate check unblocks the queue
 	// immediately — checked on every new command arrival, not only on the
-	// ticker.
-	if watched, err := p.vs.WatchActive(context.Background(), s.id); err == nil && watched {
+	// ticker. Bounded (review 2026-08-17): a hung store must not stall the
+	// relay — the wait simply continues until the grace timer drains.
+	ctx, cancel := storeCallCtx()
+	watched, werr := p.vs.WatchActive(ctx, s.id)
+	cancel()
+	if werr == nil && watched {
 		p.gateFlush(s)
 	}
 	return true
@@ -340,8 +348,12 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	s.gateMu.Unlock()
 	// A watcher that appeared since the gate check unblocks the queue
 	// immediately — checked on every new message arrival, not only on the
-	// ticker.
-	if watched, err := p.vs.WatchActive(context.Background(), s.id); err == nil && watched {
+	// ticker. Bounded (review 2026-08-17): a hung store must not stall the
+	// relay — the wait simply continues until the grace timer drains.
+	ctx, cancel := storeCallCtx()
+	watched, werr := p.vs.WatchActive(ctx, s.id)
+	cancel()
+	if werr == nil && watched {
 		p.gatePGFlush(s)
 	}
 	return true
@@ -504,8 +516,12 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame, isA
 	s.gateMu.Unlock()
 	// A watcher that appeared since the gate check unblocks the queue
 	// immediately — checked on every new message arrival, not only on the
-	// ticker.
-	if watched, err := p.vs.WatchActive(context.Background(), s.id); err == nil && watched {
+	// ticker. Bounded (review 2026-08-17): a hung store must not stall the
+	// relay — the wait simply continues until the grace timer drains.
+	ctx, cancel := storeCallCtx()
+	watched, werr := p.vs.WatchActive(ctx, s.id)
+	cancel()
+	if werr == nil && watched {
 		p.gateMSSQLFlush(s)
 	}
 	return true

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -165,7 +164,12 @@ func (p *MySQLProxy) checkWriteGate(s *mysqlSession, cmd byte) string {
 	if s.access != "write" || !isSQLExecCommand(cmd) {
 		return ""
 	}
-	watched, err := p.vs.WatchActive(context.Background(), s.id)
+	// Bounded store call (review 2026-08-17): a hung valkey must not pin
+	// the client→backend read loop — the command is blocked (fail closed)
+	// after storeCallTimeout, exactly like an absent watcher.
+	ctx, cancel := storeCallCtx()
+	defer cancel()
+	watched, err := p.vs.WatchActive(ctx, s.id)
 	if err != nil {
 		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
 		return gatingMessage(s.id)

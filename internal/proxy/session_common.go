@@ -36,6 +36,20 @@ type sessionPublisher struct {
 	metrics        *metrics.Metrics
 }
 
+// storeCallTimeout bounds every store call made from the relay/gate hot
+// paths (review 2026-08-17): a hung valkey must stall a session for at
+// most this long — gate checks fail closed (the command is blocked exactly
+// like an absent watcher), publish paths log-and-continue — never for the
+// lifetime of a TCP retransmit. A var (not const) so tests can shrink it.
+var storeCallTimeout = 3 * time.Second
+
+// storeCallCtx returns a context bounded by storeCallTimeout for one
+// logical store operation. All store calls of one publish share the SAME
+// ctx, so the total stall is bounded by the timeout, not N × timeout.
+func storeCallCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), storeCallTimeout)
+}
+
 // sessionCommon is the per-protocol session surface the shared publisher
 // needs — the session fields that feed the directory record, the heartbeat
 // stamp and the pending/capture slots. Implemented by mysqlSession,
@@ -149,7 +163,11 @@ func (c *mssqlResultCapture) isNil() bool { return c == nil }
 // after DelSessionLive, and they deliberately skip the ticket channel.
 func (pub *sessionPublisher) publishEvent(s sessionCommon, ev *models.QueryEvent) {
 	raw, _ := json.Marshal(ev)
-	ctx := context.Background()
+	// One bounded ctx for the WHOLE publish (review 2026-08-17): a hung
+	// valkey stalls the relay pipe at most storeCallTimeout — never per
+	// call (3 publishes + heartbeat would be 4 × timeout).
+	ctx, cancel := storeCallCtx()
+	defer cancel()
 	_ = pub.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	if ev.TicketID != "" {
 		_ = pub.vs.Publish(ctx, "queries:ticket:"+ev.TicketID, raw)
@@ -192,7 +210,9 @@ func (pub *sessionPublisher) refreshSessionLive(s sessionCommon, tok *models.Tok
 	id, db, threadID, startedAt, lastSeen := s.sessionMeta()
 	rec := buildSessionRecord(id, tok.Username, tok.DBUser, tok.DBType, db, threadID, startedAt, lastSeen, "active")
 	s.unlockSession()
-	_ = pub.vs.SetSessionLive(context.Background(), id, rec, sessionLiveTTL)
+	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store call
+	defer cancel()
+	_ = pub.vs.SetSessionLive(ctx, id, rec, sessionLiveTTL)
 }
 
 // publishLifecycle publishes a session lifecycle event (Kind=session,
@@ -214,7 +234,8 @@ func (pub *sessionPublisher) publishLifecycle(s sessionCommon, tok *models.Token
 		ClientAddr: clientAddr,
 	}
 	raw, _ := json.Marshal(ev)
-	ctx := context.Background()
+	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store calls
+	defer cancel()
 	_ = pub.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	_ = pub.vs.Publish(ctx, "queries:sess:"+id, raw)
 	// Task 8.8 lifecycle logging: same context fields as the query line,
@@ -234,7 +255,9 @@ func (pub *sessionPublisher) publishLifecycle(s sessionCommon, tok *models.Token
 // re-armed the heartbeat.
 func (pub *sessionPublisher) finishSession(s sessionCommon, tok *models.TokenPayload, clientAddr string) {
 	id, _, _, _, _ := s.sessionMeta()
-	_ = pub.vs.DelSessionLive(context.Background(), id)
+	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store call
+	defer cancel()
+	_ = pub.vs.DelSessionLive(ctx, id)
 	pub.publishLifecycle(s, tok, "ended", clientAddr)
 }
 

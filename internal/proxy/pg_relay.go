@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
@@ -99,7 +98,11 @@ func (p *PGProxy) gatePGBlockMsg(msg pgproto3.FrontendMessage, s *pgSession) str
 	default:
 		return ""
 	}
-	watched, err := p.vs.WatchActive(context.Background(), s.id)
+	// Bounded store call (review 2026-08-17): fail closed after
+	// storeCallTimeout on a hung store, never pin the read loop.
+	ctx, cancel := storeCallCtx()
+	defer cancel()
+	watched, err := p.vs.WatchActive(ctx, s.id)
 	if err != nil {
 		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
 		return gatingMessage(s.id)

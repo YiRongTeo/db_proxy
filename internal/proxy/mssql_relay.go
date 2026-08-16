@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -37,6 +36,7 @@ func readTDSFrame(br *bufio.Reader) (hdr [8]byte, payload []byte, err error) {
 // 9.4 write-gate) and forwards the frames in order, so the stream the
 // backend sees stays byte-exact for multi-packet messages too.
 func readTDSMessageFrames(br *bufio.Reader) (frames []mssqlGateFrame, typ byte, err error) {
+	total := 0
 	for {
 		hdr, payload, err := readTDSFrame(br)
 		if err != nil {
@@ -44,6 +44,13 @@ func readTDSMessageFrames(br *bufio.Reader) (frames []mssqlGateFrame, typ byte, 
 		}
 		if typ == 0 {
 			typ = hdr[0]
+		}
+		// Cap the assembled message (review 2026-08-17): an authenticated
+		// client streaming endless frames must not grow the held message
+		// without bound — the connection is dropped instead.
+		total += len(payload)
+		if total > tdsMaxRelayMsg {
+			return nil, 0, fmt.Errorf("tds: message too large (%d bytes)", total)
 		}
 		frames = append(frames, mssqlGateFrame{hdr: hdr, payload: payload})
 		if hdr[1]&tdsStatusEOM != 0 {
@@ -157,7 +164,11 @@ func (p *MSSQLProxy) gateMSSQLBlocked(s *mssqlSession, typ byte) string {
 	if s.access != "write" || (typ != tdsSQLBatch && typ != tdsRPC) {
 		return ""
 	}
-	watched, err := p.vs.WatchActive(context.Background(), s.id)
+	// Bounded store call (review 2026-08-17): fail closed after
+	// storeCallTimeout on a hung store, never pin the read loop.
+	ctx, cancel := storeCallCtx()
+	defer cancel()
+	watched, err := p.vs.WatchActive(ctx, s.id)
 	if err != nil {
 		p.log.Error("watch check failed — fail closed", "session_id", s.id, "err", err)
 		return gatingMessage(s.id)

@@ -306,8 +306,13 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// deadline-free by design (long-running queries must never trip a deadline).
 	_ = client.SetDeadline(time.Time{})
 
-	// 3. single-use token validation (GETDEL — atomic read+delete)
-	tok, err := p.vs.GetDeleteToken(ctx, token)
+	// 3. single-use token validation (GETDEL — atomic read+delete).
+	// Bounded (review 2026-08-17): a hung store must not pin the session
+	// goroutine at auth — the client gets the store-error rejection after
+	// storeCallTimeout instead of hanging forever.
+	sctx, scancel := storeCallCtx()
+	tok, err := p.vs.GetDeleteToken(sctx, token)
+	scancel()
 	if err != nil {
 		// Review 2026-08-16: a store failure must be REPORTED to the
 		// client (ERR 1045, mirroring the other rejection paths) and
