@@ -56,18 +56,17 @@ type mysqlSession struct {
 // limiting (Task 3.5), so there is deliberately no connection counter, no
 // maxConns, and no Serve loop here — one handleConn per accepted connection.
 type MySQLProxy struct {
-	log      *slog.Logger
-	vs       Store
+	// sessionPublisher (Task 9.12) carries the shared session/publish
+	// machinery: log, vs (Store), logQueryOutput (Task 8.8) and metrics
+	// (Task 9.8) — the fields were once duplicated across the three
+	// protocol proxies. Its methods (publishEvent, publishPending, …) are
+	// promoted onto MySQLProxy; the per-protocol bits (the session's
+	// pending/capture slots) flow in via the sessionCommon surface.
+	sessionPublisher
+
 	creds    CredResolver  // backend password source: config list or credential API (Task 8.7)
 	tlsCfg   *tls.Config   // non-nil → CLIENT_SSL advertised + SSLRequest upgraded (Task 7.4); nil = plaintext
 	serverID atomic.Uint32 // per-session connection id for the handshake
-
-	// logQueryOutput (Task 8.8) gates the CAPTURED RESULT payload on query
-	// log lines (columns/row_count/rows/truncated). False (default) still
-	// logs every query with full context — username, ticket_id, db_user,
-	// db, db_type, stmt_type, status, session_id, sql — but never the
-	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
-	logQueryOutput bool
 
 	// gateWaitSeconds (Task 8.13) is the maker write-gate GRACE WINDOW:
 	// blocked SQL commands on an unwatched write session wait up to this
@@ -77,11 +76,6 @@ type MySQLProxy struct {
 	// config gate_wait_seconds (ZT_GATE_WAIT_SECONDS, default 20) via
 	// SetGateWaitSeconds.
 	gateWaitSeconds int
-
-	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
-	// disabled (config metrics.enabled=false): every instrument call is a
-	// no-op — the disabled hot path costs one nil check per site.
-	metrics *metrics.Metrics
 
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
@@ -95,11 +89,10 @@ type MySQLProxy struct {
 // credential API — the password is never stored or logged).
 func NewMySQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
-		log:      log,
-		vs:       vs,
-		creds:    creds,
-		tlsCfg:   tlsCfg,
-		sessions: make(map[string]*mysqlSession),
+		sessionPublisher: sessionPublisher{log: log, vs: vs},
+		creds:            creds,
+		tlsCfg:           tlsCfg,
+		sessions:         make(map[string]*mysqlSession),
 	}
 }
 

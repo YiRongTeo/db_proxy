@@ -64,6 +64,78 @@ func gateTimeoutMessage(sid string, seconds int) string {
 	return fmt.Sprintf("maker gating: no checker connected within %ds (session %s)", seconds, sid)
 }
 
+// gateCore is the shared Task 8.13 grace-wait skeleton (Task 9.12
+// de-triplication): the active/stop/waiting/wg state plus the wait goroutine
+// body, embedded by the three per-protocol gate states (mysqlGateState,
+// pgGateState, mssqlGateState — their queues and drain replies stay
+// protocol-typed). The flush and timeout ACTIONS are the per-protocol bits,
+// passed in as callbacks by the mirrors' Hold paths.
+type gateCore struct {
+	active  bool           // a grace wait is in progress (queue non-empty)
+	stop    chan struct{}  // closed by whoever ends the wait (flush / drain / session close)
+	waiting bool           // a wait goroutine is running (reset by every deactivation)
+	wg      sync.WaitGroup // join the wait goroutine at session teardown (Task 9.10)
+}
+
+// startWait activates the grace wait and launches the shared wait goroutine
+// (mirrors call it under the session's gateMu when the gate transitions
+// inactive → active). flush/timeout are the mirror's protocol actions.
+func (g *gateCore) startWait(pub *sessionPublisher, sid string, seconds int, flush, timeout func()) {
+	g.active = true
+	g.stop = make(chan struct{})
+	if !g.waiting {
+		g.waiting = true
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			g.waitLoop(pub, sid, seconds, flush, timeout)
+		}()
+	}
+}
+
+// waitLoop is the shared grace-wait goroutine body: it re-checks for a
+// watcher on a short ticker (flushing the queue in order when one appears)
+// and drains + rejects the queue when the grace window expires. It exits as
+// soon as the wait is ended by any path (flush, drain, session close); the
+// caller joins it via g.wg (Task 9.10).
+func (g *gateCore) waitLoop(pub *sessionPublisher, sid string, seconds int, flush, timeout func()) {
+	timer := time.NewTimer(time.Duration(seconds) * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(gateWatchRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			timeout()
+			return
+		case <-ticker.C:
+			watched, err := pub.vs.WatchActive(context.Background(), sid)
+			if err != nil {
+				pub.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", sid, "err", err)
+				continue
+			}
+			if watched {
+				flush()
+				return
+			}
+		case <-g.stop:
+			return
+		}
+	}
+}
+
+// deactivateLocked ends the wait: clears active/waiting and closes+nils the
+// stop channel. Must be called with the session's gateMu held, right after
+// the caller extracts its protocol-typed queue.
+func (g *gateCore) deactivateLocked() {
+	g.active = false
+	g.waiting = false
+	if g.stop != nil {
+		close(g.stop)
+		g.stop = nil
+	}
+}
+
 // --- MySQL ----------------------------------------------------------------
 
 // mysqlGateEntry is one held command: the exact bytes the normal forward
@@ -80,14 +152,11 @@ type mysqlGateEntry struct {
 // mysqlGateState is the per-session Task 8.13 grace-hold state, guarded by
 // the session's gateMu (a dedicated mutex — the session mu guards the
 // pending/capture slots and is never held across gate transitions).
-// waiting/wg (Task 9.10) track the wait goroutine so closeGateWait can JOIN
-// it — the done channel it replaces is gone.
+// gateCore (Task 9.12) carries the shared active/stop/waiting/wg state and
+// the wait goroutine; the queue stays protocol-typed here.
 type mysqlGateState struct {
-	active  bool             // a grace wait is in progress (queue non-empty)
-	queue   []mysqlGateEntry // held commands, bounded (gateQueueMax)
-	stop    chan struct{}    // closed by whoever ends the wait (flush / drain / session close)
-	waiting bool             // a wait goroutine is running (reset by every deactivation)
-	wg      sync.WaitGroup   // join the wait goroutine at session teardown (Task 9.10)
+	gateCore
+	queue []mysqlGateEntry // held commands, bounded (gateQueueMax)
 }
 
 // gateHold queues a gated (blocked) command for the grace window instead of
@@ -104,16 +173,8 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 	s.gateMu.Lock()
 	if !s.gate.active {
 		// First held command: start the wait (grace timer + watch ticker).
-		s.gate.active = true
-		s.gate.stop = make(chan struct{})
-		if !s.gate.waiting {
-			s.gate.waiting = true
-			s.gate.wg.Add(1)
-			go func() {
-				defer s.gate.wg.Done()
-				p.gateWaitLoop(s)
-			}()
-		}
+		s.gate.startWait(&p.sessionPublisher, s.id, p.gateWaitSeconds,
+			func() { p.gateFlush(s) }, func() { p.gateTimeout(s) })
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -133,37 +194,6 @@ func (p *MySQLProxy) gateHold(s *mysqlSession, seq byte, payload []byte) bool {
 	return true
 }
 
-// gateWaitLoop is the per-wait goroutine: it re-checks for a watcher on a
-// short ticker (flushing the queue in order when one appears) and drains +
-// rejects the queue when the grace window expires. It exits as soon as the
-// wait is ended by any path (flush, drain, session close); the caller joins
-// it via s.gate.wg (Task 9.10).
-func (p *MySQLProxy) gateWaitLoop(s *mysqlSession) {
-	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(gateWatchRecheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timer.C:
-			p.gateTimeout(s)
-			return
-		case <-ticker.C:
-			watched, err := p.vs.WatchActive(context.Background(), s.id)
-			if err != nil {
-				p.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", s.id, "err", err)
-				continue
-			}
-			if watched {
-				p.gateFlush(s)
-				return
-			}
-		case <-s.gate.stop:
-			return
-		}
-	}
-}
-
 // gateFlush forwards every held command to the backend IN ORDER — each
 // exactly as the normal forward path writes it (the stored client seq +
 // byte-exact payload, re-framed by writeMySQLPacket) — and clears the wait:
@@ -179,12 +209,9 @@ func (p *MySQLProxy) gateFlush(s *mysqlSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	s.writeMu.Lock()
 	for _, e := range entries {
@@ -205,12 +232,9 @@ func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	p.gateRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 }
@@ -223,12 +247,9 @@ func (p *MySQLProxy) gateTimeout(s *mysqlSession) {
 func (p *MySQLProxy) closeGateWait(s *mysqlSession) {
 	s.gateMu.Lock()
 	if s.gate.active {
-		s.gate.active = false
-		s.gate.waiting = false
 		entries := s.gate.queue
 		s.gate.queue = nil
-		close(s.gate.stop)
-		s.gate.stop = nil
+		s.gate.deactivateLocked()
 		s.gateMu.Unlock()
 		p.gateRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 	} else {
@@ -246,27 +267,17 @@ func (p *MySQLProxy) closeGateWait(s *mysqlSession) {
 // replies take the session's writeMu (serialized with the relay's client
 // writes); the audit publishes run lock-free afterwards.
 func (p *MySQLProxy) gateRejectEntries(s *mysqlSession, entries []mysqlGateEntry, msg string) {
-	s.mu.Lock()
-	s.pending = nil
-	s.capture = nil
-	s.mu.Unlock()
+	p.clearPendingCapture(s)
 	s.writeMu.Lock()
 	for _, e := range entries {
 		_ = writeMySQLPacket(s.client, e.seq+1, errPacket(1045, "42000", msg))
 	}
 	s.writeMu.Unlock()
-	var lastEv *models.QueryEvent
-	for _, e := range entries {
-		if e.ev == nil || e.ev == lastEv {
-			continue // no event, or a later packet of the same multi-packet command
-		}
-		lastEv = e.ev
-		e.ev.Status = "error"
-		e.ev.Error = msg
-		p.metrics.GateBlocks(e.ev.DBType)
-		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
-		p.publishEvent(s, e.ev)
+	evs := make([]*models.QueryEvent, len(entries))
+	for i, e := range entries {
+		evs[i] = e.ev
 	}
+	p.publishGateAudits(s, evs, msg)
 }
 
 // --- PostgreSQL -----------------------------------------------------------
@@ -286,14 +297,11 @@ type pgGateEntry struct {
 }
 
 // pgGateState is the per-session Task 8.13 grace-hold state for PG,
-// guarded by the session's gateMu. Mirrors mysqlGateState (Task 9.10:
-// waiting/wg join instead of the removed done channel).
+// guarded by the session's gateMu. Mirrors mysqlGateState; gateCore
+// (Task 9.12) carries the shared state + wait goroutine.
 type pgGateState struct {
-	active  bool
-	queue   []pgGateEntry
-	stop    chan struct{}
-	waiting bool
-	wg      sync.WaitGroup
+	gateCore
+	queue []pgGateEntry
 }
 
 // gatePGHold queues a gated (blocked) PG message for the grace window
@@ -310,16 +318,9 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	}
 	s.gateMu.Lock()
 	if !s.gate.active {
-		s.gate.active = true
-		s.gate.stop = make(chan struct{})
-		if !s.gate.waiting {
-			s.gate.waiting = true
-			s.gate.wg.Add(1)
-			go func() {
-				defer s.gate.wg.Done()
-				p.gatePGWaitLoop(s)
-			}()
-		}
+		// First held message: start the wait (grace timer + watch ticker).
+		s.gate.startWait(&p.sessionPublisher, s.id, p.gateWaitSeconds,
+			func() { p.gatePGFlush(s) }, func() { p.gatePGTimeout(s) })
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -346,33 +347,6 @@ func (p *PGProxy) gatePGHold(msg pgproto3.FrontendMessage, s *pgSession) bool {
 	return true
 }
 
-// gatePGWaitLoop is the PG mirror of gateWaitLoop.
-func (p *PGProxy) gatePGWaitLoop(s *pgSession) {
-	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(gateWatchRecheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timer.C:
-			p.gatePGTimeout(s)
-			return
-		case <-ticker.C:
-			watched, err := p.vs.WatchActive(context.Background(), s.id)
-			if err != nil {
-				p.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", s.id, "err", err)
-				continue
-			}
-			if watched {
-				p.gatePGFlush(s)
-				return
-			}
-		case <-s.gate.stop:
-			return
-		}
-	}
-}
-
 // gatePGFlush forwards every held message to the backend IN ORDER — the
 // stored raw wire bytes written exactly as the normal relay write does
 // (front.conn.Write; pgproto3's Send is an unbuffered Encode+Write, so this
@@ -386,12 +360,9 @@ func (p *PGProxy) gatePGFlush(s *pgSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	s.writeMu.Lock()
 	for _, e := range entries {
@@ -410,12 +381,9 @@ func (p *PGProxy) gatePGTimeout(s *pgSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	p.gatePGRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 }
@@ -426,12 +394,9 @@ func (p *PGProxy) gatePGTimeout(s *pgSession) {
 func (p *PGProxy) closePGGateWait(s *pgSession) {
 	s.gateMu.Lock()
 	if s.gate.active {
-		s.gate.active = false
-		s.gate.waiting = false
 		entries := s.gate.queue
 		s.gate.queue = nil
-		close(s.gate.stop)
-		s.gate.stop = nil
+		s.gate.deactivateLocked()
 		s.gateMu.Unlock()
 		p.gatePGRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 	} else {
@@ -448,10 +413,7 @@ func (p *PGProxy) closePGGateWait(s *pgSession) {
 // status=error. The pending slot is cleared so the teardown path cannot
 // publish a duplicate event. Replies run under the session's writeMu.
 func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg string) {
-	s.mu.Lock()
-	s.pending = nil
-	s.capture = nil
-	s.mu.Unlock()
+	p.clearPendingCapture(s)
 	s.writeMu.Lock()
 	for _, e := range entries {
 		_ = s.be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000", Message: msg})
@@ -460,18 +422,11 @@ func (p *PGProxy) gatePGRejectEntries(s *pgSession, entries []pgGateEntry, msg s
 		}
 	}
 	s.writeMu.Unlock()
-	var lastEv *models.QueryEvent
-	for _, e := range entries {
-		if e.ev == nil || e.ev == lastEv {
-			continue
-		}
-		lastEv = e.ev
-		e.ev.Status = "error"
-		e.ev.Error = msg
-		p.metrics.GateBlocks(e.ev.DBType)
-		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
-		p.publishEvent(s, e.ev)
+	evs := make([]*models.QueryEvent, len(entries))
+	for i, e := range entries {
+		evs[i] = e.ev
 	}
+	p.publishGateAudits(s, evs, msg)
 }
 
 // --- MSSQL (Task 9.4) ------------------------------------------------------
@@ -512,14 +467,11 @@ type mssqlGateEntry struct {
 }
 
 // mssqlGateState is the per-session Task 8.13 grace-hold state for the TDS
-// plane, guarded by the session's gateMu. Mirrors mysqlGateState (Task
-// 9.10: waiting/wg join instead of the removed done channel).
+// plane, guarded by the session's gateMu. Mirrors mysqlGateState; gateCore
+// (Task 9.12) carries the shared state + wait goroutine.
 type mssqlGateState struct {
-	active  bool
-	queue   []mssqlGateEntry
-	stop    chan struct{}
-	waiting bool
-	wg      sync.WaitGroup
+	gateCore
+	queue []mssqlGateEntry
 }
 
 // gateMSSQLHold queues a gated (blocked) TDS message for the grace window
@@ -538,16 +490,8 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame, isA
 	s.gateMu.Lock()
 	if !s.gate.active {
 		// First held message: start the wait (grace timer + watch ticker).
-		s.gate.active = true
-		s.gate.stop = make(chan struct{})
-		if !s.gate.waiting {
-			s.gate.waiting = true
-			s.gate.wg.Add(1)
-			go func() {
-				defer s.gate.wg.Done()
-				p.gateMSSQLWaitLoop(s)
-			}()
-		}
+		s.gate.startWait(&p.sessionPublisher, s.id, p.gateWaitSeconds,
+			func() { p.gateMSSQLFlush(s) }, func() { p.gateMSSQLTimeout(s) })
 	}
 	if len(s.gate.queue) >= gateQueueMax {
 		s.gateMu.Unlock()
@@ -567,37 +511,6 @@ func (p *MSSQLProxy) gateMSSQLHold(s *mssqlSession, frames []mssqlGateFrame, isA
 	return true
 }
 
-// gateMSSQLWaitLoop is the TDS mirror of gateWaitLoop: it re-checks for a
-// watcher on a short ticker (flushing the queue in order when one appears)
-// and drains + rejects the queue when the grace window expires. It exits as
-// soon as the wait is ended by any path (flush, drain, session close); the
-// caller joins it via s.gate.wg (Task 9.10).
-func (p *MSSQLProxy) gateMSSQLWaitLoop(s *mssqlSession) {
-	timer := time.NewTimer(time.Duration(p.gateWaitSeconds) * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(gateWatchRecheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timer.C:
-			p.gateMSSQLTimeout(s)
-			return
-		case <-ticker.C:
-			watched, err := p.vs.WatchActive(context.Background(), s.id)
-			if err != nil {
-				p.log.Error("gate watch recheck failed — continuing the grace wait", "session_id", s.id, "err", err)
-				continue
-			}
-			if watched {
-				p.gateMSSQLFlush(s)
-				return
-			}
-		case <-s.gate.stop:
-			return
-		}
-	}
-}
-
 // gateMSSQLFlush forwards every held message to the backend IN ORDER — each
 // frame written byte-exact (original header + payload), exactly as the
 // normal forward path writes it — and clears the wait: subsequent messages
@@ -611,12 +524,9 @@ func (p *MSSQLProxy) gateMSSQLFlush(s *mssqlSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	s.writeMu.Lock()
 	for _, e := range entries {
@@ -641,12 +551,9 @@ func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
 		s.gateMu.Unlock()
 		return
 	}
-	s.gate.active = false
-	s.gate.waiting = false
 	entries := s.gate.queue
 	s.gate.queue = nil
-	close(s.gate.stop)
-	s.gate.stop = nil
+	s.gate.deactivateLocked()
 	s.gateMu.Unlock()
 	p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 }
@@ -658,12 +565,9 @@ func (p *MSSQLProxy) gateMSSQLTimeout(s *mssqlSession) {
 func (p *MSSQLProxy) closeMSSQLGateWait(s *mssqlSession) {
 	s.gateMu.Lock()
 	if s.gate.active {
-		s.gate.active = false
-		s.gate.waiting = false
 		entries := s.gate.queue
 		s.gate.queue = nil
-		close(s.gate.stop)
-		s.gate.stop = nil
+		s.gate.deactivateLocked()
 		s.gateMu.Unlock()
 		p.gateMSSQLRejectEntries(s, entries, gateTimeoutMessage(s.id, p.gateWaitSeconds))
 	} else {
@@ -691,10 +595,7 @@ func buildTDSAttnAck() []byte {
 // the teardown path cannot publish a duplicate "connection closed" event.
 // Replies run under the session's writeMu (Task 9.10).
 func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGateEntry, msg string) {
-	s.mu.Lock()
-	s.pending = nil
-	s.capture = nil
-	s.mu.Unlock()
+	p.clearPendingCapture(s)
 	s.writeMu.Lock()
 	for _, e := range entries {
 		if e.attn {
@@ -704,16 +605,9 @@ func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGate
 		}
 	}
 	s.writeMu.Unlock()
-	var lastEv *models.QueryEvent
-	for _, e := range entries {
-		if e.ev == nil || e.ev == lastEv {
-			continue // no event, or a later frame of the same multi-frame message
-		}
-		lastEv = e.ev
-		e.ev.Status = "error"
-		e.ev.Error = msg
-		p.metrics.GateBlocks(e.ev.DBType)
-		p.metrics.QueriesTotal(e.ev.DBType, e.ev.StmtType, e.ev.Status)
-		p.publishEvent(s, e.ev)
+	evs := make([]*models.QueryEvent, len(entries))
+	for i, e := range entries {
+		evs[i] = e.ev
 	}
+	p.publishGateAudits(s, evs, msg)
 }

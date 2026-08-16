@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -60,21 +59,24 @@ type mssqlSession struct {
 // NOTE (D11 redesign): like MySQLProxy/PGProxy, the Dispatcher owns the
 // accept loop — one handleConn per accepted connection.
 type MSSQLProxy struct {
-	log    *slog.Logger
-	vs     Store
+	// sessionPublisher (Task 9.12) carries the shared session/publish
+	// machinery: log, vs (Store), logQueryOutput (Task 8.8) and metrics
+	// (Task 9.8) — the fields were once duplicated across the three
+	// protocol proxies. Its methods (publishEvent, publishPending, …) are
+	// promoted onto MSSQLProxy; the per-protocol bits (the session's
+	// pending/capture slots) flow in via the sessionCommon surface.
+	sessionPublisher
+
 	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
 	tlsCfg *tls.Config  // non-nil → PRELOGIN answers ENCRYPT_ON + 0x12-wrapped TLS upgrade (Task 9.2); nil = plaintext
 
-	// logQueryOutput (Task 8.8 parity) and gateWaitSeconds (Task 8.13
-	// parity) mirror the MySQL/PG fields; the TDS query pipeline that
-	// consumes them lands in Task 9.3. Wired from the same config keys.
-	logQueryOutput  bool
+	// gateWaitSeconds (Task 8.13 parity) is the maker write-gate GRACE
+	// WINDOW: blocked TDS messages on an unwatched write session wait up
+	// to this many seconds for a checker instead of failing instantly. 0
+	// (the proxy default) = reject immediately; the deployed plane is
+	// wired from config gate_wait_seconds (ZT_GATE_WAIT_SECONDS, default
+	// 20) via SetGateWaitSeconds.
 	gateWaitSeconds int
-
-	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
-	// disabled (config metrics.enabled=false): every instrument call is a
-	// no-op — the disabled hot path costs one nil check per site.
-	metrics *metrics.Metrics
 
 	mu       sync.Mutex
 	sessions map[string]*mssqlSession // active sessions — kill registry (Task 6.4 parity)
@@ -86,7 +88,12 @@ type MSSQLProxy struct {
 // LOGIN7 (client-side TLS, data plane listener). creds resolves the backend
 // DB password per connect (Task 8.7: config list or credential API).
 func NewMSSQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MSSQLProxy {
-	return &MSSQLProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*mssqlSession)}
+	return &MSSQLProxy{
+		sessionPublisher: sessionPublisher{log: log, vs: vs},
+		creds:            creds,
+		tlsCfg:           tlsCfg,
+		sessions:         make(map[string]*mssqlSession),
+	}
 }
 
 // SetLogQueryOutput is the Task 8.8 parity setter; the TDS query pipeline
@@ -778,48 +785,4 @@ func scanLoginSPID(buf []byte) uint16 {
 		}
 	}
 	return 0
-}
-
-// refreshSessionLive writes (or refreshes) the session's directory record —
-// sess:live:<sid> with the heartbeat TTL — stamping a fresh last_seen.
-// Best-effort: failures are logged by the store, never fatal to the session.
-func (p *MSSQLProxy) refreshSessionLive(s *mssqlSession, tok *models.TokenPayload) {
-	s.mu.Lock()
-	s.lastSeen = time.Now().UTC()
-	rec := buildSessionRecord(s.id, tok.Username, tok.DBUser, tok.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
-	s.mu.Unlock()
-	_ = p.vs.SetSessionLive(context.Background(), s.id, rec, sessionLiveTTL)
-}
-
-// publishLifecycle publishes a session lifecycle event (Kind=session,
-// Action=started|ended) to queries:<username> AND queries:sess:<sid>.
-// Lifecycle events deliberately do NOT go to the ticket channel — ticket
-// grouping is about query activity, not connection presence.
-func (p *MSSQLProxy) publishLifecycle(s *mssqlSession, tok *models.TokenPayload, action, clientAddr string) {
-	ev := models.QueryEvent{
-		ID:         newEventID(),
-		Ts:         time.Now().UTC(),
-		Kind:       "session",
-		Action:     action,
-		Username:   tok.Username,
-		DBUser:     tok.DBUser,
-		DBType:     tok.DBType,
-		DB:         s.db,
-		SessionID:  s.id,
-		ClientAddr: clientAddr,
-	}
-	raw, _ := json.Marshal(ev)
-	ctx := context.Background()
-	_ = p.vs.Publish(ctx, "queries:"+ev.Username, raw)
-	_ = p.vs.Publish(ctx, "queries:sess:"+s.id, raw)
-	p.log.Info("session "+action, "username", ev.Username, "ticket_id", tok.TicketID,
-		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType, "session_id", ev.SessionID)
-}
-
-// finishSession removes the session from the directory (DelSessionLive) and
-// publishes the ended lifecycle event. Deferred in handleConn so the ended
-// event is always the session's last word on the wire.
-func (p *MSSQLProxy) finishSession(s *mssqlSession, tok *models.TokenPayload, clientAddr string) {
-	_ = p.vs.DelSessionLive(context.Background(), s.id)
-	p.publishLifecycle(s, tok, "ended", clientAddr)
 }

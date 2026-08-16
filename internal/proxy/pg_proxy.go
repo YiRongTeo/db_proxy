@@ -64,17 +64,16 @@ type pgSession struct {
 // NOTE (D11 redesign): like MySQLProxy, the Dispatcher owns the accept loop
 // and connection limiting — one handleConn per accepted connection.
 type PGProxy struct {
-	log    *slog.Logger
-	vs     Store
+	// sessionPublisher (Task 9.12) carries the shared session/publish
+	// machinery: log, vs (Store), logQueryOutput (Task 8.8) and metrics
+	// (Task 9.8) — the fields were once duplicated across the three
+	// protocol proxies. Its methods (publishEvent, publishPending, …) are
+	// promoted onto PGProxy; the per-protocol bits (the session's
+	// pending/capture slots) flow in via the sessionCommon surface.
+	sessionPublisher
+
 	creds  CredResolver // backend password source: config list or credential API (Task 8.7)
 	tlsCfg *tls.Config  // non-nil → SSLRequest answered 'S' + TLS handshake (Task 7.5); nil = plaintext 'N'
-
-	// logQueryOutput (Task 8.8) gates the CAPTURED RESULT payload on query
-	// log lines (columns/row_count/rows/truncated). False (default) still
-	// logs every query with full context — username, ticket_id, db_user,
-	// db, db_type, stmt_type, status, session_id, sql — but never the
-	// result payload. Wired from config log_query_output (ZT_LOG_QUERY_OUTPUT).
-	logQueryOutput bool
 
 	// gateWaitSeconds (Task 8.13) is the maker write-gate GRACE WINDOW:
 	// blocked SQL messages on an unwatched write session wait up to this
@@ -84,11 +83,6 @@ type PGProxy struct {
 	// config gate_wait_seconds (ZT_GATE_WAIT_SECONDS, default 20) via
 	// SetGateWaitSeconds.
 	gateWaitSeconds int
-
-	// metrics (Task 9.8) carries the OTel instruments. nil = metrics
-	// disabled (config metrics.enabled=false): every instrument call is a
-	// no-op — the disabled hot path costs one nil check per site.
-	metrics *metrics.Metrics
 
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
@@ -101,7 +95,12 @@ type PGProxy struct {
 // creds resolves the backend DB password per connect (Task 8.7: config list
 // or credential API — the password is never stored or logged).
 func NewPGProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
-	return &PGProxy{log: log, vs: vs, creds: creds, tlsCfg: tlsCfg, sessions: make(map[string]*pgSession)}
+	return &PGProxy{
+		sessionPublisher: sessionPublisher{log: log, vs: vs},
+		creds:            creds,
+		tlsCfg:           tlsCfg,
+		sessions:         make(map[string]*pgSession),
+	}
 }
 
 // SetLogQueryOutput toggles whether query log lines carry the captured

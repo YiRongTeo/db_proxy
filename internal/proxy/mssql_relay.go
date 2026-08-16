@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -179,29 +178,7 @@ func (p *MSSQLProxy) gateMSSQLReject(client net.Conn, s *mssqlSession, msg strin
 	s.writeMu.Lock() // serialize with the relay's client writes (Task 9.10)
 	_ = writeTDSMessage(client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
 	s.writeMu.Unlock()
-	p.publishMSSQLBlocked(s, msg)
-}
-
-// publishMSSQLBlocked publishes the session's pending event immediately with
-// status=error and the gating message (Task 9.4, mirroring the MySQL/PG
-// publishBlocked): a command blocked by the maker write-gate never reaches
-// the backend, so no backend response will ever complete the pending
-// capture — the audit trail must still show the block. The pending slot is
-// cleared so the next command starts fresh.
-func (p *MSSQLProxy) publishMSSQLBlocked(s *mssqlSession, msg string) {
-	s.mu.Lock()
-	ev := s.pending
-	s.pending = nil
-	s.capture = nil
-	s.mu.Unlock()
-	if ev == nil {
-		return
-	}
-	ev.Status = "error"
-	ev.Error = msg
-	p.metrics.GateBlocks(ev.DBType)
-	p.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
-	p.publishEvent(s, ev)
+	p.publishBlocked(s, msg)
 }
 
 // pipeMSSQLBackendToClient relays backend packets byte-exact (original
@@ -318,96 +295,4 @@ func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession
 	s.pending = &ev
 	s.capture = &mssqlResultCapture{}
 	s.mu.Unlock()
-}
-
-// publishPending attaches the captured response (status/error/columns/rows/
-// truncated) to the session's pending event, publishes it to
-// queries:<username>, queries:ticket:<ticket_id> (when present) and
-// queries:sess:<session_id>, and clears the slot for the next command.
-// capture must be the mssqlResultCapture whose completion triggered this
-// publish; the data is attached ONLY when it is still the session's current
-// capture (pointer identity) — never a stale capture from a previous
-// command. When a newer command was sniffed in between (or nothing is
-// pending at all), nothing is published — no-op for non-sniffed packets and
-// stray traffic after completion.
-func (p *MSSQLProxy) publishPending(s *mssqlSession, capture *mssqlResultCapture) {
-	s.mu.Lock()
-	ev := s.pending
-	if ev != nil && capture != nil && s.capture == capture {
-		ev.Status = capture.status
-		ev.Error = capture.errorMsg
-		ev.Columns = capture.columns
-		ev.Rows = capture.rows
-		ev.Truncated = capture.truncated
-		s.pending = nil
-		s.capture = nil
-	} else {
-		ev = nil // stale capture or nothing pending: publish nothing
-	}
-	s.mu.Unlock()
-	if ev != nil {
-		// Task 9.8: one query event = one queries.total increment, with
-		// the command's latency (sniffed → response completed) recorded
-		// on the query.duration histogram.
-		p.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
-		p.metrics.QueryDuration(ev.DBType, time.Since(ev.Ts))
-		p.publishEvent(s, ev)
-	}
-}
-
-// publishEvent publishes a QueryEvent to queries:<username>,
-// queries:ticket:<ticket_id> (when present) AND — Task 8.2 — the session's
-// own channel queries:sess:<session_id>. It also re-arms the
-// session-directory heartbeat (SetSessionLive with a fresh last_seen), so
-// an active session stays listed while its queries flow. Best-effort:
-// failures are logged by the store, never fatal to the relay. Lifecycle
-// events (started/ended) go through publishLifecycle instead — they must
-// NOT re-create the record after DelSessionLive, and they deliberately skip
-// the ticket channel.
-func (p *MSSQLProxy) publishEvent(s *mssqlSession, ev *models.QueryEvent) {
-	raw, _ := json.Marshal(ev)
-	ctx := context.Background()
-	_ = p.vs.Publish(ctx, "queries:"+ev.Username, raw)
-	if ev.TicketID != "" {
-		_ = p.vs.Publish(ctx, "queries:ticket:"+ev.TicketID, raw)
-	}
-	_ = p.vs.Publish(ctx, "queries:sess:"+ev.SessionID, raw)
-	s.mu.Lock()
-	s.lastSeen = time.Now().UTC()
-	rec := buildSessionRecord(s.id, ev.Username, ev.DBUser, ev.DBType, s.db, s.threadID, s.startedAt, s.lastSeen, "active")
-	s.mu.Unlock()
-	_ = p.vs.SetSessionLive(ctx, s.id, rec, sessionLiveTTL)
-	// Task 8.8 query logging: every published query event is logged with
-	// full context (never the token value — the event carries no token).
-	// The captured result payload (columns/row_count/rows/truncated) is
-	// added ONLY when log_query_output is on; rows are already capped by
-	// the capture (100 rows/512 chars/64KB).
-	attrs := []any{
-		"username", ev.Username, "ticket_id", ev.TicketID,
-		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType,
-		"stmt_type", ev.StmtType, "status", ev.Status,
-		"session_id", ev.SessionID, "sql", ev.SQL,
-	}
-	if p.logQueryOutput {
-		attrs = append(attrs,
-			"columns", ev.Columns, "row_count", len(ev.Rows),
-			"rows", ev.Rows, "truncated", ev.Truncated)
-	}
-	p.log.Info("query", attrs...)
-}
-
-// flushPendingOnClose publishes any still-pending event as failed when the
-// session dies before the backend answered (both relay exit paths; invoked
-// via defer in handleConn, and so also on a Task 6.4 kill).
-func (p *MSSQLProxy) flushPendingOnClose(s *mssqlSession) {
-	s.mu.Lock()
-	ev := s.pending
-	s.pending = nil
-	s.mu.Unlock()
-	if ev == nil {
-		return
-	}
-	ev.Status = "error"
-	ev.Error = "connection closed before response"
-	p.publishEvent(s, ev)
 }
