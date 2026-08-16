@@ -27,8 +27,7 @@ type StoreOptions struct {
 	Addrs            []string // direct: [addr]; sentinel: sentinel addrs
 	MasterName       string   // sentinel mode when non-empty
 	Password         string   // master/data connections
-	SentinelUsername string   // sentinel connections (sentinel mode only)
-	SentinelPassword string   // sentinel connections (sentinel mode only)
+	SentinelPassword string   // the sentinel's own requirepass (sentinel mode only — no username: sentinels have no ACL users)
 	DB               int
 	TLS              *tls.Config // nil = plaintext
 }
@@ -78,12 +77,12 @@ func TLSFromFiles(caFile, certFile, keyFile string, skipVerify bool, serverName 
 // sentinel mode (MasterName non-empty) InitAddress carries the SENTINEL
 // addresses and the same TLS config is wired for both the sentinel
 // connections (SentinelOption.TLSConfig) and the master/data connections
-// (ClientOption.TLSConfig). Sentinel credentials (SentinelUsername/
-// SentinelPassword) are wired into SentinelOption.Username/Password —
-// valkey-go v1.0.76's newSentinelOpt (sentinel.go) copies those onto the
-// option used for sentinel connections, whose per-connection init sends
-// HELLO 3 AUTH (pipe.go), so the sentinel itself is authenticated
-// independently of the master. ClientOption.Password keeps serving the
+// (ClientOption.TLSConfig). The sentinel's OWN requirepass
+// (SentinelPassword) is wired into SentinelOption.Password ONLY — sentinels
+// have no ACL users, so no username is ever set (valkey-go v1.0.76 emits
+// HELLO 3 AUTH <user> <pass> when Username is set, which a requirepass-only
+// sentinel rejects; with Username empty it sends AUTH default <password>,
+// which requirepass accepts). ClientOption.Password keeps serving the
 // master/data connections. Exported so tests (and callers) can assert the
 // wiring without constructing a client.
 func BuildClientOption(opts StoreOptions) valkey.ClientOption {
@@ -97,7 +96,6 @@ func BuildClientOption(opts StoreOptions) valkey.ClientOption {
 		opt.Sentinel = valkey.SentinelOption{
 			MasterSet: opts.MasterName,
 			TLSConfig: opts.TLS,
-			Username:  opts.SentinelUsername,
 			Password:  opts.SentinelPassword,
 		}
 	}

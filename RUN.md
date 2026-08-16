@@ -760,8 +760,9 @@ valkey:
   sentinel_addrs: ["127.0.0.1:26379"]
   # sentinel's OWN auth (requirepass on the sentinel) — SEPARATE from
   # `password` below, which is the MASTER's (Task 8.10). Both can differ;
-  # sentinel conns use these, master/data conns use `password`.
-  sentinel_username: ""
+  # sentinel conns use this, master/data conns use `password`. Sentinels
+  # have NO ACL users (review 2026-08-17): only the password is ever sent
+  # (AUTH <password>) — there is deliberately no sentinel_username key.
   sentinel_password: sentinelpw   # env: ZT_VALKEY_SENTINEL_PASSWORD
   password: ""                     # master/data conns — unchanged by sentinel auth
 ```

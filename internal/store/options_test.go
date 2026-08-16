@@ -176,7 +176,6 @@ func TestBuildClientOptionSentinel(t *testing.T) {
 		Addrs:            []string{"127.0.0.1:26379", "127.0.0.2:26379"},
 		MasterName:       "mymaster",
 		Password:         "datapw",
-		SentinelUsername: "suser",
 		SentinelPassword: "spw",
 		TLS:              tlsCfg,
 	})
@@ -195,11 +194,13 @@ func TestBuildClientOptionSentinel(t *testing.T) {
 	if opt.TLSConfig != tlsCfg {
 		t.Fatal("TLSConfig not wired through")
 	}
-	// Task 7.7: sentinel credentials land in SentinelOption (sentinel conns
-	// AUTH with these), while ClientOption.Password keeps serving the
-	// master/data conns.
-	if opt.Sentinel.Username != "suser" {
-		t.Fatalf("Sentinel.Username = %q, want %q", opt.Sentinel.Username, "suser")
+	// Task 7.7 + review 2026-08-17: the sentinel's requirepass lands in
+	// SentinelOption.Password ONLY — sentinels have no ACL users, so
+	// Sentinel.Username must stay empty (valkey-go would otherwise emit
+	// AUTH <user> <pass>, which a requirepass-only sentinel rejects).
+	// ClientOption.Password keeps serving the master/data conns.
+	if opt.Sentinel.Username != "" {
+		t.Fatalf("Sentinel.Username = %q, want \"\" (sentinels have no ACL users)", opt.Sentinel.Username)
 	}
 	if opt.Sentinel.Password != "spw" {
 		t.Fatalf("Sentinel.Password = %q, want %q", opt.Sentinel.Password, "spw")

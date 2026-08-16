@@ -27,7 +27,6 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 	if vc.Mode == "sentinel" {
 		opts.Addrs = vc.SentinelAddrs
 		opts.MasterName = vc.MasterName
-		opts.SentinelUsername = vc.SentinelUsername
 		opts.SentinelPassword = vc.SentinelPassword
 	} else {
 		opts.Addrs = []string{vc.Addr}

@@ -57,12 +57,15 @@ type ValkeySSL struct {
 // master via SentinelAddrs/MasterName. The old flat shape
 // (valkey: {addr, password, db}) still parses: mode defaults to "direct".
 type ValkeyConfig struct {
-	Mode             string    `mapstructure:"mode"`
-	Addr             string    `mapstructure:"addr"`
-	MasterName       string    `mapstructure:"master_name"`
-	SentinelAddrs    []string  `mapstructure:"sentinel_addrs"`
-	Password         string    `mapstructure:"password"`
-	SentinelUsername string    `mapstructure:"sentinel_username"`
+	Mode          string    `mapstructure:"mode"`
+	Addr          string    `mapstructure:"addr"`
+	MasterName    string    `mapstructure:"master_name"`
+	SentinelAddrs []string  `mapstructure:"sentinel_addrs"`
+	Password      string    `mapstructure:"password"`
+	// SentinelPassword is the sentinel's OWN requirepass (AUTH <password>).
+	// Sentinels have no ACL users — a username must never be sent (valkey-go
+	// would emit AUTH <user> <pass>, which a requirepass-only sentinel
+	// rejects). Distinct from valkey.password (the master/data password).
 	SentinelPassword string    `mapstructure:"sentinel_password"`
 	DB               int       `mapstructure:"db"`
 	SSL              ValkeySSL `mapstructure:"ssl"`
@@ -136,7 +139,6 @@ func readValkey(v *viper.Viper) (ValkeyConfig, error) {
 		MasterName:       v.GetString("valkey.master_name"),
 		SentinelAddrs:    v.GetStringSlice("valkey.sentinel_addrs"),
 		Password:         v.GetString("valkey.password"),
-		SentinelUsername: v.GetString("valkey.sentinel_username"),
 		SentinelPassword: v.GetString("valkey.sentinel_password"),
 		DB:               v.GetInt("valkey.db"),
 		SSL: ValkeySSL{
