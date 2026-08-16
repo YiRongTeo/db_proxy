@@ -70,6 +70,9 @@ valkey:
 # Task 9.7 session audit (user directive 2026-08-15): the Control Plane
 # persists every session to MySQL — maker username, ticket, db target,
 # checker username when present, status (pending|active|ended), timestamps.
+# SINK COMPATIBILITY (review 2026-08-17): MariaDB or MySQL 5.7+ — the
+# upserts use the portable VALUES() syntax (the MySQL 8.0.19+ alias form
+# fails on MariaDB and is deliberately not used).
 # DISABLED by default (no DB dependency unless enabled). When enabled the
 # writer auto-creates the zt_audit database + sessions table at startup and
 # fail-fasts if the database is unreachable; runtime write failures are

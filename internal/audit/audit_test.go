@@ -6,21 +6,34 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-// Live-test constants: the shared dev mysql-test container (RUN.md §1.2).
+// Live-test targets: the shared dev mysql-test container (RUN.md §1.2) by
+// default. ZT_AUDIT_TEST_HOST / ZT_AUDIT_TEST_PORT / ZT_AUDIT_TEST_USER /
+// ZT_AUDIT_TEST_PASSWORD point the suite at any MySQL/MariaDB-compatible
+// sink — the portable upsert syntax (review 2026-08-17) is verified against
+// MariaDB by running the suite with ZT_AUDIT_TEST_PORT=<mariadb port>.
 // The writer needs CREATE DATABASE, so the dev container root is used — the
 // same class of committed dev credential as configs/data.yaml. Every test
 // works on a THROWAWAY database (zt_audit_test_<n>) dropped on cleanup.
-const (
-	liveHost = "127.0.0.1"
-	livePort = "3307"
-	liveUser = "root"
-	livePass = "root_pw"
+var (
+	liveHost = envOr("ZT_AUDIT_TEST_HOST", "127.0.0.1")
+	livePort = envOr("ZT_AUDIT_TEST_PORT", "3307")
+	liveUser = envOr("ZT_AUDIT_TEST_USER", "root")
+	livePass = envOr("ZT_AUDIT_TEST_PASSWORD", "root_pw")
 )
+
+// envOr returns the env var value or the default when unset.
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
 
 // newLiveWriter opens a writer against a throwaway database on mysql-test
 // and registers cleanup: close the pool + DROP DATABASE.

@@ -360,6 +360,11 @@ Control Plane is the writer by design: it sees the lifecycle events (via the hub
 `queries:sess:*` pub/sub) and knows the checker identity on watch attach/detach — the Data
 Plane never learns the checker's username.
 
+**Sink compatibility (review 2026-08-17):** MariaDB or MySQL 5.7+ — the
+upserts use the portable `VALUES()` syntax (the MySQL 8.0.19+ alias form
+fails on MariaDB). The audit suite is verified against both sinks
+(`ZT_AUDIT_TEST_PORT=<port>` points it at a MariaDB container).
+
 **Config** (`configs/control.yaml`, env `ZT_AUDIT_MYSQL_*`):
 
 ```yaml

@@ -11,6 +11,12 @@
 // All writes are idempotent INSERT ... ON DUPLICATE KEY UPDATE upserts keyed
 // by session_id, and all methods return errors for the caller to log —
 // an audit write failure must NEVER break the token/connect flow.
+//
+// PORTABLE UPSERT SYNTAX (review 2026-08-17): the UPDATE clauses use the
+// classic VALUES(col) form, NOT the MySQL 8.0.19+ `VALUES (...) AS new_row`
+// alias — the sink is MariaDB (or MySQL 5.7+), and the alias syntax fails
+// on both MariaDB and MySQL < 8.0.19. VALUES(col) is supported by MariaDB
+// 10.x, MySQL 5.7 and MySQL 8.x (deprecated-but-functional in 8.0.20+).
 package audit
 
 import (
@@ -173,10 +179,10 @@ type ActiveRecord struct {
 func (w *Writer) UpsertSession(ctx context.Context, rec SessionRecord) error {
 	q := "INSERT INTO " + w.tbl +
 		" (`session_id`, `username`, `ticket_id`, `db_type`, `db_user`, `access`, `last_seen`) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?) AS new_row ON DUPLICATE KEY UPDATE " +
-		"`username` = new_row.`username`, `ticket_id` = new_row.`ticket_id`, " +
-		"`db_type` = new_row.`db_type`, `db_user` = new_row.`db_user`, " +
-		"`access` = new_row.`access`, `last_seen` = new_row.`last_seen`"
+		"VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
+		"`username` = VALUES(`username`), `ticket_id` = VALUES(`ticket_id`), " +
+		"`db_type` = VALUES(`db_type`), `db_user` = VALUES(`db_user`), " +
+		"`access` = VALUES(`access`), `last_seen` = VALUES(`last_seen`)"
 	_, err := w.db.ExecContext(ctx, q, rec.SessionID, rec.Username, rec.TicketID,
 		rec.DBType, rec.DBUser, rec.Access, rec.LastSeen.UTC())
 	return err
@@ -190,10 +196,10 @@ func (w *Writer) UpsertSession(ctx context.Context, rec SessionRecord) error {
 func (w *Writer) SetActive(ctx context.Context, rec ActiveRecord) error {
 	q := "INSERT INTO " + w.tbl +
 		" (`session_id`, `username`, `db_type`, `db_user`, `db`, `status`, `started_at`, `last_seen`) " +
-		"VALUES (?, ?, ?, ?, ?, 'active', ?, ?) AS new_row ON DUPLICATE KEY UPDATE " +
-		"`username` = new_row.`username`, `db_type` = new_row.`db_type`, " +
-		"`db_user` = new_row.`db_user`, `db` = new_row.`db`, " +
-		"`status` = 'active', `started_at` = new_row.`started_at`, `last_seen` = new_row.`last_seen`"
+		"VALUES (?, ?, ?, ?, ?, 'active', ?, ?) ON DUPLICATE KEY UPDATE " +
+		"`username` = VALUES(`username`), `db_type` = VALUES(`db_type`), " +
+		"`db_user` = VALUES(`db_user`), `db` = VALUES(`db`), " +
+		"`status` = 'active', `started_at` = VALUES(`started_at`), `last_seen` = VALUES(`last_seen`)"
 	_, err := w.db.ExecContext(ctx, q, rec.SessionID, rec.Username, rec.DBType,
 		rec.DBUser, rec.DB, rec.StartedAt.UTC(), rec.LastSeen.UTC())
 	return err
@@ -208,8 +214,8 @@ func (w *Writer) SetActive(ctx context.Context, rec ActiveRecord) error {
 func (w *Writer) SetEnded(ctx context.Context, sessionID string, endedAt time.Time) error {
 	q := "INSERT INTO " + w.tbl +
 		" (`session_id`, `username`, `status`, `ended_at`, `last_seen`) " +
-		"VALUES (?, '', 'ended', ?, ?) AS new_row ON DUPLICATE KEY UPDATE " +
-		"`status` = 'ended', `ended_at` = new_row.`ended_at`, `last_seen` = new_row.`last_seen`"
+		"VALUES (?, '', 'ended', ?, ?) ON DUPLICATE KEY UPDATE " +
+		"`status` = 'ended', `ended_at` = VALUES(`ended_at`), `last_seen` = VALUES(`last_seen`)"
 	_, err := w.db.ExecContext(ctx, q, sessionID, endedAt.UTC(), time.Now().UTC())
 	return err
 }
@@ -226,8 +232,8 @@ func (w *Writer) SetChecker(ctx context.Context, sessionID, checker string) erro
 	}
 	q := "INSERT INTO " + w.tbl +
 		" (`session_id`, `username`, `checker_username`, `last_seen`) " +
-		"VALUES (?, '', ?, ?) AS new_row ON DUPLICATE KEY UPDATE " +
-		"`checker_username` = new_row.`checker_username`, `last_seen` = new_row.`last_seen`"
+		"VALUES (?, '', ?, ?) ON DUPLICATE KEY UPDATE " +
+		"`checker_username` = VALUES(`checker_username`), `last_seen` = VALUES(`last_seen`)"
 	_, err := w.db.ExecContext(ctx, q, sessionID, c, time.Now().UTC())
 	return err
 }
