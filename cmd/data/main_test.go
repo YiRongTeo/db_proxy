@@ -64,3 +64,44 @@ func TestBuildCredResolverAPIBadURL(t *testing.T) {
 		t.Fatal("buildCredResolver: want error for malformed vault url, got nil")
 	}
 }
+
+// TestStoreOptionsTLSServerName pins the review 2026-08-17 ServerName
+// rule: DIRECT mode derives it from the configured address so TLS verifies
+// the valkey hostname; SENTINEL mode leaves it unset because the master's
+// host is unknown until discovery and the sentinel's hostname would be
+// wrong for the master connections (BuildClientOption wires ONE TLS config
+// to both sentinel and master conns).
+func TestStoreOptionsTLSServerName(t *testing.T) {
+	vc := config.ValkeyConfig{
+		Mode: "direct",
+		Addr: "127.0.0.1:6379",
+		SSL: config.ValkeySSL{
+			Enabled:  true,
+			CertFile: "../../certs/control.crt",
+			KeyFile:  "../../certs/control.key",
+		},
+	}
+	opts, err := storeOptions(vc)
+	if err != nil {
+		t.Fatalf("storeOptions(direct): %v", err)
+	}
+	if opts.TLS == nil {
+		t.Fatal("direct mode: TLS config not built")
+	}
+	if opts.TLS.ServerName != "127.0.0.1" {
+		t.Errorf("direct mode ServerName = %q, want %q", opts.TLS.ServerName, "127.0.0.1")
+	}
+
+	vc.Mode = "sentinel"
+	vc.SentinelAddrs = []string{"127.0.0.1:26379"}
+	opts, err = storeOptions(vc)
+	if err != nil {
+		t.Fatalf("storeOptions(sentinel): %v", err)
+	}
+	if opts.TLS == nil {
+		t.Fatal("sentinel mode: TLS config not built")
+	}
+	if opts.TLS.ServerName != "" {
+		t.Errorf("sentinel mode ServerName = %q, want \"\" (master host unknown until discovery)", opts.TLS.ServerName)
+	}
+}

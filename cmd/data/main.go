@@ -21,7 +21,13 @@ import (
 // storeOptions maps the valkey config block onto store.StoreOptions: mode
 // "sentinel" uses SentinelAddrs + MasterName, anything else is direct against
 // Addr; valkey.ssl.enabled loads the TLS files once here (fail fast) with the
-// ServerName taken from the first address' host.
+// ServerName taken from the first address' host — DIRECT MODE ONLY (review
+// 2026-08-17): in sentinel mode the MASTER's host is unknown until discovery,
+// and the sentinel's hostname would be wrong for the master connections
+// (BuildClientOption wires the same TLS config to both), failing cert
+// verification when sentinel and master live on different hosts. Sentinel
+// TLS therefore leaves ServerName unset — rely on the CA chain, IP SANs, or
+// valkey.ssl.skip_verify.
 func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 	opts := store.StoreOptions{Password: vc.Password, DB: vc.DB}
 	if vc.Mode == "sentinel" {
@@ -35,7 +41,7 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 		return opts, nil
 	}
 	var serverName string
-	if len(opts.Addrs) > 0 {
+	if vc.Mode != "sentinel" && len(opts.Addrs) > 0 {
 		if host, _, err := net.SplitHostPort(opts.Addrs[0]); err == nil {
 			serverName = host
 		}
