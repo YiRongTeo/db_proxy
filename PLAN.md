@@ -2428,5 +2428,34 @@ The data plane exposes OTel metrics on an HTTP endpoint a Prometheus server can 
 4. LIVE proof: data plane with metrics enabled → curl :9464/metrics → OpenMetrics format, the counters present; run a query → tokens.validated + queries.total + connections.active move; a gated INSERT → gate.blocks increments; kill → kills.total. (A Prometheus server scrapes the same endpoint; the curl scrape is the proof.)
 5. Gates: `go test -count=1 ./...` green (unit tests: instrument wiring via a test meter; live test: endpoint + deltas); commit; report.
 
-## Phase 9 gate (addendum 2)
-All tasks reviewed; full suites green; amendment 13 + 19 + 20 verified end-to-end; ledger updated.
+## Task 9.9: Review remediation — control plane (review 2026-08-16)
+
+Clear the control-plane review findings (full findings in .superpowers/sdd/PLAN/review-20260816-consolidated.md):
+- CRITICAL: (a) /api/token username forgery (handlers.go:100-102 — force sess.Username when session-authed, reject mismatch); (b) watch presence NOT reference-counted (websocket.go:74-108 — two checkers: first disconnect deletes watch:<sid> → gate fails open; fix per-connection watch:<sid>:<connid> keys + EXISTS-any, or INCR/DECR with TTL Lua); (c) bind-failure hang (cmd/control/main.go:100-117 — log.Fatal on server error).
+- IMPORTANT: constant-time compares (auth.go:40-43,64 — subtle); Secure cookie when TLS (auth.go:76-79); fail-fast auth config (non-empty username/password + token_ttl_seconds>0 — config.go:228-241); server timeouts (ReadHeaderTimeout 5s, IdleTimeout 60s, write timeout — cmd/control/main.go:98); heartbeat SetWatch-vs-DelWatch resurrect race (websocket.go:86-107 — cancel ctx before DelWatch + generation guard); one-shot Subscribe → resubscribe with backoff (websocket.go:127-131, audit.go:92-114); slow-consumer HOL → non-blocking send + drop policy + write deadline (websocket.go:126,147-156 + store/pubsub.go); login rate limit (auth.go:55-81 — per-IP+user backoff); pending-audit sweeper (audit.go:173-183 — stale pending → ended beyond sessionPendingTTL).
+- MINOR (do the cheap ones): logout error logged; decodeJSON MaxBytesReader w + DisallowUnknownFields; ticket_id validation + issuance throttle; handleKill sid validation; srv.Shutdown error logged; sentinel empty-master_name validation.
+- UNNECESSARY CODE: StoreOptions dead field; NewValkeyStoreDirect/WatchTTL/ErrClosed → test-only; Session.Expires removal; duplicate sessionFromCookie/requireSession helpers; handleMe unreachable branch; newEventID dedup vs models.NewSessionID.
+- Gates: full suite + ng + build; commit; report.
+
+## Task 9.10: Review remediation — data plane (review 2026-08-16)
+
+- CRITICAL: (a) PG gate-hold reorders extended-protocol messages (pg_relay.go:49-56 + gate_hold.go:264-349 — while the queue is active, hold/stall ALL subsequent client messages, not just Query/Parse/Execute; verify prepared-statement success path live); (b) MSSQL backend-leg TLS nominal (mssql_proxy.go:522-622 — offer ENCRYPT_ON in the backend prelogin and relay over the TLS conn; re-verify framing with a live probe incl. the 0x12-wrap + plaintext-response asymmetry).
+- IMPORTANT: thread-id capture read deadline (~5s; mysql_router.go:27-71, pg_router.go:25-57 — and register the session BEFORE capture so kill can unblock); MSSQL DECIMAL/NUMERICN size-from-precision (mssql_capture.go:383-388,575-577 — a DECIMAL column must not drop the event); pgx password via cfg.Password field not DSN interpolation (pg_router.go:111-112); writeMu around gate flush/drain + never hold gateMu across I/O (gate_hold.go:155-172,216-234,332-349,389-410,592-610; add the MSSQL-style writeMu to MySQL/PG); GETDEL-store-error → reply errPacket/FATAL/login-error (mysql_proxy.go:309-312, pg_proxy.go:301-304, mssql_proxy.go:385-388); attnPending cleared on timeout or client ATTENTION (mssql_proxy.go:280-295 + mssql_relay.go:199-210); run thread-id capture BEFORE the OK/welcome (mysql_proxy.go:343, pg_proxy.go:333); metrics connections.rejected funnel incl. handshake/TLS/parse/GETDEL-error paths; publishPendingOnReady metrics parity (pg_relay.go:264-285); log level from env (logging.go:8-11); short-write checks (mysql_packet.go:36, mssql_packet.go:97, gate_hold.go:167,344,537); ATTENTION held while the gate queue is active (mssql_relay.go:84-93); SQL password-clause redaction in logs/events (all publishEvent sites); client-refused one-byte check (mysql_proxy.go:294); welcome Send error abort (pg_proxy.go:327-333); closeGateWait joins the wait goroutine (gate_hold.go:197-210,369-382,572-585).
+- UNNECESSARY CODE: dead mssqlProxy interface + nil branches (dispatcher.go:36-94); `_ SessionKiller` pin (kill.go:26); ok() methods on all three captures; cmdQuit/cmdPing; writeTDSPacketStatus inline; login7Info.password drop; gate done channels joined or removed; buildSessionRecord returns bytes.
+- Gates: full suite + ng + build; commit; report.
+
+## Task 9.11: Review remediation — frontend (review 2026-08-16)
+
+- CRITICAL: session-mode table must render a FILTERED visibleEvents (events().filter(e => selectedSession()==='*' || e.session_id===selectedSession())) — checker-dashboard.component.html:119.
+- IMPORTANT: 401 → logout() before /login (maker-portal.component.ts:77-79,129-131 + checker refreshSessions 401 handling :300); pendingOverrides pruned (past token TTL or absent from the API list over N refreshes — :209,:244-255); refreshSessions() inside connect() (:271-278); kill-connection disabled on feedStatus==='session-ended' + killed rows marked in the WS next() path (:408-427, html:71).
+- MINOR (cheap ones): DB column renders ev.db; WS error surfaced; Connect/Stop driven by connectState(); refreshSessions debounced; seenLifecycle/killed capped; outputRows/columns memoized; token cleared when ticketId changes; auth.service user.set(res.username); a11y labels + aria-live; timestamp formatting; nzShowSearch.
+- UNNECESSARY CODE: [nzLabel] dup; withCredentials no-op; .waiting-tag dead class; KillResponse unused body; attr.title dup; 4 hidden ngModel inputs.
+- Gates: ng test + build + full Go suite; commit; report.
+
+## Task 9.12: De-triplication refactor (post-9.10; optional-risk, test-protected)
+
+Extract the triplicated session/publish helpers (~300 lines × 3: publishEvent/publishLifecycle/refreshSessionLive/finishSession/flushPendingOnClose/publishPending/publishBlocked) into a shared generic session helper; gate-hold machinery de-triplication ONLY where the three mirrors are byte-identical and fully live-test-covered. NO behavioral change — the full suite + the three protocols' live tests must stay green unchanged. If any mirror diverges in behavior, keep the divergence (comment it). Report the exact lines removed.
+- Gates: full suite ×2 + ng + build; commit; report.
+
+## Phase 9 gate (addendum 3)
+All tasks reviewed; full suites green; amendment 13 + 19 + 20 + 21 verified end-to-end; ledger updated.
