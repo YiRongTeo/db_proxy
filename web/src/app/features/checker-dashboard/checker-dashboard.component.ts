@@ -163,6 +163,19 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
   /** True when the WebSocket dropped with an error (surfaced as a banner). */
   readonly wsError = computed(() => this.live.connectState() === 'error');
 
+  /**
+   * Server rejection detail (2026-08-17 separation of duties): when the
+   * feed was closed with a 1008 policy-violation close (e.g. a maker trying
+   * to watch their own session — the server refuses to arm the gate for
+   * the maker), surface the server's reason instead of the generic
+   * "connection lost" text. Null for every other close/error.
+   */
+  readonly feedErrorDetail = computed(() => {
+    const lc = this.live.lastClose();
+    if (!lc || lc.code !== 1008) return null;
+    return lc.reason || 'the server rejected this feed';
+  });
+
   /** True while watching a session whose action=ended event has arrived (Task 8.15). */
   readonly sessionEnded = signal(false);
 

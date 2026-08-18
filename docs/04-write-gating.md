@@ -43,6 +43,21 @@ sequenceDiagram
 4. **Timeout** — no watcher by the deadline → the client receives a readable auth-class error and an audit event (`status=error`, message `maker gating: no checker connected...`). Nothing was executed; no row can land.
 5. **Re-open, no latch** — a later watcher **does** re-open the gate: the maker's next command runs, same connection, no reconnect required. (The permanent latch from an earlier design was removed — a returning checker unblocks the session.)
 
+## Separation of duties (checker ≠ maker) — 2026-08-17
+
+The checker who arms the gate for a session **cannot be the session's maker**. At WebSocket attach
+(`channel=sess:<sid>`) the control plane compares the checker's session username against the maker
+recorded in the session directory record (`sess:live:<sid>`, written at token issue):
+
+- **Same user** → the connection is closed with a **1008 policy-violation** close and **no `watch:<sid>` lease is created** — the maker can never open their own write gate, in either browser or CLI flows.
+- **Unknown/expired session record** → rejected the same way (fail-closed): a lease may only exist for a real session whose maker is known.
+- **Different user** → watch presence is armed as usual (heartbeat-refreshed lease).
+
+Because the data-plane gate only ever probes `watch:<sid>:*` presence, and the only writer of those keys
+is the (now identity-checked) WS attach, this closes the self-approval path end to end. The audit row's
+`checker_username` is only written for accepted watches. The checker dashboard surfaces the rejection
+as a banner ("Feed rejected: … — this session cannot be watched by its maker").
+
 ## Behaviour matrix
 
 | Scenario | Outcome |

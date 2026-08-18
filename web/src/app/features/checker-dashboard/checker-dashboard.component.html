@@ -117,12 +117,18 @@
   }
 
   <!-- Task 9.11: surface a WS error distinctly from a clean disconnect. -->
+  <!-- 2026-08-17: a 1008 policy-violation close (separation of duties — the
+       maker may not watch their own session) shows the server's reason. -->
   @if (wsError()) {
     <nz-alert
       class="ws-error-alert"
       nzType="error"
       nzShowIcon
-      nzMessage="Live feed connection lost — the WebSocket closed with an error. Press Connect to retry."
+      [nzMessage]="
+        feedErrorDetail()
+          ? 'Feed rejected: ' + feedErrorDetail() + ' — this session cannot be watched by its maker. Press Connect to retry.'
+          : 'Live feed connection lost — the WebSocket closed with an error. Press Connect to retry.'
+      "
     />
   }
 

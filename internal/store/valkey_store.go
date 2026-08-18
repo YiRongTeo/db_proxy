@@ -215,6 +215,22 @@ func (s *ValkeyStore) DelSessionLive(ctx context.Context, sid string) error {
 	return s.client.Do(ctx, s.client.B().Del().Key(sessionLivePrefix+sid).Build()).Error()
 }
 
+// GetSessionLive reads ONE session directory record. A missing/expired
+// record returns (nil, nil) — the caller (the checker watch attach) treats
+// an absent session as non-existent and fails closed (separation of duties
+// check, 2026-08-17: a watch lease may only be armed for a session whose
+// maker is known and distinct from the checker).
+func (s *ValkeyStore) GetSessionLive(ctx context.Context, sid string) ([]byte, error) {
+	raw, err := s.client.Do(ctx, s.client.B().Get().Key(sessionLivePrefix+sid).Build()).ToString()
+	if errors.Is(err, valkey.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return []byte(raw), nil
+}
+
 // ListSessions returns the raw JSON records of all live sessions: a full
 // SCAN of sess:live:* (cursor walk) followed by MGET. Records whose keys
 // expired between the SCAN and the MGET are skipped. Errors are wrapped;

@@ -280,21 +280,26 @@ func TestAuditLifecycleConsumer(t *testing.T) {
 
 // TestWSCheckerAuditAttachDetach (Task 9.7 live): a checker subscribing with
 // channel=sess:<sid> writes checker_username=<checker>; disconnecting clears
-// it to NULL. The checker identity comes from the WS session (here: the
-// maker's own session — the same browser watches the session it issued).
+// it to NULL. The checker identity comes from the WS session. Separation of
+// duties (2026-08-17): the checker must be a DIFFERENT user than the
+// session's maker — a maker watching their own session is rejected with a
+// 1008 close and never reaches the audit attach.
 func TestWSCheckerAuditAttachDetach(t *testing.T) {
 	srv, client, vs, db := newAuditTestAPIServer(t)
 
-	user := fmt.Sprintf("audit-ws-%d", time.Now().UnixNano())
-	// Review 9.9a: the token is issued for the SESSION user.
-	sessionAs(t, client, srv.URL, vs, user)
-	sid := issueAuditToken(t, client, srv, vs, user, "ro_user", "T-WS")
+	maker := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
+	checker := fmt.Sprintf("audit-checker-%d", time.Now().UnixNano())
+	// Review 9.9a: the token is issued for the SESSION user (the maker).
+	sessionAs(t, client, srv.URL, vs, maker)
+	sid := issueAuditToken(t, client, srv, vs, maker, "ro_user", "T-WS")
 
+	// Switch identity: the checker is a different user than the maker.
+	sessionAs(t, client, srv.URL, vs, checker)
 	cookie := wsSessionCookie(t, srv, client)
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
 
 	waitAudit(t, db, sid, "checker attach",
-		func(r auditRow) bool { return r.checker.Valid && r.checker.String == user }, nil)
+		func(r auditRow) bool { return r.checker.Valid && r.checker.String == checker }, nil)
 	r := fetchAuditRow(t, db, sid)
 	if r.status != "pending" {
 		t.Errorf("checker attach clobbered status = %q, want pending (no session yet)", r.status)

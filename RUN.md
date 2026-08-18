@@ -609,6 +609,13 @@ dashboard session selector, or any WS client subscribing to `sess:<sid>`) → IN
 work. If the watcher is removed mid-session, the very next query is blocked until a checker watches
 the session again.
 
+**Separation of duties (2026-08-17):** the checker who arms the gate for a session must be a
+**different user** than the session's maker. The WS hub rejects a maker's attempt to watch their own
+session with a **1008 policy-violation close** (no `watch:<sid>` lease is created), and also rejects
+`sess:<sid>` channels whose session record is missing/expired (fail-closed). The checker dashboard
+shows the server's reason in a banner. Only the session's maker identity is special — the live-all
+feed (`channel=*`) and user/ticket channels are unaffected.
+
 **Grace window (Task 8.13 — maker-first no longer breaks).** When a write-access maker connects
 BEFORE any checker, blocked SQL is not rejected instantly — it WAITS for a watcher:
 

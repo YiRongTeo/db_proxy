@@ -41,6 +41,15 @@ export class LiveQueryService implements OnDestroy {
   /** Real socket state (Task 8.15): driven by socket events, not connect() optimism. */
   readonly connectState = signal<'closed' | 'open' | 'error'>('closed');
 
+  /**
+   * Close code + reason of the last socket close (2026-08-17 separation of
+   * duties): captured from the raw CloseEvent via closeObserver so the UI
+   * can surface policy-violation rejections (1008 — e.g. a maker trying to
+   * watch their own session) distinctly from a plain disconnect. Cleared on
+   * every connect/disconnect.
+   */
+  readonly lastClose = signal<{ code: number; reason: string } | null>(null);
+
   private limit = 500; // ring-buffer cap
 
   /** Test seam: custom WebSocket constructor (defaults to the global WebSocket). */
@@ -61,6 +70,15 @@ export class LiveQueryService implements OnDestroy {
         next: () => {
           if (gen !== this.generation) return; // superseded socket — ignore
           this.connectState.set('open');
+        },
+      },
+      // Raw CloseEvent capture (2026-08-17): the subscription's error path
+      // loses the close code in rxjs 7.8, so the closeObserver is the
+      // version-safe way to surface policy-violation rejections (1008).
+      closeObserver: {
+        next: (e: CloseEvent) => {
+          if (gen !== this.generation) return; // superseded socket — ignore
+          this.lastClose.set({ code: e.code, reason: e.reason ?? '' });
         },
       },
     };
@@ -103,6 +121,7 @@ export class LiveQueryService implements OnDestroy {
     // signals must not depend on them for the disconnect path.
     this.connected.set(false);
     this.connectState.set('closed');
+    this.lastClose.set(null);
   }
 
   ngOnDestroy() { this.disconnect(); }

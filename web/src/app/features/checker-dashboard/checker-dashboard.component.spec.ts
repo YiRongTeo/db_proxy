@@ -45,6 +45,12 @@ class FakeWebSocket {
     this.onerror?.({} as Event);
   }
 
+  /** Server-side rejection close (2026-08-17): 1008 policy violation by default. */
+  reject(code = 1008, reason = '') {
+    this.readyState = 3;
+    this.onclose?.({ wasClean: false, code, reason } as CloseEvent);
+  }
+
   emit(event: QueryEvent) {
     this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
   }
@@ -282,6 +288,38 @@ describe('CheckerDashboardComponent', () => {
     expect(service.connectState()).toBe('closed');
     const tag = fixture.nativeElement.querySelector('.status-tag') as HTMLElement;
     expect(tag.textContent?.trim()).toBe('disconnected');
+  });
+
+  it('surfaces a 1008 policy-violation rejection (separation of duties) in the banner', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    FakeWebSocket.instances[0].open();
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.ws-error-alert')).toBeNull();
+
+    // The server refuses the watch: maker trying to watch their own session
+    // → policy-violation close with the server's reason.
+    FakeWebSocket.instances[0].reject(1008, 'cannot watch this session');
+    fixture.detectChanges();
+
+    expect(service.connectState()).toBe('error');
+    const banner = fixture.nativeElement.querySelector('.ws-error-alert') as HTMLElement;
+    expect(banner).not.toBeNull();
+    expect(banner.textContent).toContain('Feed rejected: cannot watch this session');
+    expect(banner.textContent).toContain('cannot be watched by its maker');
+  });
+
+  it('shows the generic connection-lost banner for a non-1008 close', () => {
+    const fixture = TestBed.createComponent(CheckerDashboardComponent);
+    fixture.detectChanges();
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].reject(1006, '');
+    fixture.detectChanges();
+
+    const banner = fixture.nativeElement.querySelector('.ws-error-alert') as HTMLElement;
+    expect(banner).not.toBeNull();
+    expect(banner.textContent).toContain('Live feed connection lost');
+    expect(banner.textContent).not.toContain('Feed rejected');
   });
 
   it('reconnecting from the form channel switches the feed and resets the buffer', () => {

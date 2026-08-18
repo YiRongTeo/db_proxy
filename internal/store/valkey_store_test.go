@@ -343,24 +343,48 @@ func countLiveRecords(recs [][]byte, sid string) int {
 	return n
 }
 
-// clearLiveSessions deletes every sess:live:* key (keeps the empty-list
-// assertion deterministic on the shared dev Valkey).
-func clearLiveSessions(t *testing.T, s *ValkeyStore) {
-	t.Helper()
+// TestGetSessionLiveRoundTrip: GetSessionLive reads back a stored record
+// verbatim and returns (nil, nil) for a missing/expired one — the checker
+// watch attach relies on the miss to fail closed (separation of duties,
+// 2026-08-17).
+func TestGetSessionLiveRoundTrip(t *testing.T) {
+	s := newTestStore(t)
 	ctx := context.Background()
-	cursor := uint64(0)
-	for {
-		res, err := s.client.Do(ctx, s.client.B().Scan().Cursor(cursor).Match("sess:live:*").Count(100).Build()).AsScanEntry()
-		if err != nil {
-			t.Fatalf("cleanup scan: %v", err)
-		}
-		if len(res.Elements) > 0 {
-			_ = s.client.Do(ctx, s.client.B().Del().Key(res.Elements...).Build()).Error()
-		}
-		cursor = res.Cursor
-		if cursor == 0 {
-			return
-		}
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
+
+	// Missing → (nil, nil), no error.
+	raw, err := s.GetSessionLive(ctx, sid)
+	if err != nil {
+		t.Fatalf("GetSessionLive(missing): %v", err)
+	}
+	if raw != nil {
+		t.Fatalf("GetSessionLive(missing) = %q, want nil", raw)
+	}
+
+	// Stored → read back verbatim.
+	rec := []byte(`{"session_id":"` + sid + `","username":"alice","db":"appdb","thread_id":42}`)
+	if err := s.SetSessionLive(ctx, sid, rec, 60*time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
+	}
+	raw, err = s.GetSessionLive(ctx, sid)
+	if err != nil {
+		t.Fatalf("GetSessionLive(stored): %v", err)
+	}
+	if string(raw) != string(rec) {
+		t.Fatalf("GetSessionLive(stored) = %q, want %q", raw, rec)
+	}
+
+	// Deleted → (nil, nil) again.
+	if err := s.DelSessionLive(ctx, sid); err != nil {
+		t.Fatalf("DelSessionLive: %v", err)
+	}
+	raw, err = s.GetSessionLive(ctx, sid)
+	if err != nil {
+		t.Fatalf("GetSessionLive(after delete): %v", err)
+	}
+	if raw != nil {
+		t.Fatalf("GetSessionLive(after delete) = %q, want nil", raw)
 	}
 }
 
@@ -450,17 +474,40 @@ func TestSessionLiveTTLExpiry(t *testing.T) {
 	}
 }
 
-// TestListSessionsEmpty: an empty directory returns (nil, nil).
+// TestListSessionsEmpty: a directory WITHOUT the test's own record reads
+// back without it. The shared dev Valkey carries live-suite fixture records
+// from other packages running in parallel (go test ./...), so global
+// emptiness is not assertable — the previous version raced the proxy live
+// suites (fix mirrors internal/api TestSessionsEmptyIsEmptyArray: seed →
+// list → delete → gone).
 func TestListSessionsEmpty(t *testing.T) {
 	s := newTestStore(t)
-	clearLiveSessions(t, s) // deterministic on the shared dev Valkey
+	ctx := context.Background()
+	sid := uniqueSid(t)
+	cleanupKey(t, s, "sess:live:"+sid)
 
-	recs, err := s.ListSessions(context.Background())
-	if err != nil {
-		t.Fatalf("ListSessions on empty directory: %v", err)
+	// Seed the test's own record, list (must contain it), delete, list
+	// again (must be gone) — the deterministic per-test contract.
+	rec := []byte(`{"session_id":"` + sid + `","username":"alice","status":"pending"}`)
+	if err := s.SetSessionLive(ctx, sid, rec, 60*time.Second); err != nil {
+		t.Fatalf("SetSessionLive: %v", err)
 	}
-	if len(recs) != 0 {
-		t.Fatalf("ListSessions on empty directory returned %d records: %s", len(recs), recs)
+	recs, err := s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after seed: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got == nil {
+		t.Fatalf("ListSessions after seed: record for %s missing", sid)
+	}
+	if err := s.DelSessionLive(ctx, sid); err != nil {
+		t.Fatalf("DelSessionLive: %v", err)
+	}
+	recs, err = s.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions after delete: %v", err)
+	}
+	if got := findLiveRecord(t, recs, sid); got != nil {
+		t.Fatalf("ListSessions after delete still returns the record: %s", got)
 	}
 }
 
@@ -504,13 +551,24 @@ func TestListSessionsParsed(t *testing.T) {
 	}
 
 	// Empty directory: non-nil empty slice (encodes as [], never null).
-	clearLiveSessions(t, s)
+	// After the test's OWN record is gone the result must be a NON-NIL
+	// slice (encodes as [], never null) — foreign records from parallel
+	// live suites may be present on the shared dev Valkey, so length is
+	// not asserted (same race fix as TestListSessionsEmpty).
+	if err := s.DelSessionLive(ctx, sid); err != nil {
+		t.Fatalf("DelSessionLive: %v", err)
+	}
 	got, err = s.ListSessionsParsed(ctx)
 	if err != nil {
-		t.Fatalf("ListSessionsParsed on empty directory: %v", err)
+		t.Fatalf("ListSessionsParsed after delete: %v", err)
 	}
-	if got == nil || len(got) != 0 {
-		t.Fatalf("ListSessionsParsed on empty directory = %#v (nil=%v), want non-nil empty slice", got, got == nil)
+	if got == nil {
+		t.Fatalf("ListSessionsParsed after delete = nil, want non-nil slice (encodes [] not null)")
+	}
+	for _, si := range got {
+		if si.SessionID == sid {
+			t.Fatalf("ListSessionsParsed after delete still returns the record: %+v", si)
+		}
 	}
 }
 

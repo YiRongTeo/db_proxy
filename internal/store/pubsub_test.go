@@ -10,14 +10,22 @@ import (
 )
 
 // TestPubSubChannelAndPattern subscribes to the same channel both directly and
-// via the "queries:*" pattern, publishes two messages, and expects each
-// subscriber to receive both, in publish order. Cancelling the context must
-// make both Subscribe calls return.
+// via a pattern, publishes two messages, and expects each subscriber to
+// receive both, in publish order. Cancelling the context must make both
+// Subscribe calls return.
+//
+// The pattern is scoped to a UNIQUE namespace (queries:pubsub-*): the
+// alternative "queries:*" catches foreign events published by other packages
+// running in parallel (go test ./... — api/proxy live suites publish session
+// lifecycle events on queries:<user> / queries:sess:<sid>), which made the
+// exact-payload assertions racy.
 func TestPubSubChannelAndPattern(t *testing.T) {
 	s := newTestStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	channelName := "queries:pubsub-" + uniqueSid(t)
+	patternName := "queries:pubsub-*"
 	channelOut := make(chan []byte, 8)
 	patternOut := make(chan []byte, 8)
 	subErr := make(chan error, 2)
@@ -35,8 +43,8 @@ func TestPubSubChannelAndPattern(t *testing.T) {
 		subErr <- s.Subscribe(subCtx, channel, pattern, out)
 	}
 
-	go subscribe("queries:test", false, channelOut)
-	go subscribe("queries:*", true, patternOut)
+	go subscribe(channelName, false, channelOut)
+	go subscribe(patternName, true, patternOut)
 
 	for i := 0; i < 2; i++ {
 		select {
@@ -48,10 +56,10 @@ func TestPubSubChannelAndPattern(t *testing.T) {
 
 	msg1 := []byte(`{"id":1,"query":"SELECT 1"}`)
 	msg2 := []byte(`{"id":2,"query":"SELECT 2"}`)
-	if err := s.Publish(ctx, "queries:test", msg1); err != nil {
+	if err := s.Publish(ctx, channelName, msg1); err != nil {
 		t.Fatalf("Publish #1: %v", err)
 	}
-	if err := s.Publish(ctx, "queries:test", msg2); err != nil {
+	if err := s.Publish(ctx, channelName, msg2); err != nil {
 		t.Fatalf("Publish #2: %v", err)
 	}
 

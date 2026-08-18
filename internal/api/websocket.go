@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -88,6 +91,20 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if watchSid != "" {
+		// Separation of duties (user directive 2026-08-17): the checker
+		// arming the write-gate presence for a session must NOT be the
+		// session's maker. The sess:live:<sid> record (written at TOKEN
+		// ISSUE by the control plane, overwritten by the data plane) names
+		// the maker; the WS session names the checker. Same user → the
+		// connection is closed with a policy violation and NO lease is
+		// set — the maker can never open their own write gate. A session
+		// whose record is missing/expired is treated as non-existent
+		// (fail-closed): no lease either.
+		if err := a.checkerMayWatch(r, watchSid); err != nil {
+			a.log.Warn("watch rejected", "session_id", watchSid, "reason", err.Error())
+			_ = c.Close(websocket.StatusPolicyViolation, "cannot watch this session")
+			return
+		}
 		if sess := sessionFrom(r); sess != nil {
 			a.auditChecker(r.Context(), watchSid, sess.Username)
 		}
@@ -223,4 +240,37 @@ func (a *api) subscribeLoop(ctx context.Context, key string, pattern bool, out c
 			backoff *= 2
 		}
 	}
+}
+
+// checkerMayWatch enforces separation of duties between the checker and
+// the maker (user directive 2026-08-17): the user opening a per-session
+// watch (channel=sess:<sid>) must not be the session's maker. The maker is
+// read from the sess:live:<sid> directory record — the same record the
+// sessions list renders — written at TOKEN ISSUE by the control plane
+// (pending) and overwritten by the data plane (active); both shapes carry
+// `username`. Refusals (returned error) cover three cases, all fail-closed:
+// no session identity (unreachable — /ws/checker is session-required), a
+// missing/expired/unreadable record (the session is not watchable), and
+// checker == maker. The caller closes the WebSocket with a policy-violation
+// close and arms NO presence lease, so the write gate stays closed.
+func (a *api) checkerMayWatch(r *http.Request, sid string) error {
+	checker := sessionFrom(r)
+	if checker == nil {
+		return errors.New("unauthenticated checker") // unreachable: /ws/checker is session-required
+	}
+	raw, err := a.vs.GetSessionLive(r.Context(), sid)
+	if err != nil {
+		return fmt.Errorf("session lookup failed: %w", err)
+	}
+	if raw == nil {
+		return fmt.Errorf("session %s not found", sid)
+	}
+	var rec pendingSessionRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return fmt.Errorf("session record unreadable: %w", err)
+	}
+	if rec.Username == checker.Username {
+		return fmt.Errorf("checker %q is the maker of session %s", checker.Username, sid)
+	}
+	return nil
 }

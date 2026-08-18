@@ -114,6 +114,9 @@ func TestWSCheckerWatchPresenceOnSubscribe(t *testing.T) {
 	sid := "sid-ws-presence"
 	_ = vs.DelWatch(context.Background(), sid)
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+	// Separation of duties (2026-08-17): a sess: watch is only armed for a
+	// real session whose maker differs from the checker (admin here).
+	seedSessionRecord(t, vs, sid, "alice")
 
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
 	pollWatch(t, vs, sid, true) // subscribe → lease exists (gate probe sees the watch)
@@ -143,6 +146,7 @@ func TestWSCheckerWatchHeartbeatRefreshesTTL(t *testing.T) {
 	sid := "sid-ws-heartbeat"
 	_ = vs.DelWatch(context.Background(), sid)
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+	seedSessionRecord(t, vs, sid, "alice") // maker ≠ checker (admin)
 
 	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
 	pollWatch(t, vs, sid, true)
@@ -173,6 +177,7 @@ func TestWSCheckerWatchChannelSwitchAway(t *testing.T) {
 	sidA := "sid-ws-switch-a"
 	_ = vs.DelWatch(context.Background(), sidA)
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sidA) })
+	seedSessionRecord(t, vs, sidA, "alice") // maker ≠ checker (admin)
 
 	// Checker watches session A.
 	connA := dialWSChecker(t, srv, cookie, "sess:"+sidA)
@@ -235,6 +240,7 @@ func TestWSCheckerWatchRefcountDisconnectSafety(t *testing.T) {
 	sid := "sid-ws-refcount"
 	_ = vs.DelWatch(context.Background(), sid)
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+	seedSessionRecord(t, vs, sid, "alice") // maker ≠ checker (admin)
 
 	// Two checkers attach to the same session.
 	connA := dialWSChecker(t, srv, cookie, "sess:"+sid)
