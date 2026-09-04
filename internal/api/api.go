@@ -74,7 +74,7 @@ func (a *api) Routes() http.Handler {
 	mux.HandleFunc("POST /api/token", a.auth.requireJWT(a.handleToken))                             // Task 7: JWT-only mint (control-plane API key retired); requireJWT consults the jti denylist, so logged-out tokens cannot mint
 	mux.HandleFunc("POST /api/kill", a.auth.requireJWT(a.auth.requireChecker(a.handleKill)))        // Task 6.5: checker kill button — Task 8: role-gated (checker always; maker only with auth.allow_maker_watch)
 	mux.HandleFunc("GET /api/sessions", a.auth.requireJWT(a.auth.requireChecker(a.handleSessions))) // Task 8.4: session directory — Task 8: role-gated (checker always; maker only with auth.allow_maker_watch)
-	mux.HandleFunc("GET /ws/checker", a.auth.requireJWT(a.auth.requireChecker(a.handleWS)))         // Task 2.4 — Task 8: role-gated (checker always; maker only with auth.allow_maker_watch); SoD checkerMayWatch still rejects watcher == maker
+	mux.HandleFunc("GET /ws/checker", a.auth.requireJWTWS(a.auth.requireChecker(a.handleWS)))       // Task 2.4 — Task 8: role-gated (checker always; maker only with auth.allow_maker_watch); SoD checkerMayWatch still rejects watcher == maker; Task 9: requireJWTWS accepts the JWT via Authorization header OR ?access_token= (browsers cannot set WS headers)
 	// Task 2.9: SPA static serving — registered LAST so /api/* and /ws/* win.
 	if _, err := os.Stat(a.cfg.StaticDir); err != nil {
 		a.log.Warn("static dir missing; SPA will not be served", "static_dir", a.cfg.StaticDir)

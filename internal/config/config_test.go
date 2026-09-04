@@ -88,6 +88,13 @@ func TestLoadControl(t *testing.T) {
 	if got := j.Secret; got != "jwt-dev-secret-0123456789abcdef0123456789" {
 		t.Errorf("JWT.Secret = %q, want the expanded ZT_JWT_SECRET", got)
 	}
+	// Task 9: the committed control.yaml documents an EMPTY
+	// auth.jwt.allowed_origins (same-origin-only default for the checker
+	// WebSocket). Viper returns a non-nil empty slice for an explicit
+	// `allowed_origins: []` — length is the contract.
+	if got := len(j.AllowedOrigins); got != 0 {
+		t.Errorf("len(JWT.AllowedOrigins) = %d, want 0 (committed default: same-origin only)", got)
+	}
 	if got := cfg.Valkey.Mode; got != "direct" {
 		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
 	}
@@ -1782,6 +1789,66 @@ auth:
 		}
 		if !strings.Contains(err.Error(), "auth.jwt.secret") {
 			t.Errorf("error %q missing the auth.jwt.secret hint", err.Error())
+		}
+	})
+}
+
+// TestJWTAllowedOriginsLoad (Task 9): auth.jwt.allowed_origins is the
+// cross-origin host allowlist for the checker WebSocket upgrade
+// (websocket.Accept OriginPatterns). A yaml list must land on
+// cfg.JWT.AllowedOrigins verbatim; an ABSENT key must load as EMPTY — the
+// same-origin-only default (today's behavior), never nil-panicking
+// consumers (websocket.Accept treats a nil/empty list identically).
+func TestJWTAllowedOriginsLoad(t *testing.T) {
+	t.Run("yaml list populates the allowlist", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    login_enabled: true
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
+    allowed_origins:
+      - "http://checker.example.com"
+      - "https://*.zt-internal.example"
+`)
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		want := []string{"http://checker.example.com", "https://*.zt-internal.example"}
+		got := cfg.JWT.AllowedOrigins
+		if len(got) != len(want) {
+			t.Fatalf("JWT.AllowedOrigins = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("JWT.AllowedOrigins[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("absent key loads empty (same-origin-only default)", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    login_enabled: true
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
+`)
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		if len(cfg.JWT.AllowedOrigins) != 0 {
+			t.Errorf("JWT.AllowedOrigins = %v, want empty (same-origin only)", cfg.JWT.AllowedOrigins)
 		}
 	})
 }

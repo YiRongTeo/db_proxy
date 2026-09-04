@@ -1,10 +1,13 @@
 package api
 
 // JWT conversion (Task 5): self-issued HS256 bearer tokens are the Control
-// Plane's request credential. requireJWT guards the authenticated routes
-// (/api/me, /api/db-presets, /api/token since Task 7, /api/kill,
-// /api/sessions, /ws/checker), replacing the legacy UI-session middleware
-// (removed in Task 4); the Valkey jti denylist (Task 6) revokes tokens.
+// Plane's request credential. requireJWT guards the authenticated REST
+// routes (/api/me, /api/db-presets, /api/token since Task 7, /api/kill,
+// /api/sessions), replacing the legacy UI-session middleware (removed in
+// Task 4); the Valkey jti denylist (Task 6) revokes tokens. /ws/checker is
+// guarded by requireJWTWS (Task 9) — the same verification, but the token
+// may ALSO arrive via ?access_token= because the browser WebSocket API
+// cannot set the Authorization header.
 //
 // The token carries the principal in the sub claim plus an explicit
 // maker|checker role claim. requireJWT verifies signature + exp + iss + aud
@@ -130,44 +133,84 @@ func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error
 	return &models.Session{Username: claims.Subject, Role: claims.Role}, *claims, nil
 }
 
+// authorizeJWT is the shared core of requireJWT and requireJWTWS: it
+// verifies a raw token — presence ("": errUnauthorizedJWT, no anonymous
+// access), parseJWT (signature + exp + iss + aud + role), the Valkey jti
+// denylist (Task 6: a logged-out token is rejected even though its
+// signature is fine) — and returns a request whose context carries the
+// principal session under sessionKey{} so sessionFrom(r) consumers keep
+// working unchanged. Any failure returns errUnauthorizedJWT, mapped by the
+// caller to the standard 401. A denylist consult ERROR fails CLOSED (401):
+// revocation state must never be skipped because the store hiccuped.
+func (a *authMiddleware) authorizeJWT(r *http.Request, raw string) (*http.Request, error) {
+	if raw == "" {
+		return nil, errUnauthorizedJWT
+	}
+	sess, claims, err := a.parseJWT(raw)
+	if err != nil || sess == nil {
+		return nil, errUnauthorizedJWT
+	}
+	// Task 6: a token id on the denylist (handleLogout wrote it) is
+	// revoked — 401. Tokens without a jti are skipped (never deniable);
+	// self-issued tokens always carry one (signJWT/newJTI).
+	if claims.ID != "" {
+		denied, err := a.vs.JWTDenied(r.Context(), claims.ID)
+		if err != nil {
+			a.log.Warn("requireJWT: denylist consult failed", "err", err)
+			return nil, errUnauthorizedJWT
+		}
+		if denied {
+			return nil, errUnauthorizedJWT
+		}
+	}
+	return r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess)), nil
+}
+
 // requireJWT guards a route with a self-issued HS256 bearer token: it reads
-// "Authorization: Bearer ***", verifies signature + exp + iss + aud
-// (parseJWT), consults the Valkey jti denylist (Task 6: a logged-out token
-// is rejected even though its signature is fine), and injects the principal
+// "Authorization: Bearer ***" ONLY (bearerToken), verifies signature + exp
+// + iss + aud (parseJWT via authorizeJWT), and injects the principal
 // session under sessionKey{} so sessionFrom(r) consumers keep working
 // unchanged. Any failure answers 401 with the standard unauthorized body —
 // the same 401 these routes answered under the legacy UI-session
-// middleware. A denylist consult ERROR fails CLOSED (401): revocation state
-// must never be skipped because the store hiccuped.
+// middleware. REST routes stay header-only BY DESIGN: a token in a query
+// string would leak into logs, browser history and proxy access logs, so
+// the query-param fallback exists only on /ws/checker (requireJWTWS), where
+// the browser WebSocket API makes the header impossible.
 func (a *authMiddleware) requireJWT(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authed, err := a.authorizeJWT(r, bearerToken(r))
+		if err != nil {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, authed)
+	}
+}
+
+// requireJWTWS guards /ws/checker (Task 9): the browser WebSocket API
+// cannot set custom headers, so the checker SPA's live-query socket (Task
+// 11) must carry its JWT another way — the ?access_token= query parameter
+// appended to the WS URL. The Authorization header is tried FIRST; the
+// query parameter is consulted ONLY when the header is absent (the SPA
+// never duplicates a header it could use into the URL). The raw value then
+// goes through the EXACT same verification as requireJWT (authorizeJWT:
+// signature + exp + iss + aud + role + denylist) BEFORE websocket.Accept
+// runs, and the same 401 answers any failure. Scoping: the query fallback
+// exists ONLY on this route — REST keeps requireJWT header-only above, so
+// tokens never ride URLs (logs/history/proxies) anywhere but the one route
+// where a browser WebSocket makes the header impossible.
+func (a *authMiddleware) requireJWTWS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw := bearerToken(r)
 		if raw == "" {
+			raw = r.URL.Query().Get("access_token")
+		}
+		authed, err := a.authorizeJWT(r, raw)
+		if err != nil {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		sess, claims, err := a.parseJWT(raw)
-		if err != nil || sess == nil {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
-		// Task 6: a token id on the denylist (handleLogout wrote it) is
-		// revoked — 401. Tokens without a jti are skipped (never deniable);
-		// self-issued tokens always carry one (signJWT/newJTI).
-		if claims.ID != "" {
-			denied, err := a.vs.JWTDenied(r.Context(), claims.ID)
-			if err != nil {
-				a.log.Warn("requireJWT: denylist consult failed", "err", err)
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-			if denied {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-		}
-		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
-		next(w, r.WithContext(ctx))
+		next(w, authed)
 	}
 }
 

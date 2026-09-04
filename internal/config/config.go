@@ -169,6 +169,19 @@ type JWTConfig struct {
 	// the auth.users passwords: unset/empty = the plane refuses to start;
 	// never a silent empty key).
 	Secret string `mapstructure:"secret"`
+	// AllowedOrigins (Task 9; yaml auth.jwt.allowed_origins) is the
+	// cross-origin host allowlist for the CHECKER WebSocket upgrade ONLY
+	// (/ws/checker websocket.Accept OriginPatterns). Browsers cannot set
+	// headers on a WebSocket upgrade, so a checker SPA served from another
+	// origin must be allow-listed here. EMPTY (default) = same-origin only
+	// — an upgrade whose Origin host differs from the control-plane host is
+	// rejected (the pre-Task-9 behavior). Patterns are lowercase host globs
+	// ("checker.example.com", "*.example.com"); prefix the scheme
+	// ("https://checker.example.com") to pin it. REST routes never read
+	// this list — their JWTs ride the Authorization header only. Env
+	// override is deliberately NOT supported (a list in one env var is
+	// awkward) — set it in control.yaml.
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
 
 // MySQLAuditConfig is the optional session-audit MySQL block (Task 9.7,
@@ -364,12 +377,13 @@ func LoadControl(path string) (*ControlConfig, error) {
 		AuthRole:        v.GetString("auth.role"),
 		AllowMakerWatch: v.GetBool("auth.allow_maker_watch"),
 		JWT: JWTConfig{
-			Enabled:      v.GetBool("auth.jwt.enabled"),
-			LoginEnabled: v.GetBool("auth.jwt.login_enabled"),
-			Issuer:       v.GetString("auth.jwt.issuer"),
-			Audience:     v.GetString("auth.jwt.audience"),
-			TTLSeconds:   v.GetInt("auth.jwt.ttl_seconds"),
-			Secret:       v.GetString("auth.jwt.secret"),
+			Enabled:        v.GetBool("auth.jwt.enabled"),
+			LoginEnabled:   v.GetBool("auth.jwt.login_enabled"),
+			Issuer:         v.GetString("auth.jwt.issuer"),
+			Audience:       v.GetString("auth.jwt.audience"),
+			TTLSeconds:     v.GetInt("auth.jwt.ttl_seconds"),
+			Secret:         v.GetString("auth.jwt.secret"),
+			AllowedOrigins: v.GetStringSlice("auth.jwt.allowed_origins"),
 		},
 		SessionTTL: v.GetInt("auth.session_ttl_hours"),
 		TLS:        tlsCfg,

@@ -68,7 +68,16 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 	if channel == "" {
 		channel = "*"
 	}
-	c, err := websocket.Accept(w, r, nil)
+	// Task 9: the upgrade's Origin allowlist comes from config
+	// (auth.jwt.allowed_origins). EMPTY (default) keeps the vendor's
+	// same-origin-only behavior — an empty Origin header or one whose host
+	// equals the request Host passes; any other Origin host is refused 403
+	// before the handshake. A configured list adds cross-origin hosts
+	// (browser SPAs that cannot set WS headers). REST auth is unaffected —
+	// requireJWT never reads this.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: a.cfg.JWT.AllowedOrigins,
+	})
 	if err != nil {
 		return
 	}

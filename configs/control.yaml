@@ -57,6 +57,17 @@ auth:
     audience: "zt-api"
     ttl_seconds: 28800
     secret: "${ZT_JWT_SECRET}"  # NO SECRETS IN COMMITTED CONFIGS — set ZT_JWT_SECRET in .env (see .env.example); REQUIRED when login_enabled; empty = plane refuses to start
+    # allowed_origins (Task 9): cross-origin host allowlist for the CHECKER
+    # WebSocket upgrade ONLY (/ws/checker). Browsers cannot set headers on a
+    # WebSocket upgrade, so a checker SPA served from ANOTHER origin must be
+    # allow-listed here. EMPTY (default) = same-origin only (today's
+    # behavior): an upgrade whose Origin host differs from the control-plane
+    # host is rejected 403 before the handshake. Patterns are lowercase host
+    # globs — "checker.example.com", "*.example.com"; prefix the scheme
+    # ("https://checker.example.com") to pin it too. REST routes ignore this
+    # list (their JWTs ride the Authorization header only). NO env override —
+    # a list in one env var is awkward; set it here in yaml.
+    allowed_origins: []
   # session_ttl_hours (LEGACY cookie-session TTL — KEPT for now: internal/
   # api/auth.go still reads it; removal owned by JWT Task 6, superseded by
   # jwt.ttl_seconds above):
