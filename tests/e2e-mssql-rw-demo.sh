@@ -1,20 +1,29 @@
 #!/bin/bash
-# E2E MSSQL READ/WRITE session demo — maker alice (API key), checker admin (WS watch)
+# E2E MSSQL READ/WRITE session demo — maker admin (JWT login), checker account (WS watch)
 # Steps: issue rw token -> attach checker within 60s -> rw SQL flows -> kill query -> kill conn
+# JWT-era auth (2026-09-05 conversion): the MAKER account (admin) mints DB
+# tokens; the CHECKER account watches/lists/kills (strict SoD — control.yaml
+# auth.allow_maker_watch: false, so the maker cannot touch the checker surface).
 set -u
 cd /d/AI/hermes/Project/Project-D
 API=http://127.0.0.1:8080
-KEY='dev-key-change-me'
-COOKIE=$(cat "$HOME/zt.cookie")
 D=/tmp/rwdemo; mkdir -p $D
+# Dev credentials from .env (env override wins; .env.example defaults below).
+MAKER_JWT=$(curl -s -X POST $API/api/login -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"${ZT_AUTH_PASSWORD:-admin123}\"}" \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+CHECKER_JWT=$(curl -s -X POST $API/api/login -H 'Content-Type: application/json' \
+  -d "{\"username\":\"checker\",\"password\":\"${ZT_AUTH_CHECKER_PASSWORD:-checker123}\"}" \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+[ -n "$MAKER_JWT" ] && [ -n "$CHECKER_JWT" ] || { echo "FATAL: /api/login failed — is the control plane up?"; exit 1; }
 
-echo "== [1] issue rw token (maker=alice, mssql rw_user) =="
-TOKEN=$(curl -s -X POST $API/api/token -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"username":"alice","db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"E2E-MSSQL-RW-2"}' \
+echo "== [1] issue rw token (maker=admin, mssql rw_user) =="
+TOKEN=$(curl -s -X POST $API/api/token -H "Authorization: Bearer $MAKER_JWT" -H 'Content-Type: application/json' \
+  -d '{"username":"admin","db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"E2E-MSSQL-RW-2"}' \
   | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
 echo "TOKEN=${TOKEN:0:14}..."
 sleep 0.8
-SID=$(curl -s -H "Cookie: zt_session=$COOKIE" $API/api/sessions | python -c '
+SID=$(curl -s -H "Authorization: Bearer $CHECKER_JWT" $API/api/sessions | python -c '
 import sys,json
 d=json.load(sys.stdin)
 pend=[s for s in d if s.get("status")=="pending"]
@@ -22,8 +31,8 @@ print(pend[-1]["session_id"] if pend else "")')
 echo "SID=$SID"
 echo "$TOKEN" > $D/token; echo "$SID" > $D/sid
 
-echo "== [2] attach checker watcher (admin) =="
-node tests/zt-ws-listen.js "sess:$SID" "$COOKIE" 80000 > $D/ws.log 2>&1 &
+echo "== [2] attach checker watcher (checker account) =="
+node tests/zt-ws-listen.js "sess:$SID" "$CHECKER_JWT" 80000 > $D/ws.log 2>&1 &
 WSPID=$!
 sleep 3
 echo "watch EXISTS: $(docker exec valkey valkey-cli --scan --pattern "watch:$SID:*" | wc -l | tr -d ' ') (1 = checker watcher armed)"
