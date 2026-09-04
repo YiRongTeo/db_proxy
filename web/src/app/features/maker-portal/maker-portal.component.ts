@@ -75,7 +75,8 @@ export class MakerPortalComponent implements OnInit {
       error: (err) => {
         this.presetsLoading.set(false);
         if (err.status === 401) {
-          // Task 9.11: clear the UI session BEFORE leaving — otherwise the
+          // Task 12: the bearer JWT was rejected (expired or denylisted) —
+          // drop the stored token + identity BEFORE leaving — otherwise the
           // stale user signal keeps the authGuard happy and the SPA loops
           // on 401s.
           this.handleUnauthorized();

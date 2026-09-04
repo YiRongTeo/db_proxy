@@ -34,7 +34,7 @@
 - Standalone components only (NO NgModules); zoneless (Angular 21 default: no zone.js dep/polyfill, no provideZoneChangeDetection in app.config.ts); Signals for local state.
 - NG-ZORRO v21 components (`nz-table`, `nz-form`, `nz-card`, `nz-tag`, `nz-select`); enterprise look.
 - `rxjs/webSocket` for the live feed; `toSignal` bridge; `complete()` on destroy (no leaks).
-- `ngx-clipboard` for token copy; lazy standalone routes; route guards require session.
+- `ngx-clipboard` for token copy; lazy standalone routes; route guards require a stored bearer JWT (TokenStore; authGuard blocks until the boot-time /api/me restore resolves).
 - Dark enterprise theme: dark zinc sidebar + sky accent (house style, consistent with B/C look).
 
 ## Verification
@@ -42,7 +42,7 @@
 - Valkey: `docker exec valkey valkey-cli ping` → PONG.
 - MySQL proxy: `docker exec mysql-test mysql -h host.docker.internal -P 3306 -u <token> -e "SELECT 1"`.
 - PG proxy: `docker exec pg-test psql -h host.docker.internal -p 3306 -U <token> -d appdb -c "SELECT 1"` (shared port).
-- Control API: curl matrix with/without `X-Api-Key` / session → 200 vs 401.
-- WS: `node -e 'const ws=new WebSocket("ws://127.0.0.1:8080/ws/checker?channel=*");…'` (Node ≥22 global WebSocket).
+- Control API: curl matrix with/without bearer JWT → 200 vs 401 (login via `POST /api/login` first; role gates: checker-role JWT for kill/sessions, maker blocked unless `allow_maker_watch`; checker write-mint → 403). The old X-Api-Key/session-cookie matrix is GONE — never test with `X-Api-Key` on `/api/*`.
+- WS: `node -e 'const ws=new WebSocket("ws://127.0.0.1:8080/ws/checker?access_token=<jwt>&channel=*");…'` (Node ≥22 global WebSocket; the token rides the URL query, not a cookie).
 - E2E: two-browser Maker/Checker gate (recipe: PLAN.md Phase 5).
 - All async operations must be verified with real tool output.

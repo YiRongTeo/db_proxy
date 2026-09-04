@@ -2,6 +2,13 @@
 
 > **This page describes how the gateway CALLS OUT to an external API to withdraw DB passwords.** This is the section most likely to be modified — the contract below is the source of truth for anyone changing it.
 
+> **Key disambiguation (JWT conversion):** the `X-Api-Key` on THIS page is the
+> **data plane's** key to its vault (`credentials_api.api_key` /
+> `ZT_CREDENTIALS_API_API_KEY`) — a different, still-live credential. The
+> control-plane API key (`ZT_API_API_KEY` / `X-Api-Key` on `/api/*`) was
+> retired in the 2026-09-05 JWT conversion — see
+> [Page 9 — JWT & Roles](jwt-auth-conversion.md).
+
 ## When it happens
 
 The data plane needs the **real DB password** exactly once per session: when it opens the backend connection after validating the maker's token. In `credentials_source: api` mode the password is fetched live from an external credential service. It exists **in memory only, for that one connect call** — it is never stored, logged, or sent back toward the client.

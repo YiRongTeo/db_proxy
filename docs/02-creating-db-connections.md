@@ -16,10 +16,12 @@ sequenceDiagram
     participant D as Data Plane :3306
     participant B as Target DB (MySQL/PG/MSSQL)
 
-    T->>C: POST /api/token (X-Api-Key or session cookie)
+    T->>C: POST /api/login {username,password} (auth.jwt.login_enabled)
+    C-->>T: 200 {token (JWT), username, role, expires_in}
+    T->>C: POST /api/token (Authorization: Bearer <jwt>)
     C->>V: store tok:<id> (single-use, TTL 300s) + sess:live:<sid> (status=pending)
     C->>V: publish lifecycle event action=issued (queries:<user>, queries:sess:<sid>)
-    C-->>T: 200 { token, session_id, db_type, db_user, db, access, expires_at }
+    C-->>T: 200 { token, host, port, expires_in }
 
     Note over K, V: Checker sees the PENDING session immediately (badge "waiting for maker")
 
@@ -38,55 +40,61 @@ sequenceDiagram
 | Item | Value |
 |---|---|
 | Endpoint | `POST /api/token` (HTTPS on `:8080`) |
-| Authentication | `X-Api-Key: <api_key>` header **or** an authenticated UI session cookie |
+| Authentication | `Authorization: Bearer <jwt>` — a self-issued login JWT (`POST /api/login`) or an external JWT signed with the same `auth.jwt.secret` (the control-plane `X-Api-Key` was retired). See [Page 9 — JWT & Roles](jwt-auth-conversion.md) |
 | Content-Type | `application/json` |
 
 ### Request body
 
 ```json
 {
-  "username": "alice",
+  "username": "admin",
   "ticket_id": "TKT-1234",
-  "db_preset": "mssql read-write"
+  "db_type": "mssql",
+  "db_user": "rw_user",
+  "db_ip": "127.0.0.1",
+  "db_port": "1434",
+  "access": "write"
 }
 ```
 
 | Field | Required | Meaning |
 |---|---|---|
-| `username` | yes | The maker's identity (appears in events and logs) |
+| `username` | no | Must match the bearer JWT's subject or be omitted — the token is ALWAYS issued for the authenticated principal (mint-for-others is rejected) |
 | `ticket_id` | yes | Approval/change ticket — required since Phase 6; missing → `400` |
-| `db_preset` | **or** | Named preset from config (e.g. `mysql read-only`, `mssql read-write`) — carries `db_type`, `db_user`, `db_ip`, `db_port`, `access` |
-| `db_type`, `db_user`, `db_ip`, `db_port`, `access` | **or** | Explicit connection parameters instead of a preset (`access`: `read` \| `write`) |
+| `db_type` | yes | `mysql` \| `postgres` \| `mssql` \| `oracle` |
+| `db_user`, `db_ip`, `db_port` | yes | Target connection parameters (the `db_presets` allowlist in `configs/control.yaml` decides the resolved `access` level) |
+| `mode` | no | Token flavor: `single-use` (default) \| `session` (multi-connect, IP-locked, revocable — see RUN.md §3) |
+| `idle_seconds` | no | Per-token data-plane idle override (0/absent = the data-plane default) |
 
-`access` defaults to `read`. `db_type` must be one of `mysql`, `postgres`, `mssql`.
+`access` is resolved from the matching `db_presets` entry (absent = read). A **checker**-role
+principal is limited to read-access mints — `POST /api/token` for a write preset answers **403**
+(`checker role limited to read-only tokens`).
 
 ### Response — `200 OK`
 
 ```json
 {
   "token": "sess_3dbeca423e...",
-  "session_id": "sid-0ad82ea1ef361acb",
-  "db_type": "mssql",
-  "db_user": "rw_user",
-  "db": "appdb",
-  "access": "write",
-  "expires_at": 1755300000
+  "host": "127.0.0.1",
+  "port": "3306",
+  "expires_in": 300
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `token` | The single-use token. **The client uses it as the DB username.** Format `sess_<32 hex>`. TTL 300 s. |
-| `session_id` | Session id **stamped at issue time** — the session exists before the maker connects (this is what makes the checker flow work) |
-| `db_type` / `db_user` / `db` / `access` | What the connection will be |
+| `host` / `port` | The shared Data Plane public listener (from `configs/control.yaml` `api.data_plane_*`) — same port for every protocol |
+| `expires_in` | Seconds until expiry (`-1` for infinite session-mode tokens) |
 
 ### Error responses
 
 | Status | Meaning |
 |---|---|
-| `400` | Missing/invalid fields (e.g. no `ticket_id`, unknown `db_type`) |
-| `401` | Missing/invalid API key or session |
-| `404` | Unknown preset |
+| `400` | Missing/invalid fields (no `ticket_id`, unknown `db_type`, body username ≠ bearer subject) |
+| `401` | Missing/invalid/expired/denylisted bearer JWT |
+| `403` | Role gate: a checker-role principal minting a write-access token |
+| `422` | Unknown `db_type` value |
 
 ## 2.2 Side effects of a successful token issue
 

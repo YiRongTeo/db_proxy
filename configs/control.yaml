@@ -27,6 +27,15 @@ api:
   data_plane_host: "127.0.0.1"
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
+  # JWT/roles auth (2026-09-05 conversion). The retired control-plane API
+  # key (api.api_key / ZT_API_API_KEY / X-Api-Key on /api/*) is GONE — do
+  # NOT re-add it; mint auth is bearer-JWT only. (The DATA plane's
+  # credentials_api.api_key in data.yaml is a different key and still
+  # exists for vault calls.) Operator switches: auth.jwt.login_enabled
+  # (true = UI login on; false = external-JWT-only), auth.jwt.allowed_origins
+  # (cross-origin checker WS allowlist; no env override), auth.role /
+  # auth.users[].role (maker|checker), auth.allow_maker_watch (false =
+  # strict SoD).
   username: "admin"
   password: ""                # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUTH_PASSWORD in .env (see .env.example); empty = plane refuses to start
   # role (JWT conversion): the PRIMARY account's role — "maker" or
@@ -46,9 +55,13 @@ auth:
       password: "${ZT_AUTH_CHECKER_PASSWORD}"
       role: "checker"
   # jwt (JWT conversion): the bearer-JWT auth block. enabled ABSENT = true
-  # (JWT is the mode); an explicit false keeps the legacy cookie mode.
-  # login_enabled registers /api/login + /api/logout (self-issued HS256
-  # JWTs); false = external-JWT-only (username/password then NOT required).
+  # (JWT is the mode; an unmigrated config fails fast demanding roles +
+  # secret). An explicit false DISABLES JWT verification — every guarded
+  # route answers 401 (fail closed); there is NO legacy cookie mode anymore
+  # (the cookie-session machinery was removed in the conversion), so keep
+  # the default true. login_enabled registers /api/login + /api/logout
+  # (self-issued HS256 JWTs); false = external-JWT-only (username/password
+  # then NOT required).
   # ttl_seconds (28800 = 8h) replaces session_ttl_hours as the auth expiry.
   jwt:
     enabled: true
@@ -68,9 +81,11 @@ auth:
     # list (their JWTs ride the Authorization header only). NO env override —
     # a list in one env var is awkward; set it here in yaml.
     allowed_origins: []
-  # session_ttl_hours (LEGACY cookie-session TTL — KEPT for now: internal/
-  # api/auth.go still reads it; removal owned by JWT Task 6, superseded by
-  # jwt.ttl_seconds above):
+  # session_ttl_hours is INERT LEGACY RESIDUE of the cookie-session era: it
+  # is still parsed (default 8) into an UNUSED ControlConfig.SessionTTL
+  # field for backward compatibility, but NOTHING consumes it — the live
+  # auth expiry is jwt.ttl_seconds above (28800 = 8h). Safe to delete this
+  # key entirely; the parse will be removed with the field.
   session_ttl_hours: 8
 db_presets:
   - name: "MySQL read-only"

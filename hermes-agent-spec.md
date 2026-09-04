@@ -28,7 +28,7 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
 | R3 | Every query is audited in real time | Wire-protocol parsing + Valkey Pub/Sub → Checker WebSocket dashboard |
 | R4 | Control/Data planes fully decoupled | Valkey is the only shared infrastructure; Data Plane never calls Control Plane |
 | R5 | Protocol-aware proxying | MySQL + PostgreSQL wire parsing (COM_QUERY, SimpleQuery, Parse, …) |
-| R6 | Token issuance is secured | `X-Api-Key` (external systems) OR UI session; no anonymous issuance |
+| R6 | Token issuance is secured | Self-issued HS256 **bearer JWT** (login or external issuer sharing `auth.jwt.secret`); roles maker/checker; no anonymous issuance (see §9 amendment 19 — supersedes the v1 X-Api-Key / UI-session mechanism) |
 | R7 | Thick-client compatible | HeidiSQL connects with token as username; byte-exact relay |
 
 ---
@@ -39,8 +39,8 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         CONTROL PLANE (Go, :8080)                    │
 │  ┌──────────────┐   ┌──────────────────┐   ┌─────────────────────┐  │
-│  │ Angular SPA  │◄──┤ POST /api/token  │   │ /ws/checker WS hub  │  │
-│  │ (maker+      │   │ POST /api/login  │   │ (Valkey Pub/Sub →   │  │
+│  │ Angular SPA  │◄──┤ POST /api/login  │   │ /ws/checker WS hub  │  │
+│  │ (maker+      │   │ POST /api/token  │   │ (Valkey Pub/Sub →   │  │
 │  │  checker)    │   │ GET /api/db-     │   │  Checker dashboard) │  │
 │  └──────────────┘   │ presets, health  │   └─────────────────────┘  │
 │                     └────────┬─────────┘                            │
@@ -49,8 +49,8 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
                                ▼
                     ┌──────────────────────┐
                     │   VALKEY (shared)     │   ← single source of truth
-                    │ tok:<t> TTL 300s      │      tok:<t>, sess:ui:<id>,
-                    │ sess:ui:<id> TTL 8h   │      Pub/Sub queries:*
+                    │ tok:<t> TTL 300s      │      tok:<t>, sess:live:<sid>,
+                    │ jwt:deny:<jti> TTL    │      watch:<sid>, Pub/Sub queries:*
                     └──────────────────────┘
                                ▲
         │        ┌──────────────────────┼──────────────────────────────────────┐
@@ -71,11 +71,11 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
 
 ### 4.1 Control Plane (Go, :8080)
 - Serves the built Angular SPA from `web/dist/web/browser` (Angular 21 application-builder output layout)
-- `POST /api/token` — issues a single-use token (TTL 300 s) into Valkey; secured by `X-Api-Key` OR UI session cookie
-- `POST /api/login` / `POST /api/logout` — single admin account (`control.yaml`), session stored in Valkey (TTL 8 h)
+- `POST /api/login` / `POST /api/logout` — self-issue / revoke HS256 bearer JWTs (registered only when `auth.jwt.login_enabled: true`; login → `{token, username, role, expires_in}`; logout denylists the jti)
+- `POST /api/token` — issues a single-use DB token (TTL 300 s) into Valkey; secured by **Bearer JWT** (control-plane API key retired — amendment 19)
 - `GET /api/db-presets` — allowlisted DB targets for the Maker UI (zero-trust: UI can only issue tokens against known targets)
 - `GET /api/health` — liveness + Valkey status
-- `GET /ws/checker?channel=<username | ticket:<id> | *>` — WebSocket bridge from Valkey Pub/Sub to the Checker dashboard
+- `GET /ws/checker?channel=<username | ticket:<id> | *>` — WebSocket bridge from Valkey Pub/Sub to the Checker dashboard; JWT via `Authorization` header or `?access_token=` (role-gated, amendment 19)
 
 ### 4.2 Data Plane (Go, :3306 — MySQL + PostgreSQL on one shared port)
 - One shared TCP listener; **protocol detected per connection** (PostgreSQL is client-first, MySQL is server-first — see §6.0); grace period `listen.detect_delay_ms` (default 200 ms)
@@ -87,28 +87,29 @@ The system is **distributed**: a **Control Plane** (web/API) and a **Data Plane*
 
 ### 4.3 Valkey (shared infrastructure)
 - `tok:<token>` → `TokenPayload` JSON, TTL 300 s — single source of truth for routing
-- `sess:ui:<id>` → UI session, TTL 8 h
-- Pub/Sub channels: `queries:<username>`, `queries:ticket:<ticket_id>` (pattern `queries:*` for "all")
+- `jwt:deny:<jti>` → logged-out JWT ids (TTL = the token's remaining life) — the logout denylist
+- Pub/Sub channels: `queries:<username>`, `queries:ticket:<ticket_id>` (pattern `queries:*` for "all"), plus the `sess:live:*` session directory and `watch:*` presence keys
 
 ---
 
 ## 5. API Contract
 
 ### `POST /api/token`
-Auth: `X-Api-Key: <control.api_key>` **OR** valid UI session cookie.
+Auth: `Authorization: Bearer <jwt>` (login-issued or external; the control-plane `X-Api-Key` is retired — amendment 19).
 ```json
 { "username": "alice", "db_user": "ro_user", "db_ip": "10.0.0.5",
   "db_port": "3306", "db_type": "mysql", "ticket_id": "TICKET-1" }
 ```
 - 200: `{ "token": "sess_…", "host": "<data-plane-host>", "port": "3306", "expires_in": 300 }`
   (`port` = the shared Data Plane public listener, from `control.yaml` — same port for both protocols)
-- 401 unauthorized · 400 missing/invalid fields · 422 unknown `db_type`
+- 401 unauthorized (missing/invalid/denylisted JWT) · 400 missing/invalid fields · 422 unknown `db_type` · 403 checker-role write mint
+  (`username` in the body must match the bearer JWT's subject or be omitted — the token is always issued for the authenticated principal)
 
-### `POST /api/login` `{username,password}` → 200 + `Set-Cookie` (HttpOnly, SameSite=Lax) | 401
-### `POST /api/logout` → 200 (session deleted from Valkey)
-### `GET /api/db-presets` → `[{name, db_type, db_user, db_ip, db_port}]` (session required)
+### `POST /api/login` `{username,password}` → 200 `{token, username, role, expires_in}` (HS256 JWT, no cookie) | 401 | 429 (rate-limited) — registered only when `auth.jwt.login_enabled: true`
+### `POST /api/logout` → 200 (denylists the presented token's jti in Valkey) | 401 (no/invalid bearer)
+### `GET /api/db-presets` → `[{name, db_type, db_user, db_ip, db_port, access}]` (bearer JWT required)
 ### `GET /api/health` → `{"status":"ok","valkey":"up"}`
-### `GET /ws/checker?channel=<key>` (session required) → stream of `QueryEvent` JSON
+### `GET /ws/checker?channel=<key>` (bearer JWT via header or `?access_token=`; role-gated) → stream of `QueryEvent` JSON
 
 ---
 
@@ -200,6 +201,7 @@ All dependencies Apache-2.0 or MIT — no GPL.
 16. **Checker dashboard legibility (2026-08-14, user directive)**: the session-details strip uses readable contrast on the dark theme (values ≥4.5:1, labels ≥3:1 vs the panel background), and the toolbar/strip/select-options spacing is consistent so details are visible at a glance (verified via computed-style contrast checks, DOM evidence).
 18. **Checker controls grid (2026-08-14, user directive)**: the checker toolbar/controls (session selector, channel input, connect/stop, kill-connection, status tag) are laid out with ng-zorro `nz-row`/`nz-col` responsive spans so they display properly at every width.
 13. **MSSQL (TDS) support (2026-08-13, user directive)**: third wire protocol on the shared data-plane listener (:3306, first byte 0x12 → mssql). Full parity with MySQL/PG: token-as-username Login7 auth (GETDEL, login7 rewritten with real creds via the fixed magic XOR key), prelogin encryption negotiation (ENCRYPT_ON + raw TLS handshake when `tls.enabled`, ENCRYPT_NOT_SUP otherwise), SQL batch/RPC relay + capture (COLMETADATA/ROW/DONE/ERROR → columns/rows/status, caps 100/512/64KB), session directory + lifecycle, kill-query via ATTENTION (0x06) on the live conn (session survives), kill-connection, write-gating, credential API mode, query logging. Presets/creds in config (mssql ro/rw).
+19. **JWT/roles auth conversion (2026-09-05, executed Tasks 1–11 — SUPERSEDES the auth mechanism in R6, §4.1/§4.3, §5 above and amendments 3 and 7)**: the cookie-session model is REMOVED — `zt_session`/`sess:ui:*` UI sessions, `CreateSession/GetSession/DeleteSession`, `sessionFromRequest`, `requireSession` and the control-plane API key (`api.api_key`/`ZT_API_API_KEY`, `X-Api-Key` on `/api/*`) are all gone. Control-plane auth is now: (a) **bearer JWT** on every authenticated route — `/api/me`, `/api/db-presets`, `/api/token`, `/api/kill`, `/api/sessions` (`Authorization: Bearer <jwt>`, header-only by design) and `/ws/checker`, which ALSO accepts `?access_token=` because browsers cannot set WS headers (requireJWTWS); (b) **self-issued HS256 JWTs** from `POST /api/login` (registered only when `auth.jwt.login_enabled: true`; 200 `{token, username, role, expires_in}`, NO cookie) with **logout revocation** — `POST /api/logout` denylists the token's `jti` in Valkey (`jwt:deny:<jti>`) for its remaining life; fail-closed: a denylist consult error 401s; (c) **roles** — every account declares `maker`|`checker` (`auth.role`, `auth.users[].role`; REQUIRED when login_enabled, never defaulted): `checker` may mint **read-only** tokens only (write mint → 403, so a checker cannot self-watch a write session), and the checker surface (`/ws/checker`, `POST /api/kill`, `GET /api/sessions`) is role-gated — checker always, maker only when `auth.allow_maker_watch: true` (default false = strict SoD); the SoD username check (watcher ≠ maker) is independent of roles; (d) **config** — `auth.jwt{enabled (default true), login_enabled (default true), issuer, audience, ttl_seconds (28800 = 8h, replaces `session_ttl_hours` which is now inert), secret (ZT_JWT_SECRET, required when login_enabled), allowed_origins (cross-origin checker-WS allowlist, no env override)}`; `auth.jwt.enabled: false` disables JWT verification entirely (guarded routes fail closed 401 — no legacy cookie fallback); external-JWT-only deployments set `login_enabled: false` and mint their own JWTs signed with the same secret. The Angular SPA stores the JWT in memory + sessionStorage (TokenStore) and rides it on REST calls (interceptor) and the checker WS (`?access_token=`). Full operator documentation: RUN.md §2–§5 and docs/jwt-auth-conversion.md.
 
 ---
 

@@ -8,21 +8,21 @@ Checker dashboard (maker–checker principle).
 
 - **Control Plane** (Go, `:8080`) — REST API + WebSocket hub + Angular 21 SPA (Maker portal / Checker dashboard).
 - **Data Plane** (Go, `:3306`) — ONE shared TCP listener for **MySQL AND PostgreSQL**; protocol detected per connection.
-- **Valkey** — the *only* coupling between the planes: tokens, UI sessions, and the query event bus.
+- **Valkey** — the *only* coupling between the planes: DB tokens, the live-session directory, watch keys, and the query event bus (UI auth is bearer-JWT, not Valkey sessions).
   The Data Plane **never** makes HTTP calls to the Control Plane (R4).
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        CONTROL PLANE (Go, :8080)                        │
-│   Angular SPA (Maker+Checker) · POST /api/token · /ws/checker hub      │
+│   Angular SPA (Maker+Checker) · POST /api/login (JWT) · /ws/checker hub │
 └───────────────────────────────┬────────────────────────────────────────┘
                                 │ SET/GETDEL tokens · Pub/Sub queries
                                 ▼
-                     ┌──────────────────────┐
-                     │   VALKEY (shared)    │   tok:<t> TTL 300s (single-use, GETDEL)
-                     │ tok:* · sess:ui:* ·  │   sess:ui:<id> TTL 8h
-                     │ Pub/Sub queries:*    │   queries:<user>, queries:ticket:<id>
-                     └──────────────────────┘
+                     ┌────────────────────────────────────────┐
+                     │   VALKEY (shared)                      │   tok:<t> TTL 300s (single-use, GETDEL)
+                     │ tok:* · sess:live:* · watch:* ·        │   sess:live:<sid> session directory
+                     │ Pub/Sub queries:* · ctl:kill           │   queries:<user>, queries:ticket:<id>
+                     └────────────────────────────────────────┘
                                 ▲
 ┌───────────────────────────────┴────────────────────────────────────────┐
 │                     DATA PLANE (Go, :3306 — shared)                     │
@@ -44,8 +44,16 @@ Checker dashboard (maker–checker principle).
 - **Every query is audited** — passive wire-protocol sniffing (COM_QUERY/COM_INIT_DB/COM_STMT_PREPARE/
   EXECUTE; PG SimpleQuery/Parse/Execute) publishes `QueryEvent`s to Valkey Pub/Sub → Checker WebSocket
   (R3). Checker is **monitor-only** in v1 (D3).
-- **No anonymous issuance** — `POST /api/token` requires `X-Api-Key` (external ticketing systems) **or**
-  a UI session cookie (R6); UI tokens restricted to the `db_presets` allowlist (D8).
+- **No anonymous issuance** — `POST /api/token` requires a **bearer JWT**
+  (self-issued by `POST /api/login` with `auth.jwt.login_enabled`, or an external
+  issuer signed with the same `auth.jwt.secret`) (R6). The control-plane
+  `X-Api-Key` / `ZT_API_API_KEY` was retired in the JWT conversion. UI tokens are
+  restricted to the `db_presets` allowlist (D8).
+- **Role-scoped UI (maker/checker)** — every account carries a role from
+  `configs/control.yaml`: makers mint tokens; checkers watch sessions and kill
+  (write-mints by a checker → 403; watch/kill/sessions by a maker → 403 unless
+  `auth.allow_maker_watch: true`). Checker WS auth rides `?access_token=<jwt>`
+  (browsers cannot set WS headers). See [docs/jwt-auth-conversion.md](docs/jwt-auth-conversion.md).
 - **Decoupled planes** — Valkey is the only shared infrastructure; the Data Plane has zero HTTP calls
   to the Control Plane by construction (R4, verified in Task 5.1).
 
@@ -55,7 +63,8 @@ Checker dashboard (maker–checker principle).
   server-first → detection grace `detect_delay_ms` (default 200 ms) adds ~200 ms to MySQL connects (D11).
 - Tokens carry `db_type`; a MySQL token rejected by a PG client and vice versa (wrong-protocol = fail closed).
 - Byte-exact relay (original packet headers/sequence preserved) — thick-client compatible (R7).
-- UI session: single admin account (`configs/control.yaml`, env-overridable via `ZT_*`), 8 h TTL in Valkey.
+- UI auth: self-issued HS256 **bearer JWT** (8 h default TTL) — `POST /api/login` returns
+  `{token, username, role, expires_in}`; logout denylists the token's jti in Valkey. No cookies.
 
 ## Tech stack
 
@@ -78,9 +87,9 @@ configs/         control.yaml, data.yaml (dev defaults; ZT_ env overrides)
 
 ## Get started
 
-See **[RUN.md](RUN.md)** — containers → `go run ./cmd/control` → `go run ./cmd/data` → curl a token →
-connect HeidiSQL/mysql/psql → Checker at `http://127.0.0.1:8080/checker` (login `admin`, password from
-`.env` — `cp .env.example .env` first; the committed configs carry no secrets).
+See **[RUN.md](RUN.md)** — containers → `go run ./cmd/control` → `go run ./cmd/data` → log in (`/api/login` → bearer JWT) → curl a token →
+connect HeidiSQL/mysql/psql → Checker at `http://127.0.0.1:8080/checker` (login `admin` — maker — or
+`checker`, passwords from `.env` — `cp .env.example .env` first; the committed configs carry no secrets).
 
 ## Docs
 
@@ -88,6 +97,8 @@ connect HeidiSQL/mysql/psql → Checker at `http://127.0.0.1:8080/checker` (logi
 - [hermes-rules.md](hermes-rules.md) — house rules / architecture invariants
 - [PLAN.md](PLAN.md) — full implementation plan, per-task verification gates, design decisions D1–D11
 - [RUN.md](RUN.md) — end-to-end run guide with exact commands and timings
+- [docs/](docs/) — Confluence page set (architecture, API, checker, write-gating, TLS, audit, metrics)
+- [docs/jwt-auth-conversion.md](docs/jwt-auth-conversion.md) — the JWT/roles auth model: flows before/after, role×capability matrix, config keys, sequence diagrams
 
 **Status:** Phases 0–4 complete and reviewed (MySQL + PG proxies, shared-port dispatcher, coexistence
 gate); Phase 5 gates in progress (security matrix, concurrency, shutdown hygiene passed; docs/E2E/review remaining).

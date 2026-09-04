@@ -407,9 +407,10 @@ export class CheckerDashboardComponent implements OnInit, OnDestroy {
       },
       error: (err: { status?: number }) => {
         if (err?.status === 401) {
-          // Task 9.11: the session cookie expired — clear the UI session
-          // FIRST, then send the user to /login. Without the logout the stale
-          // user signal keeps the authGuard happy and the SPA loops on 401s.
+          // Task 12: the bearer JWT was rejected (expired or denylisted) —
+          // clear the stored token + identity FIRST, then send the user to
+          // /login. Without the logout the stale user signal keeps the
+          // authGuard happy and the SPA loops on 401s.
           this.handleUnauthorized();
           return;
         }

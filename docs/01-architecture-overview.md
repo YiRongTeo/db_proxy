@@ -14,8 +14,8 @@ The system is split into two planes coupled **only through Valkey**:
 ```mermaid
 flowchart LR
     subgraph Clients
-        M[Maker / Ticketing UI] -->|"POST /api/token<br/>X-Api-Key or session"| C
-        K[Checker UI] -->|"WS queries:*<br/>POST /api/kill"| C
+        M[Maker / Ticketing UI] -->|"POST /api/login → JWT<br/>POST /api/token (Bearer JWT)"| C
+        K[Checker UI] -->|"WS queries:* ?access_token=&lt;jwt&gt;<br/>POST /api/kill (Bearer JWT)"| C
         DB[DB Client<br/>mysql / psql / sqlcmd] -->|"connect with token as username"| D
     end
 
@@ -63,8 +63,8 @@ flowchart LR
 
 | Component | Role |
 |---|---|
-| Control plane API | `/api/login`, `/api/token`, `/api/sessions`, `/api/kill`, WS hub auth |
-| Token store (Valkey) | `tok:<id>` single-use tokens (GETDEL), `sess:ui:` UI sessions |
+| Control plane API | `/api/login` (JWT), `/api/token`, `/api/sessions`, `/api/kill`, WS hub — all Bearer-JWT auth (see [Page 9 — JWT & Roles](jwt-auth-conversion.md)) |
+| Token store (Valkey) | `tok:<id>` single-use tokens (GETDEL); jti denylist `jwt:deny:<jti>` for logged-out JWTs |
 | Session directory (Valkey) | `sess:live:<sid>` heartbeat-refreshed records, `watch:<sid>` checker presence |
 | Event channels (Valkey) | `queries:<user>`, `queries:ticket:<t>`, `queries:sess:<sid>` |
 | Data plane proxies | MySQL (server-first handshake), PostgreSQL (client-first), MSSQL (TDS prelogin + Login7) |

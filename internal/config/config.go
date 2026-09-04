@@ -126,9 +126,10 @@ type ControlConfig struct {
 	// the bearer-JWT auth block. jwt.ttl_seconds supersedes SessionTTL as
 	// the auth expiry (default 28800 = 8h, mirroring the old session TTL).
 	JWT JWTConfig
-	// SessionTTL is the LEGACY cookie-session TTL in hours (default 8).
-	// Superseded by JWT.TTLSeconds — kept until Task 6 removes the
-	// cookie-session machinery (internal/api/auth.go still reads it).
+	// SessionTTL is INERT LEGACY RESIDUE of the cookie-session era: parsed
+	// from auth.session_ttl_hours (default 8) for backward compatibility but
+	// consumed by NOTHING — the live auth expiry is JWT.TTLSeconds (28800).
+	// Safe to drop the yaml key; the parse goes away with this field.
 	SessionTTL int
 	DBPresets  []DBPreset
 	TLS        *CertConfig
@@ -152,9 +153,12 @@ type AuthUserConfig struct {
 // ZT_AUTH_JWT_*; JWT conversion Task 2). Enabled is the master switch:
 // ABSENT defaults to TRUE — JWT is the mode going forward, so an
 // unmigrated config fails fast demanding roles + secret instead of
-// booting with the old semantics. An EXPLICIT auth.jwt.enabled: false is
-// allowed (pre-JWT cookie-session mode) and skips every new validation —
-// only the classic auth.username/auth.password requirement applies.
+// booting with the old semantics. An EXPLICIT auth.jwt.enabled: false
+// DISABLES JWT verification — every guarded route answers 401 (parseJWT
+// fails closed); there is NO legacy cookie-session fallback (that
+// machinery was removed in the conversion), so the only validations that
+// still apply are the classic auth.username/auth.password requirement and
+// the auth.users shape. Keep the default true.
 // LoginEnabled registers /api/login + /api/logout and self-issues HS256
 // JWTs; when false the plane may run external-JWT-only: auth.username /
 // auth.password and the secret are then NOT required.
@@ -333,12 +337,14 @@ func LoadControl(path string) (*ControlConfig, error) {
 		"api.token_mode": "single-use", "api.session_token_ttl_seconds": 0,
 		// JWT conversion (Task 2): the bearer-JWT block defaults ON —
 		// auth.jwt.enabled ABSENT = true (JWT is the mode going forward; an
-		// explicit false keeps the legacy cookie-session mode), and
+		// explicit false disables JWT verification — guarded routes fail
+		// closed 401; the legacy cookie-session machinery was removed during
+		// the conversion and no longer exists as a fallback), and
 		// login_enabled ABSENT = true (today's behavior: the plane
 		// authenticates UI users with username/password). jwt.ttl_seconds
 		// (28800 = 8h) is the new auth expiry — it supersedes
-		// auth.session_ttl_hours, which stays parsed (default 8) until
-		// Task 6 removes the cookie-session machinery.
+		// auth.session_ttl_hours, which stays parsed (default 8) as INERT
+		// backward-compatible residue (nothing consumes it).
 		"auth.jwt.enabled":       true,
 		"auth.jwt.login_enabled": true,
 		"auth.jwt.ttl_seconds":   28800,
@@ -395,7 +401,9 @@ func LoadControl(path string) (*ControlConfig, error) {
 	// defaults map and would produce a plane with an empty credential; a
 	// plane with unguessable-empty credentials must never start. The
 	// username/password requirement is now mode-dependent:
-	//   - legacy cookie mode (auth.jwt.enabled: false): required, unchanged.
+	//   - JWT disabled (auth.jwt.enabled: false): username/password still
+	//     required (kept from the legacy config shape; no cookie mode
+	//     exists — guarded routes simply fail closed 401, see JWTConfig).
 	//   - JWT mode + login_enabled: required, unchanged.
 	//   - JWT mode external-only (login_enabled: false): NOT required —
 	//     the plane may run external-JWT-only (no UI login).
@@ -435,7 +443,10 @@ func LoadControl(path string) (*ControlConfig, error) {
 			}
 		}
 	} else {
-		// Legacy pre-JWT cookie mode: the classic requirement is unchanged.
+		// JWT disabled (auth.jwt.enabled: false): the classic requirement is
+		// kept so such a config still demands unguessable credentials (no
+		// cookie-session mode exists anymore — guarded routes fail closed
+		// 401 regardless, see JWTConfig).
 		if cfg.AuthUser == "" {
 			return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
 		}
@@ -466,8 +477,8 @@ func LoadControl(path string) (*ControlConfig, error) {
 	// Task 2: role validation for the OPTIONAL users — every entry must
 	// declare "maker"|"checker" when login_enabled (explicit over default:
 	// an un-role'd entry would be an accidental superuser); in external-only
-	// mode a declared role must still be valid. Legacy cookie mode
-	// (jwt.enabled: false) has no roles and skips this entirely.
+	// mode a declared role must still be valid. With JWT disabled
+	// (jwt.enabled: false) there are no roles and this is skipped entirely.
 	if cfg.JWT.Enabled {
 		for i := range cfg.AuthUsers {
 			u := &cfg.AuthUsers[i]

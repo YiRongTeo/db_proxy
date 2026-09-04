@@ -169,10 +169,15 @@ goes in the USERNAME field; the password is ignored (`-P x`). The token's
 `db_ip`/`db_port` select the backend (mssql preset → `127.0.0.1:1434`):
 
 ```bash
-# token for the mssql preset (Control Plane must be running):
-TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token -H "X-Api-Key: dev-ke...-me" \
+# bearer JWT via login (auth.jwt.login_enabled is on by default — §3):
+JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+# mint the mssql token with that JWT (the body username must match the
+# bearer principal — or omit it and it is bound to the JWT's sub, §3):
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql"}' \
+  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 
 # plaintext plane:  expect `1` / `(1 rows affected)`, exit 0
@@ -236,7 +241,7 @@ docker exec mssql-test /opt/mssql-tools18/bin/sqlcmd -S host.docker.internal,330
 #    server message, e.g. "Invalid object name 'no_such_table_zz'.")
 
 # the session shows up in the checker directory with its database:
-curl -b /tmp/zt.jar http://127.0.0.1:8080/api/sessions
+curl -H "Authorization: Bearer $JWT" http://127.0.0.1:8080/api/sessions
 # → 200 → [..., {"db_type":"mssql","db":"appdb", ...}, ...]
 ```
 
@@ -285,10 +290,13 @@ client through the proxy:
 # mint a token, then point any JDBC client at the proxy:
 #   host 127.0.0.1, port 1522 (listen.oracle_addr), service FREEPDB1
 #   user = <token>, password = anything
-go run ./cmd/control &   # or your running control plane
+# login → bearer JWT (admin = ZT_AUTH_PASSWORD from .env; §3), then mint:
+JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
-  -H 'Content-Type: application/json' -H 'X-Api-Key: dev-key-change-me' \
-  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1521","db_type":"oracle","ticket_id":"E2E-1"}'
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $JWT" \
+  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1521","db_type":"oracle","ticket_id":"E2E-1"}'
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 # go-ora DSN: oracle://<TOKEN>:x@127.0.0.1:1522/FREEPDB1
 ```
@@ -319,7 +327,12 @@ cd /d/AI/hermes/Project/Project-D
 cp .env.example .env     # then edit .env to taste (dev defaults already match §1's container seeds)
 ```
 
-Required: `ZT_AUTH_PASSWORD` (empty → the control plane refuses to start).
+Required (UI login on, the default): `ZT_AUTH_PASSWORD` AND `ZT_JWT_SECRET` (empty
+→ the control plane refuses to start). `ZT_JWT_SECRET` is the HS256 signing
+secret behind every bearer JWT (config `auth.jwt.secret`, §3); `ZT_AUTH_PASSWORD`
+authenticates UI logins while `auth.jwt.login_enabled: true` (the default) —
+set `login_enabled: false` for an external-JWT-only plane, in which case the
+password and secret are NOT required (see `docs/jwt-auth-conversion.md`).
 `ZT_CRED_*` entries feed the data plane's credentials list via `${VAR}`
 placeholders in `configs/data.yaml`; an unset credential variable is a
 **load error**, never a silent empty password. `ZT_ENV_FILE` overrides the
@@ -332,12 +345,16 @@ cd /d/AI/hermes/Project/Project-D
 go run ./cmd/control
 ```
 
-Optional — enable external token issuance with an API key (recommended for ticketing integrations):
-
-```bash
-export ZT_API_API_KEY='dev-key-change-me'     # maps to configs/control.yaml api.api_key
-go run ./cmd/control
-```
+Auth model (JWT conversion — the old `ZT_API_API_KEY` / control-plane
+`X-Api-Key` is GONE): every authenticated route takes a **Bearer JWT**
+(`Authorization: Bearer <jwt>`); `/api/login` self-issues those JWTs when
+`auth.jwt.login_enabled` is true (default). To mint DB tokens (§3) log in
+first and reuse the returned JWT — the SPA does exactly this. Operators who
+want ticketing integrations to mint tokens without a UI login can either
+issue JWTs to the integration signed with the same `auth.jwt.secret`, or
+leave `login_enabled` on and treat the login response as the integration's
+entry point. `auth.jwt.allowed_origins` (control.yaml) allow-lists
+cross-origin checker WebSocket upgrades (no env override — set it in yaml).
 
 Readiness (second terminal):
 
@@ -373,6 +390,9 @@ The Data Plane owns the backend DB passwords (zero-trust). Where they come from 
   env `ZT_CREDENTIALS_API_API_KEY`; `timeout_seconds` default 5, env
   `ZT_CREDENTIALS_API_TIMEOUT_SECONDS`). Load fails fast when `source=api` and the URL is
   empty, so a data plane that cannot resolve passwords never starts silently.
+  **This `X-Api-Key` is the DATA plane's key to its vault — unrelated to the retired
+  control-plane `ZT_API_API_KEY` (removed in the JWT conversion; the Control Plane's
+  `/api/token` now takes a Bearer JWT, §2.1).**
 
 Vault contract (the only thing the endpoint must implement):
 
@@ -599,34 +619,42 @@ address and time window; revocation is explicit and converges on one
 invariant — **no key = no session**. The checker gate, SoD watch and audit
 are unchanged (the session id is stamped at mint as before).
 
-### 3.1 API-key flavor (external systems)
+### 3.1 Bearer-JWT flavor (login → mint — the ONLY flavor)
+
+Every mint must present a valid bearer JWT (`Authorization: Bearer <jwt>`) —
+the control-plane `X-Api-Key` was retired in the JWT conversion. The JWT comes
+from `/api/login` (when `auth.jwt.login_enabled: true`, the default) or from an
+external issuer trusted by the plane's `auth.jwt.secret`:
 
 ```bash
+# 1) login → 200 {token, username, role, expires_in} — the token is the JWT
+JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+# 2) mint with the JWT. The body username (optional) must match the JWT's
+#    subject or be omitted — the token is always issued for the principal.
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
-  -H "X-Api-Key: dev-key-change-me" \
+  -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
+  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 echo "$TOKEN"
 ```
 
-Response shape (token is always `sess_…`): `{"token":"sess_…","host":"127.0.0.1","port":"3306","expires_in":300}`.
+Logout revokes the JWT server-side (Valkey jti denylist for its remaining
+life): `curl -X POST http://127.0.0.1:8080/api/logout -H "Authorization: Bearer $JWT"`
+→ `200 {"ok":"true"}` — the same token then answers `401` on every guarded route.
+Self-issued JWTs default to `auth.jwt.ttl_seconds: 28800` (8 h); on expiry the
+SPA sends you back to `/login`.
 
-### 3.2 Session-cookie flavor (UI session)
-
-```bash
-curl -s -c /tmp/zt.jar -X POST http://127.0.0.1:8080/api/login \
-  -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'
-TOKEN=$(curl -s -b /tmp/zt.jar -X POST http://127.0.0.1:8080/api/token \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
-  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
-echo "$TOKEN"
-```
+Response shape (DB token is always `sess_…`): `{"token":"sess_…","host":"127.0.0.1","port":"3306","expires_in":300}`
+(session-mode tokens report `expires_in: -1` = infinite, revoked by deletion).
 
 For PostgreSQL swap `"db_type":"postgres"` and the backend port `"db_port":"5433"` (user `ro_user`).
 
-> Token without key/session → `401`; unknown `db_type` → `422`; missing fields → `400`.
+> Mint without a bearer → `401`; unknown `db_type` → `422`; missing fields → `400`;
+> a **checker**-role principal minting a write-access token → `403` (checkers are
+> read-only minters — they cannot create a write session they could then watch, §5).
 
 ---
 
@@ -679,11 +707,25 @@ For PostgreSQL use psql or any PG client pointed at the same `127.0.0.1:3306`.
 Login: **admin** with the password from `.env` (`ZT_AUTH_PASSWORD` — copy
 `.env.example` to `.env` first; the committed configs carry NO secrets).
 Override the username via `configs/control.yaml` (`auth.username`) or
-`ZT_AUTH_USERNAME`.
+`ZT_AUTH_USERNAME`. Every account declares a **role** (`auth.role` for the
+primary pair, `auth.users[].role` for extras) and the SPA lands you on the
+role's page — `/maker` for a maker, `/checker` for a checker. The committed
+config ships two accounts for SoD testing: `admin` (maker) and `checker`
+(checker, password `ZT_AUTH_CHECKER_PASSWORD` from `.env`) — use two
+browsers/profiles, the checker must NOT be the maker.
 
-Checker is **monitor-only** for statements in v1 (live audit; no approval of queries). UI tokens
-can only target the `db_presets` allowlist from `configs/control.yaml`. Phase 8 adds per-session
-selection and two-level kill — see 5.2 below.
+| Role | Mint (`POST /api/token`) | Watch / kill / sessions (`/ws/checker`, `/api/kill`, `/api/sessions`) | Default account |
+|---|---|---|---|
+| `maker` | any `db_presets` access — read **and** write | **403** unless `auth.allow_maker_watch: true` (default false = strict SoD) | `admin` (`auth.username`, `auth.role: maker`) |
+| `checker` | **read-only** presets only — a write-access mint → `403` | always (this is the checker surface) | `checker` (`auth.users[]`, `role: checker`) |
+
+`allow_maker_watch: true` (control.yaml) is the single-account deployment
+escape hatch: it lets maker-role principals watch/kill too. The **SoD
+username check is independent of roles** — a checker can never watch their
+OWN session (1008 policy-violation close, §5.1), and the data-plane write
+gate still requires a watcher ≠ maker. Checker is **monitor-only** for
+statements (live audit; no approval of queries — kill is the only action).
+UI tokens can only target the `db_presets` allowlist from `configs/control.yaml`.
 
 ### 5.1 Maker write-gating (Task 8.6)
 
@@ -710,6 +752,8 @@ the session again.
 **different user** than the session's maker. The WS hub rejects a maker's attempt to watch their own
 session with a **1008 policy-violation close** (no `watch:<sid>` lease is created), and also rejects
 `sess:<sid>` channels whose session record is missing/expired (fail-closed). The checker dashboard
+shows the server's reason in a banner. Only the session's maker identity is special — the live-all
+feed (`channel=*`) and user/ticket channels are unaffected.
 
 **Extra UI users (Task 9.13):** the control plane supports additional accounts beyond the primary
 `auth.username/password` pair via the optional `auth.users` list in `configs/control.yaml`
@@ -717,8 +761,6 @@ session with a **1008 policy-violation close** (no `watch:<sid>` lease is create
 `ZT_AUTH_CHECKER_PASSWORD` — same fail-fast rule as the primary pair). The committed config ships
 a dedicated **`checker`** account for SoD testing: maker = `admin`, checker = `checker`
 (two browsers/profiles — the checker must NOT be the maker).
-shows the server's reason in a banner. Only the session's maker identity is special — the live-all
-feed (`channel=*`) and user/ticket channels are unaffected.
 
 **Grace window (Task 8.13 — maker-first no longer breaks).** When a write-access maker connects
 BEFORE any checker, blocked SQL is not rejected instantly — it WAITS for a watcher:
@@ -751,7 +793,7 @@ thread_id|pid`), SETEX TTL 60 s — SET on start, REFRESH on every published eve
 (idle-but-open sessions drop off after 60 s, documented). The checker lists them with
 
 ```bash
-curl -b /tmp/zt.jar http://127.0.0.1:8080/api/sessions   # session cookie required
+curl -H "Authorization: Bearer $JWT" http://127.0.0.1:8080/api/sessions   # checker-role JWT (or maker with allow_maker_watch)
 # 200 → [{"session_id","username","db_user","db_type","db","started_at","last_seen"}, ...]
 ```
 
@@ -761,6 +803,15 @@ Selecting a session in the Checker dashboard (or any WS client subscribing to
 `ws://127.0.0.1:8080/ws/checker?channel=sess:<sid>`) switches the feed to ONLY that session's
 events; `channel=*` remains the all-queries feed.
 
+**WS auth (JWT conversion):** `/ws/checker` accepts the bearer JWT via the
+`Authorization` header **or**, because the browser WebSocket API cannot set
+headers, as the `?access_token=<jwt>` query parameter on the WS URL — e.g.
+`ws://127.0.0.1:8080/ws/checker?access_token=<jwt>&channel=sess:<sid>` (Node's
+global WebSocket / rxjs `webSocket` both take the URL form). The header wins
+when both are present; REST routes stay header-only by design. The route is
+role-gated like the REST checker surface (checker always, maker only with
+`allow_maker_watch`), and the SoD check still rejects watcher == maker.
+
 **Two-level kill.** `POST /api/kill` takes an optional `mode`:
 
 | mode | behavior |
@@ -769,8 +820,9 @@ events; `channel=*` remains the all-queries feed.
 | `query` | aborts only the in-flight query via a second backend connection (`KILL QUERY <thread_id>` MySQL / `pg_cancel_backend(<pid>)` PG); the session stays alive and the maker can keep running queries. No active query → idempotent ok |
 
 ```bash
-curl -b /tmp/zt.jar -X POST http://127.0.0.1:8080/api/kill \
+curl -H "Authorization: Bearer $JWT" -X POST http://127.0.0.1:8080/api/kill \
   -H 'Content-Type: application/json' -d '{"session_id":"sid-...","mode":"query"}'  # 202 {"killed":"queued"}
+# ($JWT must be a checker-role JWT — or a maker with allow_maker_watch — else 403)
 ```
 
 The Checker dashboard shows one row per session with two buttons: **Kill query** (mode=query,
@@ -965,9 +1017,10 @@ ZT_VALKEY_PASSWORD=masterpw ZT_VALKEY_SENTINEL_PASSWORD=sentinelpw go run ./cmd/
 
 ```bash
 cd /d/AI/hermes/Project/Project-D
-# control plane — HTTPS listener + TLS Valkey store + API key (optional)
+# control plane — HTTPS listener + TLS Valkey store (auth secrets come from .env:
+# ZT_AUTH_PASSWORD + ZT_JWT_SECRET; the retired ZT_API_API_KEY must NOT be set)
 ZT_TLS_ENABLED=true ZT_VALKEY_SSL_ENABLED=true ZT_VALKEY_ADDR=127.0.0.1:6380 \
-ZT_VALKEY_SSL_CA_FILE=certs/data.crt ZT_API_API_KEY='dev-key-change-me' go run ./cmd/control
+ZT_VALKEY_SSL_CA_FILE=certs/data.crt go run ./cmd/control
 # data plane — wire TLS on :3306 + TLS Valkey store
 ZT_TLS_ENABLED=true ZT_VALKEY_SSL_ENABLED=true ZT_VALKEY_ADDR=127.0.0.1:6380 \
 ZT_VALKEY_SSL_CA_FILE=certs/data.crt go run ./cmd/data
@@ -991,10 +1044,13 @@ ZT_VALKEY_SENTINEL_PASSWORD=sentinelpw go run ./cmd/control
 ### 6.5 Clients with TLS flags (verified 2026-08-12 gate)
 
 ```bash
-# token over HTTPS — same payloads as §3 (API-key or session-cookie flavor)
+# token over HTTPS — bearer JWT (login over HTTPS first, §3; -k = self-signed dev cert)
+JWT=$(curl -sk -X POST https://127.0.0.1:8080/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 TOKEN=$(curl -sk -X POST https://127.0.0.1:8080/api/token \
-  -H "X-Api-Key: $ZT_API_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
+  -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 
 # MySQL wire TLS — REQUIRED hard-fails if the proxy did not negotiate TLS
@@ -1006,20 +1062,25 @@ docker exec mysql-test mysql -h host.docker.internal -P 3306 -u "$TOKEN" -pany \
 docker exec pg-test psql "host=host.docker.internal port=3306 user=$TOKEN dbname=appdb sslmode=require" \
   -c "SELECT id,name FROM demo_items"
 
-# kill E2E over HTTPS (session-cookie flavor; 202 = queued, data plane force-closes)
-curl -sk -b /tmp/zt.jar -X POST https://127.0.0.1:8080/api/kill \
+# kill E2E over HTTPS (checker-role bearer JWT; 202 = queued, data plane force-closes)
+curl -sk -H "Authorization: Bearer $JWT" -X POST https://127.0.0.1:8080/api/kill \
   -H 'Content-Type: application/json' -d '{"session_id":"sid-..."}'   # expect: 202 {"killed":"queued"}
 ```
 
-Checker WS in TLS mode is `wss://127.0.0.1:8080/ws/checker?channel=*` — Node ≥ 22 global WebSocket
-with `NODE_TLS_REJECT_UNAUTHORIZED=0` (self-signed cert) plus the session cookie header
-(`new WebSocket(url, { headers: { Cookie: 'zt_session=...' } })`).
+Checker WS in TLS mode is
+`wss://127.0.0.1:8080/ws/checker?access_token=<jwt>&channel=*` — Node ≥ 22 global
+WebSocket with `NODE_TLS_REJECT_UNAUTHORIZED=0` (self-signed cert) plus the JWT
+in the URL (`new WebSocket('wss://…/ws/checker?access_token=' + jwt +
+'&channel=*')`); non-browser WS clients may instead send the
+`Authorization: Bearer <jwt>` upgrade header.
 
 ### 6.6 Env override notes (verified live, 2026-08-12)
 
-- `api.api_key` maps to **`ZT_API_API_KEY`** (viper: `ZT_` prefix + dots→underscores) — **NOT**
-  `ZT_API_KEY`. Setting only `ZT_API_KEY` is silently ignored and `/api/token` stays key-disabled
-  (401); the stale `# set via ZT_API_KEY` comment in `configs/control.yaml` predates this finding.
+- Control-plane `api.api_key` / **`ZT_API_API_KEY`** were **retired in the JWT
+  conversion** (Task 7): nothing parses them anymore, setting them has no
+  effect, and `/api/token` auth is bearer-JWT only (§3). They are NOT the same
+  key as the data plane's `credentials_api.api_key` → `ZT_CREDENTIALS_API_API_KEY`
+  (§2.3), which is still live. The old `ZT_API_KEY` spelling was never valid.
 - Sentinel mode overrides `valkey.addr` (direct mode); both modes share the `valkey.ssl.*` block.
 
 ---
@@ -1065,11 +1126,14 @@ PID=$(netstat -ano | grep -E ':3306\s.*LISTEN' | awk '{print $NF}' | head -1)
 
 | Symptom | Cause / fix |
 |---|---|
+| `401` on `/api/token` or any `/api/*` | Missing/invalid/expired/denylisted bearer JWT — log in again (§3) |
+| `403` on `/api/kill`, `/api/sessions`, `/ws/checker` | Role gate: mint/watch needs a **checker**-role JWT (or `auth.allow_maker_watch: true`), §5 |
+| `403` on a write-access mint | A **checker**-role JWT cannot mint write tokens (read-only minters), §3/§5 |
 | `invalid or expired token` on first connect | Token reused (single-use) or > 300 s old — issue a fresh one |
 | MySQL connect hangs ~200 ms then works | Expected — protocol-detection grace on the shared port |
 | `token not valid for this protocol` | Token `db_type` doesn't match the client (mysql token + psql, or vice versa) |
 | `backend unavailable` | Backend container down, or credentials missing in `configs/data.yaml` for that `db_ip:db_port:db_user` key |
-| Control Plane exits at boot | Valkey not up (`valkey-cli ping` fails); port 8080 already bound |
+| Control Plane exits at boot | Valkey not up (`valkey-cli ping` fails); port 8080 already bound; `ZT_JWT_SECRET`/`ZT_AUTH_PASSWORD` missing from `.env` |
 | UI 404 / blank | Angular not built — see §2.1 |
 
 ---
@@ -1082,7 +1146,7 @@ Measured from a fresh terminal with the three containers already up (Phase 0 sta
 |---|---|
 | Control Plane boot → `/api/health` 200 | **2.8 s** |
 | Data Plane boot → `:3306` listening | **2.0 s** |
-| Token issuance (curl, API key) | **79 ms** |
+| Token issuance (curl, bearer JWT) | **79 ms** |
 | `mysql … SELECT` through `:3306` (incl. ~200 ms detection grace) | **402 ms** |
 | **Total, fresh terminal → first proxied SELECT** | **22.8 s — target < 120 s ✓** |
 

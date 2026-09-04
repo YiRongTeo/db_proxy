@@ -7,6 +7,18 @@
 
 **Method note:** every row cites the task report that captured real tool output (both planes from built binaries; containers `mysql-test` :3307, `pg-test` :5433, `valkey` :6379 live). All citations live in `.superpowers/sdd/PLAN/`. No fabricated results anywhere in the record.
 
+> **Auth rows superseded (2026-09-05 JWT/roles conversion):** rows R6, §9-3 and
+> §9-7 below describe the ORIGINAL cookie-session + control-plane `X-Api-Key`
+> auth and were **live and true on 2026-08-11** (this snapshot's date). The
+> conversion replaced that model — UI sessions (`sess:ui:*`, `zt_session`
+> cookie, `session_ttl_hours`) and the control-plane `ZT_API_API_KEY` /
+> `X-Api-Key` are gone; mint auth is bearer-JWT only, roles (maker/checker)
+> gate the checker surface. The R1–R7 verdicts themselves (token issuance
+> secured = R6 **PASS**, no anonymous issuance) still hold under the new
+> mechanism. See **[docs/jwt-auth-conversion.md](jwt-auth-conversion.md)** for
+> the current auth model; evidence rows here are preserved verbatim as the
+> historical record.
+
 ---
 
 ## R1–R7 spec-compliance table

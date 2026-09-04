@@ -49,8 +49,10 @@ func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.Va
 }
 
 // dialWSChecker opens a checker WebSocket with the given channel param.
-// /ws/checker is requireJWT-guarded since Task 5: the dial presents the
-// bearer token in the upgrade request's Authorization header.
+// /ws/checker is requireJWTWS-guarded since Task 9: the dial presents the
+// bearer token in the upgrade request's Authorization header (the
+// ?access_token= query fallback is for browsers that cannot set headers;
+// header-first is what Go clients use).
 func dialWSChecker(t *testing.T, srv *httptest.Server, token, channel string) *websocket.Conn {
 	t.Helper()
 	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/checker?channel=" + url.QueryEscape(channel)

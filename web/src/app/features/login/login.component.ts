@@ -11,8 +11,9 @@ import { AuthService } from '../../core/auth.service';
 /**
  * Sign-in form (Task 2.8, replaces the placeholder). Submits credentials to
  * POST /api/login via AuthService; since Task 10 the returned bearer JWT is
- * held by the TokenStore (no more session cookie) and rides on every
- * subsequent REST call (authInterceptor) and the checker WS (Task 11).
+ * held by the TokenStore (memory + sessionStorage — no session cookie) and
+ * rides on every subsequent REST call (authInterceptor) and the checker WS
+ * (Task 11, as the ?access_token= URL param).
  * Already-logged-in visitors bounce straight to their `returnUrl` (or their
  * role's landing page). After a successful login the visitor is sent to
  * `returnUrl` when the authGuard redirected here with one (Task 5.7) — and
