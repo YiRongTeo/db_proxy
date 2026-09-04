@@ -91,7 +91,7 @@ principal is limited to read-access mints — `POST /api/token` for a write pres
 
 | Status | Meaning |
 |---|---|
-| `400` | Missing/invalid fields (no `ticket_id`, unknown `db_type`, body username ≠ bearer subject) |
+| `400` | Missing/invalid fields (no/invalid `ticket_id`, missing required fields, body username ≠ bearer subject) |
 | `401` | Missing/invalid/expired/denylisted bearer JWT |
 | `403` | Role gate: a checker-role principal minting a write-access token |
 | `422` | Unknown `db_type` value |

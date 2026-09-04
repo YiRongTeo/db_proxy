@@ -182,9 +182,10 @@ type JWTConfig struct {
 	// rejected (the pre-Task-9 behavior). Patterns are lowercase host globs
 	// ("checker.example.com", "*.example.com"); prefix the scheme
 	// ("https://checker.example.com") to pin it. REST routes never read
-	// this list — their JWTs ride the Authorization header only. Env
-	// override is deliberately NOT supported (a list in one env var is
-	// awkward) — set it in control.yaml.
+	// this list — their JWTs ride the Authorization header only. No
+	// dedicated env binding — AutomaticEnv still maps
+	// ZT_AUTH_JWT_ALLOWED_ORIGINS (comma-separated) if set; set the list
+	// in control.yaml for clarity.
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
 

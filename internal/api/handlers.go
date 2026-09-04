@@ -29,7 +29,7 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "valkey": "up"})
 }
 
-// handleDBPresets returns the configured database presets (session required).
+// handleDBPresets returns the configured database presets (bearer JWT principal required).
 func (a *api) handleDBPresets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.cfg.DBPresets)
 }
@@ -330,7 +330,7 @@ func (a *api) accessForPreset(dbType, dbUser, dbIP, dbPort string) string {
 	return ""
 }
 
-// handleKill queues a data-plane session kill (session required). The kill
+// handleKill queues a data-plane session kill (bearer JWT principal required). The kill
 // is dispatched over the Valkey ctl:kill channel — no HTTP between planes
 // (spec amendment 9e). Mode selects the kill scope (Task 8.3 two-level
 // kill): "connection" (default) terminates the whole backend session;
@@ -377,8 +377,8 @@ func (a *api) handleKill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"killed": "queued"})
 }
 
-// handleSessions lists the live data-plane session directory (session
-// required). The directory is the sess:live:* keys the data plane
+// handleSessions lists the live data-plane session directory (bearer JWT
+// principal required). The directory is the sess:live:* keys the data plane
 // heartbeats (Task 8.2); thread_id stays backend-internal and is not
 // exposed to the checker. An empty directory is encoded as [] (never null).
 func (a *api) handleSessions(w http.ResponseWriter, r *http.Request) {

@@ -254,10 +254,11 @@ func TestRequireJWTMissingOrMalformedHeader(t *testing.T) {
 	}
 }
 
-// TestRequireJWTRejectsWhenJWTDisabled: with jwt.enabled=false (the legacy
-// pre-JWT cookie mode) requireJWT fails CLOSED — even a correctly signed
-// token is rejected because no JWT trust is configured. (Route tests run
-// with jwt.enabled=true; this pins the fail-closed branch.)
+// TestRequireJWTRejectsWhenJWTDisabled: with jwt.enabled=false (JWT
+// verification disabled — there is NO legacy cookie mode; an explicitly
+// disabled JWT trust is a misconfiguration) requireJWT fails CLOSED — even
+// a correctly signed token is rejected because no JWT trust is configured.
+// (Route tests run with jwt.enabled=true; this pins the fail-closed branch.)
 func TestRequireJWTRejectsWhenJWTDisabled(t *testing.T) {
 	legacy := &config.ControlConfig{JWT: config.JWTConfig{Enabled: false, LoginEnabled: true}}
 	a := &authMiddleware{cfg: legacy}

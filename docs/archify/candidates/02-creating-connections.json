@@ -26,7 +26,7 @@
     { "from": 660, "to": 780, "label": "3 · Session live" }
   ],
   "messages": [
-    { "id": "token-request", "from": "maker", "to": "control", "y": 195, "label": "POST /api/token (X-Api-Key or session cookie)", "variant": "emphasis" },
+    { "id": "token-request", "from": "maker", "to": "control", "y": 195, "label": "POST /api/token (Authorization: Bearer JWT)", "variant": "emphasis" },
     { "id": "store-token", "from": "control", "to": "valkey", "y": 248, "label": "store tok:<id> — single-use, TTL 300s", "variant": "default" },
     { "id": "store-session", "from": "control", "to": "valkey", "y": 292, "label": "sess:live:<sid> status=pending + publish action=issued", "variant": "default" },
     { "id": "token-response", "from": "control", "to": "maker", "y": 335, "label": "200 { token, session_id, db_type, db_user, db, access, expires_at }", "variant": "return" },

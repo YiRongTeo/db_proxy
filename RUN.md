@@ -354,7 +354,8 @@ want ticketing integrations to mint tokens without a UI login can either
 issue JWTs to the integration signed with the same `auth.jwt.secret`, or
 leave `login_enabled` on and treat the login response as the integration's
 entry point. `auth.jwt.allowed_origins` (control.yaml) allow-lists
-cross-origin checker WebSocket upgrades (no env override — set it in yaml).
+cross-origin checker WebSocket upgrades (no dedicated env binding — AutomaticEnv
+still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS`, comma-separated, if set).
 
 Readiness (second terminal):
 

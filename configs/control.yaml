@@ -33,7 +33,8 @@ auth:
   # credentials_api.api_key in data.yaml is a different key and still
   # exists for vault calls.) Operator switches: auth.jwt.login_enabled
   # (true = UI login on; false = external-JWT-only), auth.jwt.allowed_origins
-  # (cross-origin checker WS allowlist; no env override), auth.role /
+  # (cross-origin checker WS allowlist; no dedicated env binding — AutomaticEnv
+  # maps ZT_AUTH_JWT_ALLOWED_ORIGINS, comma-separated), auth.role /
   # auth.users[].role (maker|checker), auth.allow_maker_watch (false =
   # strict SoD).
   username: "admin"
@@ -78,8 +79,9 @@ auth:
     # host is rejected 403 before the handshake. Patterns are lowercase host
     # globs — "checker.example.com", "*.example.com"; prefix the scheme
     # ("https://checker.example.com") to pin it too. REST routes ignore this
-    # list (their JWTs ride the Authorization header only). NO env override —
-    # a list in one env var is awkward; set it here in yaml.
+    # list (their JWTs ride the Authorization header only). No dedicated env
+    # binding — AutomaticEnv still maps ZT_AUTH_JWT_ALLOWED_ORIGINS
+    # (comma-separated) if set; set the list here in yaml for clarity.
     allowed_origins: []
   # session_ttl_hours is INERT LEGACY RESIDUE of the cookie-session era: it
   # is still parsed (default 8) into an UNUSED ControlConfig.SessionTTL

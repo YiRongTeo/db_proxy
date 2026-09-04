@@ -71,7 +71,7 @@ role other than `maker`/`checker` — is rejected 401 at verification.
 | `auth.jwt.issuer` / `auth.jwt.audience` | `ZT_AUTH_JWT_ISSUER` / `ZT_AUTH_JWT_AUDIENCE` | `zerotrust-proxy` / `zt-api` — enforced on every token (wrong iss/aud → 401). |
 | `auth.jwt.ttl_seconds` | `ZT_AUTH_JWT_TTL_SECONDS` | `28800` (8 h) — the JWT life returned as `expires_in`; replaces `auth.session_ttl_hours` (now inert). |
 | `auth.jwt.secret` | `ZT_JWT_SECRET` (also `ZT_AUTH_JWT_SECRET`) | HS256 signing secret. REQUIRED when `login_enabled` — empty = the control plane refuses to start. Use a long random value (32+ bytes). |
-| `auth.jwt.allowed_origins` | **no env override** (set in yaml) | Cross-origin host allowlist for the checker WebSocket upgrade ONLY (`/ws/checker`). Empty = same-origin only (upgrade 403 before handshake). Patterns: `checker.example.com`, `*.example.com`; prefix the scheme to pin it. REST ignores the list (headers only). |
+| `auth.jwt.allowed_origins` | no dedicated env binding — AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS` (comma-separated) if set | Cross-origin host allowlist for the checker WebSocket upgrade ONLY (`/ws/checker`). Empty = same-origin only (upgrade 403 before handshake). Patterns: `checker.example.com`, `*.example.com`; prefix the scheme to pin it. REST ignores the list (headers only). |
 | `auth.username` / `auth.password` | `ZT_AUTH_USERNAME` / `ZT_AUTH_PASSWORD` | Primary account (maker in the committed config). Password REQUIRED when `login_enabled`; empty = refuses to start. |
 | `auth.role` | `ZT_AUTH_ROLE` | Primary account's role: `maker` \| `checker` — REQUIRED when `login_enabled`. |
 | `auth.allow_maker_watch` | `ZT_AUTH_ALLOW_MAKER_WATCH` | `false` (default, strict SoD) — maker-role principals may watch/kill only when `true`. |
@@ -136,7 +136,7 @@ sequenceDiagram
     Note over U,S: Logout
     S->>C: POST /api/logout with Authorization: Bearer <jwt>
     C->>V: SET jwt:deny:<jti> (TTL = remaining token life)
-    C-->>S: 200 {"ok": true} — the same JWT now answers 401 everywhere
+    C-->>S: 200 {"ok":"true"} — the same JWT now answers 401 everywhere
 ```
 
 ## Operator migration checklist
