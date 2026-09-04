@@ -138,9 +138,11 @@ type QueryEvent struct {
 	DB     string `json:"db,omitempty"`     // client-requested target database
 }
 
-// Session is the UI session payload (stored at sess:ui:<id>). The TTL of
-// the sess:ui:<id> key IS the expiry — the Expires field was dead weight
-// and is gone (Task 9.9 review remediation).
+// Session is the authenticated principal — username plus maker/checker
+// role — carried in the request context (the JWT middleware of Task 4
+// builds it under sessionKey{}). The legacy sess:ui cookie-session
+// storage it once described is gone (Task 4).
 type Session struct {
 	Username string `json:"username"`
+	Role     string `json:"role,omitempty"` // "maker" | "checker"
 }
