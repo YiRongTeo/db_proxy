@@ -58,7 +58,7 @@ func testJWTBlock() config.JWTConfig {
 // Authorization header (authHeader/withBearer). Since Task 6 the REAL login
 // endpoint also returns such a token (see loginJWT); mintJWT stays for
 // identities the login endpoint cannot authenticate (non-configured users —
-// the /api/token bare route resolves the bearer principal since Task 4).
+// signJWT needs only the JWT config, so any sub+role can be minted).
 func mintJWT(t *testing.T, cfg *config.ControlConfig, username, role string) string {
 	t.Helper()
 	tok, err := signJWT(cfg, username, role, 5*time.Minute, time.Now())
@@ -90,7 +90,7 @@ func (t bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // withBearer returns a shallow copy of client that sends the given bearer
 // token on every request. Use it after mintJWT to drive requireJWT-guarded
-// routes (and, since Task 4, the bare /api/token route):
+// routes (including the /api/token mint route since Task 7):
 //
 //	client = withBearer(client, mintJWT(t, cfg, "admin", "maker"))
 func withBearer(client *http.Client, token string) *http.Client {

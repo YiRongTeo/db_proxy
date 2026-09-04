@@ -203,8 +203,8 @@ func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 	user := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
 	// Review 9.9a: the token is issued for the SESSION (bearer) user — the
 	// maker under test authenticates with its own minted JWT (the login
-	// endpoint only knows admin). The same bearer drives /api/token (bare
-	// route, Task 4) and the requireJWT-guarded GET /api/sessions.
+	// endpoint only knows admin). The same bearer drives /api/token
+	// (requireJWT-guarded since Task 7) and GET /api/sessions.
 	authed := withBearer(client, mintJWT(t, cfg, user, "maker"))
 	sid := issueAuditToken(t, authed, srv, vs, user, "ro_user", "T-9-7")
 

@@ -79,8 +79,8 @@ func issueToken(t *testing.T, client *http.Client, base, body string) string {
 // (the data plane treats absent access as read).
 func TestTokenAccessFromPreset(t *testing.T) {
 	srv, client, vs, cfg := newPresetTestAPIServer(t)
-	// The /api/token bare route resolves the bearer principal (Task 4):
-	// authenticate as the fixture user with a minted JWT.
+	// The mint route is requireJWT-guarded (Task 7): authenticate as the
+	// fixture user with a minted JWT.
 	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 	ctx := context.Background()
 
@@ -172,5 +172,138 @@ func TestTokenRejectsInvalidDBType(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(got), "db_type must be mysql, postgres, mssql or oracle") {
 		t.Errorf("error body = %s, want the canonical db_type message", got)
+	}
+}
+
+// --- Task 7: JWT-only mint + checker read-only role gate --------------------
+
+// postToken POSTs a token request and returns the status + raw body (for
+// tests that must inspect rejections; 200-path callers use issueToken).
+func postToken(t *testing.T, client *http.Client, base, body string) (int, string) {
+	t.Helper()
+	resp, err := client.Post(base+"/api/token", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/token: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read token response: %v", err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+// Task 7 request bodies: the mysql presets in newPresetTestAPIServer are
+// ro_user (read, :3307) and rw_user (write, :3307); the ad-hoc target
+// matches NO preset (access "" — the data plane treats absent access as
+// read, so it stays ungated for both roles).
+const (
+	task7ReadBody  = `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-7-role"}`
+	task7WriteBody = `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-7-role"}`
+	task7AdhocBody = `{"db_user":"some_user","db_ip":"10.1.2.3","db_port":"3306","db_type":"mysql","ticket_id":"T-7-role"}`
+)
+
+// TestTokenRoleGate (Task 7 user directive): POST /api/token enforces the
+// checker read-only rule — a checker-role principal requesting a WRITE-access
+// preset is refused 403 BEFORE any token is stored; read-access presets and
+// ungated ad-hoc targets stay available to BOTH roles.
+func TestTokenRoleGate(t *testing.T) {
+	srv, client, vs, cfg := newPresetTestAPIServer(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name, role, body string
+		wantStatus       int
+		wantAccess       string // stored payload access for the 200 rows
+	}{
+		{"checker + read preset", "checker", task7ReadBody, http.StatusOK, "read"},
+		{"checker + write preset", "checker", task7WriteBody, http.StatusForbidden, ""},
+		{"maker + write preset", "maker", task7WriteBody, http.StatusOK, "write"},
+		{"maker + read preset", "maker", task7ReadBody, http.StatusOK, "read"},
+		{"checker + ad-hoc target (no preset)", "checker", task7AdhocBody, http.StatusOK, ""},
+		{"maker + ad-hoc target (no preset)", "maker", task7AdhocBody, http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authed := withBearer(client, mintJWT(t, cfg, testJWTUser, tc.role))
+			status, body := postToken(t, authed, srv.URL, tc.body)
+			if status != tc.wantStatus {
+				t.Fatalf("status %d, want %d (body %s)", status, tc.wantStatus, body)
+			}
+			if status == http.StatusForbidden {
+				if !strings.Contains(body, "checker role limited to read-only tokens") {
+					t.Errorf("403 body = %s, want the checker read-only error", body)
+				}
+				return
+			}
+			// 200 rows: the stored payload carries the resolved access
+			// level (the gate must not distort access resolution).
+			var issued struct {
+				Token string `json:"token"`
+			}
+			if err := json.NewDecoder(strings.NewReader(body)).Decode(&issued); err != nil {
+				t.Fatalf("decode 200 body %s: %v", body, err)
+			}
+			p, err := vs.GetDeleteToken(ctx, issued.Token)
+			if err != nil || p == nil {
+				t.Fatalf("GetDeleteToken: p=%v err=%v", p, err)
+			}
+			if p.Access != tc.wantAccess {
+				t.Errorf("stored access = %q, want %q", p.Access, tc.wantAccess)
+			}
+		})
+	}
+}
+
+// TestTokenMintRequiresJWT (Task 7): POST /api/token without a bearer JWT is
+// 401 — no credential at all, AND the retired control-plane X-Api-Key header
+// alone (the pre-Task-7 mint auth) must NOT authenticate a mint.
+func TestTokenMintRequiresJWT(t *testing.T) {
+	srv, client, _, _ := newPresetTestAPIServer(t)
+
+	if status, body := postToken(t, client, srv.URL, task7ReadBody); status != http.StatusUnauthorized {
+		t.Errorf("no auth: status %d, want 401 (body %s)", status, body)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/token", strings.NewReader(task7ReadBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Api-Key", "retired-key")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/token with X-Api-Key: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("X-Api-Key mint: status %d, want 401 (control-plane API key retired)", resp.StatusCode)
+	}
+}
+
+// TestTokenMintDenylistedJWT401 (Task 7 CARRY-FORWARD from the Task 4
+// review): a logged-out (denylisted) bearer must NOT be able to mint — POST
+// /api/token answers 401 even though the token's signature is still valid.
+// The denylist consult lives in requireJWT (Task 6), which now guards the
+// mint route, so revocation and mint share ONE auth path.
+func TestTokenMintDenylistedJWT401(t *testing.T) {
+	srv, client, _, _ := newPresetTestAPIServer(t)
+	tok := loginJWT(t, client, srv.URL, testJWTUser, testJWTPassword)
+	authed := withBearer(client, tok)
+
+	// Sanity: the fresh token mints.
+	if status, body := postToken(t, authed, srv.URL, task7ReadBody); status != http.StatusOK {
+		t.Fatalf("pre-logout mint: status %d, want 200 (body %s)", status, body)
+	}
+	// Logout denylists the token's jti (Task 6 handleLogout).
+	resp, err := authed.Post(srv.URL+"/api/logout", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /api/logout: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/logout: status %d, want 200", resp.StatusCode)
+	}
+	// The SAME token, now denylisted → the mint route must refuse it.
+	if status, body := postToken(t, authed, srv.URL, task7ReadBody); status != http.StatusUnauthorized {
+		t.Errorf("denylisted mint: status %d, want 401 (body %s)", status, body)
 	}
 }

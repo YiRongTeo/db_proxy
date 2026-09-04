@@ -2,7 +2,6 @@ http:
   addr: ":8080"
   static_dir: "./web/dist/web/browser"
 api:
-  api_key: ""                 # DEPRECATED (JWT conversion): retired in Task 7 — control-plane mint auth becomes bearer-JWT only. Keep empty; do NOT set ZT_API_API_KEY going forward.
   token_ttl_seconds: 300
   # token_mode (Task 9.13; env ZT_API_TOKEN_MODE): the DEFAULT token flavor
   # when a mint request carries no mode and the target preset declares none.

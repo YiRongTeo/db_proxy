@@ -1,10 +1,10 @@
 package api
 
 // JWT conversion (Task 5): self-issued HS256 bearer tokens are the Control
-// Plane's request credential. requireJWT guards the session-required routes
-// (/api/me, /api/db-presets, /api/kill, /api/sessions, /ws/checker),
-// replacing the legacy UI-session middleware (removed in Task 4); the Valkey
-// jti denylist (Task 6) revokes tokens.
+// Plane's request credential. requireJWT guards the authenticated routes
+// (/api/me, /api/db-presets, /api/token since Task 7, /api/kill,
+// /api/sessions, /ws/checker), replacing the legacy UI-session middleware
+// (removed in Task 4); the Valkey jti denylist (Task 6) revokes tokens.
 //
 // The token carries the principal in the sub claim plus an explicit
 // maker|checker role claim. requireJWT verifies signature + exp + iss + aud

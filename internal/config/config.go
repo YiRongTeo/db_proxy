@@ -81,7 +81,6 @@ type ValkeyConfig struct {
 type ControlConfig struct {
 	HTTPAddr  string
 	StaticDir string
-	APIKey    string
 	TokenTTL  int
 	// TokenMaxUses (Task 9.12): connection budget per issued token — 1 =
 	// single-use (default); >1 lets GUI clients (SSMS/DBeaver) open their
@@ -354,7 +353,6 @@ func LoadControl(path string) (*ControlConfig, error) {
 	cfg := &ControlConfig{
 		HTTPAddr:        v.GetString("http.addr"),
 		StaticDir:       v.GetString("http.static_dir"),
-		APIKey:          v.GetString("api.api_key"),
 		TokenTTL:        v.GetInt("api.token_ttl_seconds"),
 		TokenMaxUses:    v.GetInt("api.token_max_uses"),
 		TokenMode:       v.GetString("api.token_mode"),

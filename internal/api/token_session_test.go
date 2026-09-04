@@ -218,9 +218,9 @@ func TestTokenIssueListsPendingSession(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// The /api/token bare route resolves the bearer principal
-			// (Task 4) and GET /api/sessions below is requireJWT-guarded —
-			// the same client's bearer drives both.
+			// The /api/token route is requireJWT-guarded (Task 7), as is
+			// GET /api/sessions below — the same client's bearer drives
+			// both.
 			authed := withBearer(client, mintJWT(t, cfg, tc.user, "maker"))
 			userCh := subscribeAPI(t, vs, "queries:"+tc.user)
 			body := fmt.Sprintf(`{"username":%q,"db_user":%q,"db_ip":"127.0.0.1","db_port":"3307","db_type":%q,"ticket_id":"T-8-11"}`,

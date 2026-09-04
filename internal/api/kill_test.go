@@ -130,9 +130,9 @@ func TestKillPublishesCtlKill(t *testing.T) {
 // --- POST /api/token ticket requirement (Task 6.5, spec amendment 9b) ---
 
 // TestTokenRequiresTicketID: with a valid bearer principal (the /api/token
-// bare route resolves it since Task 4), a token request WITHOUT ticket_id →
-// 400 {"error":"ticket_id required"}; WITH ticket_id → 200 and the issued
-// tok:<token> key exists in Valkey with the ticket.
+// route is requireJWT-guarded since Task 7), a token request WITHOUT
+// ticket_id → 400 {"error":"ticket_id required"}; WITH ticket_id → 200 and
+// the issued tok:<token> key exists in Valkey with the ticket.
 func TestTokenRequiresTicketID(t *testing.T) {
 	srv, client, cfg := newTestAPIServer(t)
 	// Authenticate as the fixture user with a minted JWT.

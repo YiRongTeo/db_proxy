@@ -53,22 +53,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// handleToken issues a single-use DB token. Auth: valid bearer JWT OR API key.
+// handleToken issues a single-use DB token. Auth: a VALID BEARER JWT ONLY —
+// the route is wrapped in requireJWT (api.go), so by the time the handler
+// runs the principal session is always present (sessionFrom(r) != nil) and
+// the Valkey jti denylist has ALREADY been consulted: a logged-out token
+// cannot mint (Task 7 — one auth path for revocation and mint). The
+// control-plane API key (X-Api-Key) was retired in Task 7; there is no key
+// fallback.
 func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
-	// Bare route (no requireJWT wrapper): resolve the bearer principal
-	// ourselves to support the "JWT OR API key" auth model — the rewire that
-	// retired the UI-session branch (Task 4). A missing or unverifiable
-	// bearer simply leaves no principal; the API-key check below then decides
-	// (the same degrade semantics the old branch had).
-	if raw := bearerToken(r); raw != "" {
-		if sess, _, err := a.auth.parseJWT(raw); err == nil && sess != nil {
-			r = r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess))
-		}
-	}
-	if !a.auth.validAPIKey(r) && sessionFrom(r) == nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		return
-	}
 	var req struct {
 		Username string `json:"username"`
 		DBUser   string `json:"db_user"`
@@ -89,11 +81,13 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 		return
 	}
-	// Review 9.9 CRITICAL (a): a session-authenticated requester's username
-	// is BOUND to the session. The body username (if present) must match the
-	// session's — otherwise the request is rejected — and the token is
-	// ALWAYS issued for the session username. Only the API-key path (no
-	// session) trusts the body.
+	// Review 9.9 CRITICAL (a): the requester's username is BOUND to the
+	// bearer principal — requireJWT (Task 7) guarantees one, so this branch
+	// ALWAYS fires. The body username (if present) must match the
+	// principal's sub — otherwise the request is rejected — and the token is
+	// ALWAYS issued for the principal's username. Mint-for-others arrives
+	// only with the Phase-2 delegation rule (a principal cannot mint in
+	// another identity's name).
 	if sess := sessionFrom(r); sess != nil {
 		if req.Username != "" && req.Username != sess.Username {
 			http.Error(w, `{"error":"username does not match session"}`, http.StatusBadRequest)
@@ -147,13 +141,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "idle_seconds must be >= 0"})
 		return
 	}
-	// Review 9.9 MINOR: issuance throttle — bound token minting. Session
-	// requests are keyed by the (bound) username; API-key requests by the
-	// client IP (the key is shared, the IP is the only per-client signal).
+	// Review 9.9 MINOR: issuance throttle — bound token minting. Every
+	// request is bearer-authenticated (Task 7) and the username is bound to
+	// the principal, so the username is ALWAYS the throttle key (the
+	// API-key-by-client-IP branch was removed together with the key).
 	issueKey := req.Username
-	if sessionFrom(r) == nil {
-		issueKey = clientIP(r)
-	}
 	if a.issueLimiter.blocked(issueKey, time.Now()) {
 		http.Error(w, `{"error":"token issuance rate limited"}`, http.StatusTooManyRequests)
 		return
@@ -166,10 +158,24 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Task 8.11: stamp the session id at ISSUE time so the session is
 	// visible to checkers (status "pending") before the maker connects —
 	// the gating-deadlock fix. The data plane adopts this id on connect.
+	access := a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort)
+	// Task 7 role gate (user directive): a checker-role principal may mint
+	// only read-access (or ungated ad-hoc) tokens. A checker minting a
+	// write-access token would be its own maker — it could open a write
+	// session and watch itself, bypassing the data plane's SoD write gate
+	// (Task 8.6: a write session's queries are blocked unless a checker
+	// WATCHES it, and the checker can never watch its own session). No
+	// matching preset → access "" — the data plane treats absent access as
+	// read (no gate), so ad-hoc checker mints stay available, matching the
+	// plan's access semantics.
+	if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && access == "write" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker role limited to read-only tokens"})
+		return
+	}
 	payload := models.TokenPayload{
 		Username: req.Username, DBUser: req.DBUser, DBIP: req.DBIP,
 		DBPort: req.DBPort, DBType: req.DBType, TicketID: req.TicketID,
-		Access:    a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort),
+		Access:    access,
 		SessionID: models.NewSessionID(),
 		Mode:      mode,
 		// Task 9.13 per-token idle override: 0/absent = the data plane's

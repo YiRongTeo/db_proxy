@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -138,17 +137,6 @@ type authMiddleware struct {
 	// Review 9.9: per-(IP, username) failed-login backoff (wired in NewAPI;
 	// tests may inject a shortened limiter).
 	loginLimiter *rateLimiter
-}
-
-// validAPIKey reports whether the X-Api-Key header matches config, in
-// constant time (review 9.9 — a plain == comparison leaks the comparison
-// position through timing).
-func (a *authMiddleware) validAPIKey(r *http.Request) bool {
-	k := a.cfg.APIKey
-	if k == "" {
-		return false
-	}
-	return secureEqual(strings.TrimSpace(r.Header.Get("X-Api-Key")), k)
 }
 
 type sessionKey struct{}

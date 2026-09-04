@@ -120,8 +120,8 @@ func tokenBody(username string) string {
 // session — the token is issued for the session username.
 func TestTokenUsernameBindingAccept(t *testing.T) {
 	srv, client, cfg := newTestAPIServer(t)
-	// The /api/token bare route resolves the bearer principal (Task 4):
-	// authenticate as admin with a minted JWT.
+	// The mint route is requireJWT-guarded (Task 7): authenticate as admin
+	// with a minted JWT.
 	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
@@ -229,7 +229,6 @@ func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client, *conf
 		AuthPassword: testJWTPassword,
 		AuthRole:     "maker",
 		JWT:          testJWTBlock(),
-		APIKey:       "dev-key",
 		SessionTTL:   8,
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
@@ -243,20 +242,23 @@ func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client, *conf
 }
 
 // TestTokenIssuanceThrottle (review 9.9 MINOR): token minting is bounded per
-// user — after the (shortened) quota the next issue answers 429.
+// user — after the (shortened) quota the next issue answers 429. The mint
+// route is JWT-only since Task 7, so the throttle key is always the (bound)
+// bearer username.
 func TestTokenIssuanceThrottle(t *testing.T) {
-	srv, client, _ := newIssueRateLimitedAPI(t)
+	srv, client, cfg := newIssueRateLimitedAPI(t)
 
-	// API-key path (no session): keyed by client IP. The request body is a
-	// one-shot reader — reuse would hit "ContentLength with Body length 0"
-	// on the second Do, so each issue gets a fresh request.
+	// Bearer-authenticated mint (Task 7): the body username must match the
+	// token's sub, and that username IS the throttle key. The request body
+	// is a one-shot reader — reuse would hit "ContentLength with Body
+	// length 0" on the second Do, so each issue gets a fresh request.
+	authed := withBearer(client, mintJWT(t, cfg, "maker1", "maker"))
 	issue := func() (*http.Response, error) {
 		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/token", strings.NewReader(tokenBody("maker1")))
 		if err != nil {
 			t.Fatalf("new request: %v", err)
 		}
-		req.Header.Set("X-Api-Key", "dev-key")
-		return client.Do(req)
+		return authed.Do(req)
 	}
 	for i := 0; i < 2; i++ {
 		resp, err := issue()
