@@ -20,7 +20,8 @@ containers already exist (assumed up from Phase 0). The two `go run` boots + fir
 
 The three containers (`valkey`, `mysql-test`, `pg-test`) are the **only** external services for the
 default plaintext posture. Phase 7 (TLS/sentinel, §6) adds two optional ones: `valkey-tls` and
-`valkey-sentinel`. All commands below run from the repo root:
+`valkey-sentinel`. Phase 9 (Task 9.14, Oracle — **on a DEDICATED proxy port** `:1522`) adds
+`oracle-test`. All commands below run from the repo root:
 
 ```bash
 cd /d/AI/hermes/Project/Project-D        # Windows: cd D:\AI\hermes\Project\Project-D
@@ -244,6 +245,61 @@ NEVER sets the DONE_FINAL bit on query responses — completion is the message
 EOM after a DONE-family token (documented in `mssql_capture.go`).
 ATTENTION (`0x06`) / LOGOUT (`0x0E`) pass through untouched; the maker
 write-gate slots into the client→backend sniff (Task 9.4).
+
+### 1.5 Oracle 23c Free test backend (`oracle-test`, host port 1521)
+
+Task 9.14: TNS test backend. The data plane serves Oracle on a **dedicated
+proxy listener** (`listen.oracle_addr`, default `:1522`) — protocol-isolated
+from the shared `:3306` classifier. Image `gvenzl/oracle-free:23-slim`
+(~2–3 GB, free license, needs ~2 GB RAM). `ORACLE_PASSWORD` sets the SYS
+password; the PDB is `FREEPDB1`; the DB service is `FREE`.
+
+```bash
+docker run -d --name oracle-test -p 1521:1521 -e ORACLE_PASSWORD='SysPassword123' gvenzl/oracle-free:23-slim
+# readiness (first boot takes 2–5 min): the slim image has no HEALTHCHECK —
+for i in $(seq 1 60); do docker exec oracle-test bash -lc "echo 'SELECT 1 FROM dual;' | sqlplus -S sys/SysPassword123@localhost:1521/FREEPDB1 as sysdba" >/dev/null 2>&1 && break; sleep 5; done
+```
+
+Seed users + demo table (idempotent; run the SQL from `tests/oracle-seed.sql`
+— RO_USER/ro_pw = SELECT-only, RW_USER/rw_pw = write, table `DEMO_ITEMS`
+owned by RW_USER with a public synonym so both users resolve it):
+
+```bash
+docker exec -i oracle-test bash -lc "sqlplus -S sys/SysPassword123@localhost:1521/FREEPDB1 as sysdba" < tests/oracle-seed.sql
+docker exec oracle-test bash -lc "echo 'SELECT COUNT(*) FROM demo_items;' | sqlplus -S ro_user/ro_pw@localhost:1521/FREEPDB1"   # → 3
+```
+
+Wire note: Oracle clients negotiate native encryption (O5LOGON) — the
+plaintext posture requires the client to disable it (recipes per client
+land with the OracleProxy).
+
+### 1.5.1 Through the proxy (JDBC-family clients — verified 2026-09-02)
+
+The proxy terminates the TNS login on both legs (the token is the
+credential; the client's password is never verified) and byte-relays
+post-auth traffic. **JDBC-family clients** (go-ora, ojdbc, SQL Developer,
+DBeaver Oracle) are fully supported — verified end-to-end with a go-ora
+client through the proxy:
+
+```bash
+# mint a token, then point any JDBC client at the proxy:
+#   host 127.0.0.1, port 1522 (listen.oracle_addr), service FREEPDB1
+#   user = <token>, password = anything
+go run ./cmd/control &   # or your running control plane
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
+  -H 'Content-Type: application/json' -H 'X-Api-Key: dev-key-change-me' \
+  -d '{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1521","db_type":"oracle","ticket_id":"E2E-1"}'
+  | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+# go-ora DSN: oracle://<TOKEN>:x@127.0.0.1:1522/FREEPDB1
+```
+
+**OCI-family clients (sqlplus)**: the backend leg authenticates with the
+real `db_user` credentials, but the client leg replays mirrored auth
+responses — the 23c OCI mutual-auth handshake verifies `AUTH_SVR_RESPONSE`
+on the client, so sqlplus fails at login (ORA-01017/ORA-28041). Use a
+JDBC-family client (go-ora, DBeaver, SQL Developer) through the proxy, or
+sqlplus directly against the backend (`:1521`) when the proxy isn't
+required.
 
 ---
 
@@ -499,8 +555,49 @@ bogus token → `tokens_rejected_total{reason=invalid} +1`, `connections_total{r
 
 ## 3. Issue a token (curl)
 
-Tokens are single-use, TTL 300 s, stored in Valkey (`tok:<token>`), consumed atomically on first
+Tokens are single-use by default, TTL 300 s, stored in Valkey (`tok:<token>`), consumed atomically on first
 connection. **One token = one connection** — get a fresh token per connect.
+
+**Multi-use budget (Task 9.12, option-2).** `api.token_max_uses` in
+`configs/control.yaml` (env `ZT_TOKEN_MAX_USES`, default **1** = single-use)
+sets how many connections one token may open before it dies. GUI clients
+(SSMS / DBeaver / Azure Data Studio) open several connections per session
+automatically (Object Explorer + auxiliary + query windows), so with the
+default budget their second connection fails with `Login failed for user
+'sess_…'` (18456) — set `token_max_uses: 4` (or `ZT_API_TOKEN_MAX_USES=4`;
+the short alias `ZT_TOKEN_MAX_USES` also works) for
+those clients. Each use is still atomic (a stolen token can open at most N
+connections within the TTL), and the TTL still bounds the window.
+
+**Session tokens (Task 9.13, option-A — the GUI-native flavor).** A
+session-mode token (`"mode":"session"` on POST /api/token, a preset's
+`token_mode: session`, or `api.token_mode: session` as the deployment
+default) is:
+
+- **Not consumed** — one token opens ANY number of connections (SSMS's
+  connection churn is unbounded: Object Explorer, query windows, pooling).
+- **IP-locked** — stamped with the issuer's address at mint; every
+  connection must come from that address (loopback-normalized), else the
+  login is rejected like an invalid token.
+- **TTL 0 = INFINITE** (`api.session_token_ttl_seconds: 0`, the default) —
+  the token lives until REVOKED. With a finite value it dies at the TTL.
+- **Live-revocable** — deleting `tok:<token>` by ANY means (control-plane
+  kill, `valkey-cli del`, an operator script) closes every running session
+  bound to it: instantly via valkey keyspace notifications
+  (`notify-keyspace-events KEx`) when the server publishes them, otherwise
+  within `session.revoke_poll_seconds` (default 1 s, data.yaml). The kill
+  endpoint also deletes the key, so kill == revoke.
+- **Policed by the data plane** (data.yaml `session.*`): `idle_seconds`
+  (default 1800 — the safety valve: a forgotten GUI window cannot pin a
+  backend connection forever; **applies to every token mode**, single-use
+  included), `max_lifetime_seconds` (0 = off), and `revoke_poll_seconds`
+  (1). A mint request can carry `"idle_seconds": N` to override the
+  default for that token (0/absent = follow the data-plane default).
+
+Security posture: a stolen session token grants at most the maker's own
+address and time window; revocation is explicit and converges on one
+invariant — **no key = no session**. The checker gate, SoD watch and audit
+are unchanged (the session id is stamped at mint as before).
 
 ### 3.1 API-key flavor (external systems)
 
@@ -613,6 +710,13 @@ the session again.
 **different user** than the session's maker. The WS hub rejects a maker's attempt to watch their own
 session with a **1008 policy-violation close** (no `watch:<sid>` lease is created), and also rejects
 `sess:<sid>` channels whose session record is missing/expired (fail-closed). The checker dashboard
+
+**Extra UI users (Task 9.13):** the control plane supports additional accounts beyond the primary
+`auth.username/password` pair via the optional `auth.users` list in `configs/control.yaml`
+(passwords are `${VAR}` placeholders from the environment, e.g.
+`ZT_AUTH_CHECKER_PASSWORD` — same fail-fast rule as the primary pair). The committed config ships
+a dedicated **`checker`** account for SoD testing: maker = `admin`, checker = `checker`
+(two browsers/profiles — the checker must NOT be the maker).
 shows the server's reason in a banner. Only the session's maker identity is special — the live-all
 feed (`channel=*`) and user/ticket channels are unaffected.
 

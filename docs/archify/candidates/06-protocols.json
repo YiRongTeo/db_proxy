@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Wire Protocols on One Port — Detection → Handshake → Relay",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1240, 480],
+    "views": [
+      { "id": "detect-flow", "label": "Detection + handshake", "focus": ["client", "sniff", "mssql", "pg", "mysql"], "note": "One listener, three wire protocols, decided by the first client bytes." },
+      { "id": "relay-flow", "label": "Relay + events", "focus": ["relay", "events"], "note": "Byte-exact relay with passive capture; audit events fan out per session." }
+    ]
+  },
+  "components": [
+    { "id": "client", "type": "external", "label": "DB Client", "sublabel": "mysql / psql / sqlcmd", "pos": [30, 250], "size": [140, 66] },
+    { "id": "sniff", "type": "backend", "label": "Protocol Sniffer", "sublabel": "first client byte :3306", "tag": "0x12 · 0x00 · silence", "pos": [270, 250], "size": [150, 70] },
+    { "id": "mssql", "type": "backend", "label": "MSSQL Proxy", "sublabel": "prelogin → Login7", "pos": [540, 110], "size": [150, 64] },
+    { "id": "pg", "type": "backend", "label": "PG Proxy", "sublabel": "startup → auth", "pos": [540, 250], "size": [150, 64] },
+    { "id": "mysql", "type": "backend", "label": "MySQL Proxy", "sublabel": "server-first handshake", "pos": [540, 390], "size": [150, 64] },
+    { "id": "relay", "type": "backend", "label": "Byte-Exact Relay", "sublabel": "passive capture + audit", "pos": [810, 250], "size": [150, 70] },
+    { "id": "events", "type": "messagebus", "label": "Event Channels", "sublabel": "queries:user/ticket/sess", "pos": [1060, 250], "size": [150, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Data plane :3306", "wraps": ["sniff", "mssql", "pg", "mysql", "relay"], "pad": 10 }
+  ],
+  "connections": [
+    { "id": "client-connect", "from": "client", "to": "sniff", "label": "connect", "variant": "emphasis", "fromSide": "right", "toSide": "left", "labelAt": [215, 268] },
+    { "id": "sniff-mssql", "from": "sniff", "to": "mssql", "label": "0x12", "fromSide": "right", "toSide": "left", "labelAt": [440, 130] },
+    { "id": "sniff-pg", "from": "sniff", "to": "pg", "label": "0x00", "fromSide": "right", "toSide": "left", "labelAt": [440, 268] },
+    { "id": "sniff-mysql", "from": "sniff", "to": "mysql", "label": "silence (200 ms)", "fromSide": "right", "toSide": "left", "labelAt": [430, 400] },
+    { "id": "mssql-relay", "from": "mssql", "to": "relay", "variant": "emphasis", "fromSide": "right", "toSide": "left", "labelAt": [735, 130] },
+    { "id": "pg-relay", "from": "pg", "to": "relay", "variant": "emphasis", "fromSide": "right", "toSide": "left", "labelAt": [735, 268] },
+    { "id": "mysql-relay", "from": "mysql", "to": "relay", "variant": "emphasis", "fromSide": "right", "toSide": "left", "labelAt": [735, 400] },
+    { "id": "relay-events", "from": "relay", "to": "events", "label": "audit events", "variant": "dashed", "fromSide": "right", "toSide": "left", "labelAt": [1000, 268] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Byte-exact relay", "items": ["Client ↔ backend traffic forwarded verbatim", "The sniffed copy is parsed separately and never alters the stream", "Statement classification: first keyword → select / insert / update / delete / other"] },
+    { "dot": "emerald", "title": "Output capture (flag-gated)", "items": ["log_query_output: true adds columns + rows (max 100, 512 chars/cell, 64 KB/event)", "Caps set the truncated flag instead of failing", "Context-only logging by default — SQL yes, result rows no"] },
+    { "dot": "amber", "title": "MSSQL specifics", "items": ["Login7 password obfuscation: per-UTF-16LE-byte nibble-swap ^ 0xA5", "TLS handshake rides inside TDS type-0x12; Login7 is a bare TLS record", "Proxy-swallowed ATTENTION ack keeps the client's protocol state clean"] }
+  ]
+}

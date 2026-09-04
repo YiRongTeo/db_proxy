@@ -15,6 +15,8 @@
 
 > **Maintenance note:** pages 2 and 5 describe the two API surfaces most likely to change. Their contracts (headers, keys, status codes, payload fields) are spelled out in tables so edits can be made without re-deriving the wire behaviour.
 
+> **Interactive diagrams:** an [Archify HTML diagram set](archify/README.md) mirrors these pages as explorable, self-contained HTML (light/dark, pan/zoom, export). Keep it in sync when editing the change-prone pages 2 and 5.
+
 ## Quick orientation
 
 - **Control plane** — HTTPS API + WebSocket hub + Angular SPA (`:8080`).

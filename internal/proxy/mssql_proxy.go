@@ -39,11 +39,16 @@ type mssqlSession struct {
 	spid        uint16               // backend SPID from the login-response ENVCHANGE token (ATTENTION header, Task 9.4)
 	attnPending bool                 // a proxy-initiated ATTENTION is outstanding: the backend's DONE_ATTN ack must be swallowed (Task 9.4 round-1 fix)
 	attnAt      time.Time            // when the proxy attention was sent — the swallow expectation expires after mssqlAttnTimeout (Task 9.10)
-	writeMu     sync.Mutex           // serializes ALL socket writes: relay forward, gate flush, drain replies, ATTENTION (Task 9.4/9.10)
-	gateMu      sync.Mutex           // Task 9.4 grace-hold state guard (mirrors mysqlSession.gateMu)
-	gate        mssqlGateState       // Task 9.4 maker write-gate grace hold (mirrors mysqlGateState)
-	client      net.Conn             // (possibly TLS-wrapped) client conn
-	backend     net.Conn             // (possibly TLS-wrapped) backend conn
+	shortDone   bool                 // client negotiated TDS < 7.2 (e.g. SQLOLEDB/7.1): DONE tokens are the legacy 9-byte shape, both directions (version passthrough fix, 2026-08-26)
+	// token (Task 9.13) is the raw token string for SESSION-mode sessions
+	// (the liveness/revocation handle). Empty for single-use sessions —
+	// their key is consumed at login and there is nothing to watch.
+	token   string
+	writeMu sync.Mutex     // serializes ALL socket writes: relay forward, gate flush, drain replies, ATTENTION (Task 9.4/9.10)
+	gateMu  sync.Mutex     // Task 9.4 grace-hold state guard (mirrors mysqlSession.gateMu)
+	gate    mssqlGateState // Task 9.4 maker write-gate grace hold (mirrors mysqlGateState)
+	client  net.Conn       // (possibly TLS-wrapped) client conn
+	backend net.Conn       // (possibly TLS-wrapped) backend conn
 }
 
 // MSSQLProxy runs TDS (SQL Server) sessions on the Data Plane (Task 9.2):
@@ -398,7 +403,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err != nil {
 		p.log.Error("token lookup", "err", err, "client", clientAddr)
 		p.metrics.ConnectionsTotal("mssql", "rejected")
-		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token validation failed.", token)))
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token validation failed.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
 		return
 	}
 	if tok == nil {
@@ -408,14 +413,24 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		p.metrics.TokensRejected("invalid")
 		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Warn("invalid or expired token", "client", clientAddr)
-		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s'.", token)))
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s'.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
 		return
 	}
 	if tok.DBType != "mssql" {
 		p.metrics.TokensRejected("wrong_db_type")
 		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
-		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token not valid for this protocol.", token)))
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': token not valid for this protocol.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
+		return
+	}
+	// Task 9.13 session tokens: IP lock. A session token only opens
+	// connections from the address stamped at issue time; anything else is
+	// rejected like an invalid token (uniform wire error, fail-closed).
+	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+		p.metrics.TokensRejected("ip_mismatch")
+		p.metrics.ConnectionsTotal("mssql", "rejected")
+		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': %s.", token, reason), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
 		return
 	}
 	p.metrics.TokensValidated()
@@ -428,13 +443,13 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	if err != nil {
 		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
-		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token)))
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
 		return
 	}
 	defer backend.Close()
 	if len(loginResp) == 0 {
 		p.log.Error("backend login: empty response", "client", clientAddr)
-		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token)))
+		_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
 		return
 	}
 
@@ -475,7 +490,11 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		tok:       tok,
 		access:    tok.Access,
 		spid:      scanLoginSPID(loginResp),
+		shortDone: li.tdsVersion < mssqlLegacyDoneMaxTDSVersion,
 		closer:    func() { client.Close(); backend.Close() },
+	}
+	if tok.Mode == "session" {
+		s.token = token
 	}
 	p.registerSession(s)
 	p.metrics.ConnectionsTotal("mssql", "ok")
@@ -621,7 +640,7 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 		// switches to raw pass-through), login response = bare TLS record
 		// read through the TLS conn.
 		tds.bare = true
-		login7 := buildLogin7(li.hostname, t.DBUser, li.appname, li.server, li.database, obfuscatePassword(pw))
+		login7 := buildLogin7(li.hostname, t.DBUser, li.appname, li.server, li.database, obfuscatePassword(pw), li.tdsVersion, li.packetSize)
 		if err := writeTDSPacket(tlsConn, tdsLogin7, login7); err != nil {
 			conn.Close()
 			return nil, nil, nil, false, "", err
@@ -638,7 +657,7 @@ func connectMSSQLBackend(ctx context.Context, t *models.TokenPayload, res CredRe
 	}
 
 	// PLAINTEXT leg: REWRITTEN LOGIN7 as a regular 0x10 TDS packet.
-	login7 := buildLogin7(li.hostname, t.DBUser, li.appname, li.server, li.database, obfuscatePassword(pw))
+	login7 := buildLogin7(li.hostname, t.DBUser, li.appname, li.server, li.database, obfuscatePassword(pw), li.tdsVersion, li.packetSize)
 	if err := writeTDSPacket(conn, tdsLogin7, login7); err != nil {
 		conn.Close()
 		return nil, nil, nil, false, "", err
@@ -695,8 +714,8 @@ func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
 // ... Login failed for user 'x'." failure. The token value in the message is
 // the client's OWN credential, echoed back only to the client that presented
 // it.
-func buildLoginError(msg string) []byte {
-	return buildTDSErrorToken(msg, 18456, 1, 14)
+func buildLoginError(msg string, shortDone bool) []byte {
+	return buildTDSErrorToken(msg, 18456, 1, 14, shortDone)
 }
 
 // buildTDSErrorToken builds a TABULAR RESULT token stream carrying one
@@ -708,7 +727,11 @@ func buildLoginError(msg string) []byte {
 // (buildLoginError, 18456/1/14) and for the Task 9.4 maker write-gate
 // rejections (18456/1/14 — the same access-denied family; the gating text
 // names the session).
-func buildTDSErrorToken(msg string, errNumber uint32, errState, errClass byte) []byte {
+//
+// shortDone selects the DONE tail shape (version passthrough fix,
+// 2026-08-26): clients that negotiated TDS < 7.2 (SQLOLEDB/7.1) expect the
+// LEGACY 9-byte DONE (4-byte row count), modern clients the 13-byte form.
+func buildTDSErrorToken(msg string, errNumber uint32, errState, errClass byte, shortDone bool) []byte {
 	const serverName = "zerotrust-proxy"
 	utf16le := func(s string) []byte {
 		units := utf16.Encode([]rune(s))
@@ -748,12 +771,17 @@ func buildTDSErrorToken(msg string, errNumber uint32, errState, errClass byte) [
 	// DONE token: type(1) + status(2, LE) + curcmd(2) + rowcount(8). The
 	// real server ends a failed command with status 0x0002 (DONE_ERROR
 	// only — NO DONE_FINAL bit; captured `fd 02 00` tail) and the message
-	// EOM is what ends the response.
+	// EOM is what ends the response. shortDone (TDS < 7.2 negotiation)
+	// switches the row count to the legacy 4-byte form (9-byte DONE).
 	status := uint16(tdsDoneError) // 0x0002
+	rowLen := 8
+	if shortDone {
+		rowLen = 4
+	}
 	out = append(out, 0xFD)
 	out = append(out, byte(status), byte(status>>8))
 	out = append(out, 0x00, 0x00) // curcmd
-	out = append(out, make([]byte, 8)...)
+	out = append(out, make([]byte, rowLen)...)
 	return out
 }
 
@@ -766,11 +794,15 @@ func scanLoginSPID(buf []byte) uint16 {
 	for pos := 0; pos < len(buf); {
 		t := buf[pos]
 		switch t {
-		case 0xFD, 0xFE, 0xFF: // DONE family — fixed 13-byte tail
+		case 0xFD, 0xFE, 0xFF: // DONE family — 13-byte modern, 9-byte legacy (TDS < 7.2)
+			doneLen := 13
 			if pos+13 > len(buf) {
-				return 0
+				if pos+9 > len(buf) {
+					return 0
+				}
+				doneLen = 9
 			}
-			pos += 13
+			pos += doneLen
 		case 0xAA, 0xAB, 0xAD, 0xAE, 0xE3, 0xE4: // length-prefixed tokens
 			if pos+3 > len(buf) {
 				return 0

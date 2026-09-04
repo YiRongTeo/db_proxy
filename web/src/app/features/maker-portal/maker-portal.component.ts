@@ -49,7 +49,7 @@ export class MakerPortalComponent implements OnInit {
   // Form state (signals, per house style)
   readonly selectedPreset = signal<string | null>(null);
   readonly ticketId = signal('');
-  readonly dbType = signal<'mysql' | 'postgres'>('mysql');
+  readonly dbType = signal<'mysql' | 'postgres' | 'mssql' | 'oracle'>('mysql');
   readonly dbUser = signal('');
   readonly dbIp = signal('');
   readonly dbPort = signal('');
@@ -93,7 +93,13 @@ export class MakerPortalComponent implements OnInit {
       return;
     }
     this.selectedPreset.set(name);
-    this.dbType.set(preset.db_type === 'postgres' ? 'postgres' : 'mysql');
+    // Phase 9 (Task 9.1): pass the preset's db_type through VERBATIM.
+    // The pre-Phase-9 ternary (db_type === 'postgres' ? 'postgres' : 'mysql')
+    // collapsed mssql → mysql, so an MSSQL preset minted a mysql token aimed
+    // at the mssql port — the data plane found no credential key
+    // (mysql:ro_user@127.0.0.1:1434) and answered "backend unavailable".
+    const t = preset.db_type;
+    this.dbType.set(t === 'mysql' || t === 'postgres' || t === 'mssql' || t === 'oracle' ? t : 'mysql');
     this.dbUser.set(preset.db_user);
     this.dbIp.set(preset.db_ip);
     this.dbPort.set(preset.db_port);

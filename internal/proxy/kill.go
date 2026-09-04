@@ -48,10 +48,42 @@ type Killer struct {
 	pg    *PGProxy
 	mssql *MSSQLProxy // Task 9.2: TDS sessions (kill-query N/A until 9.4)
 
+	// vs (Task 9.13) is the store used to DELETE the session token's key
+	// when a connection-mode kill lands — revocation converges on "no key
+	// = no session": killing once both closes the live conns AND prevents
+	// any reconnect (new connections fail the consume, the sweeper closes
+	// stragglers). nil (tests) skips the deletion.
+	vs Store
+
 	// metrics (Task 9.8): kills.total is recorded here — the ctl:kill
 	// handler — per APPLIED kill (successful KillSession/KillQuery), by
 	// mode. nil = metrics disabled (every call a no-op).
 	metrics *metrics.Metrics
+}
+
+// SetStore wires the revocation store (the kill path deletes the session
+// token's key; nil skips deletion — test-only proxies need not care).
+func (k *Killer) SetStore(vs Store) { k.vs = vs }
+
+// TokenForSession returns the raw session-mode token for a registered
+// session on ANY plane ("" when unknown or single-use).
+func (k *Killer) TokenForSession(id string) (string, bool) {
+	if k.mysql != nil {
+		if tok, ok := k.mysql.TokenForSession(id); ok && tok != "" {
+			return tok, true
+		}
+	}
+	if k.pg != nil {
+		if tok, ok := k.pg.TokenForSession(id); ok && tok != "" {
+			return tok, true
+		}
+	}
+	if k.mssql != nil {
+		if tok, ok := k.mssql.TokenForSession(id); ok && tok != "" {
+			return tok, true
+		}
+	}
+	return "", false
 }
 
 func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy) *Killer {
@@ -140,6 +172,15 @@ func (k *Killer) HandleKill(msg []byte) (line, sid string) {
 		}
 		return "kill: unknown session", sid
 	case KillModeConnection:
+		// Task 9.13: revoke the token FIRST (idempotent) — no reconnect
+		// can re-establish the session — then close the live conns. If
+		// the session vanished between lookup and kill, the sweeper
+		// closes the straggler within one poll interval anyway.
+		if tok, ok := k.TokenForSession(sid); ok && k.vs != nil {
+			ctx, cancel := storeCallCtx()
+			_ = k.vs.DeleteToken(ctx, tok)
+			cancel()
+		}
 		if k.KillSession(sid) {
 			k.metrics.KillsTotal(KillModeConnection)
 			return "session killed", sid

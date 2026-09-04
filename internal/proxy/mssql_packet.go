@@ -23,9 +23,16 @@ const (
 	tdsHeaderLen  = 8
 	tdsPacketSize = 4096
 	tdsVersion740 = 0x74000004 // TDS 7.4 — what sqlcmd v18 sends
-	tdsDoneFinal  = 0x0200     // DONE token status bit: message complete
-	tdsDoneError  = 0x0002     // DONE token status bit: error occurred
-	tdsDoneAttn   = 0x0020     // DONE token status bit: attention acknowledged (MS-TDS 2.2.7.10)
+	// mssqlLegacyDoneMaxTDSVersion: clients declaring a TDS version BELOW
+	// this negotiate the legacy wire shape — SQL Server answers them with
+	// SHORT 9-byte DONE tokens (4-byte row count) instead of the modern
+	// 13-byte form (live-verified 2026-08-26: SQLOLEDB declares
+	// 0x71000001; the server echoed it and used 9-byte DONEs). Every
+	// place the proxy BUILDS or PARSES a DONE token must branch on this.
+	mssqlLegacyDoneMaxTDSVersion = 0x72000000
+	tdsDoneFinal                 = 0x0200 // DONE token status bit: message complete
+	tdsDoneError                 = 0x0002 // DONE token status bit: error occurred
+	tdsDoneAttn                  = 0x0020 // DONE token status bit: attention acknowledged (MS-TDS 2.2.7.10)
 )
 
 // tdsMaxHandshakeMsg caps the assembled size of a PRE-AUTH TDS message
@@ -257,6 +264,16 @@ type login7Info struct {
 	appname  string
 	server   string
 	database string
+	// Fixed-header values declared by the CLIENT, preserved verbatim on
+	// the backend login7 (version passthrough fix, 2026-08-26): the proxy
+	// previously forced TDS 7.4 here, so a legacy provider (SQLOLEDB
+	// declares 0x71000001) received a LOGINACK for a version it cannot
+	// parse — its DBMS Version property came back empty/garbage and
+	// HeidiSQL failed with "DBMS version is less than 7.0.0". Passing the
+	// client's declaration through lets the REAL server negotiate exactly
+	// as it would on a direct connection.
+	tdsVersion uint32
+	packetSize uint32
 }
 
 // login7 fixed header layout (MS-TDS 2.2.6.4): 36 bytes of fixed fields
@@ -316,17 +333,24 @@ func parseLogin7(payload []byte) (login7Info, error) {
 	if li.database, err = text(8); err != nil {
 		return li, err
 	}
+	li.tdsVersion = binary.LittleEndian.Uint32(payload[4:8])
+	li.packetSize = binary.LittleEndian.Uint32(payload[8:12])
 	return li, nil
 }
 
 // buildLogin7 builds the login7 the proxy sends to the real backend:
 // username = the token's real db_user, password = the resolver password
 // OBFUSCATED with the derived transform, database = the CLIENT-requested
-// database (kept so the session has the maker's default schema). The fixed
-// fields mirror the captured sqlcmd v18 login7 (TDS 7.4, packet size 4096,
-// option flags e0 03 00 10, LCID 0x0409); clientid is 0xFF like the
-// capture; no feature extensions are requested.
-func buildLogin7(hostname, username, appname, server, database string, obfuscatedPw []byte) []byte {
+// database (kept so the session has the maker's default schema). tdsVersion
+// and packetSize are the CLIENT's declared fixed-header values, passed
+// through verbatim (version passthrough fix, 2026-08-26): the server then
+// negotiates the TDS version exactly as it would on a direct connection,
+// so legacy providers (SQLOLEDB / TDS 7.1) get an ack they can parse while
+// modern clients (which declare 7.4 themselves) see byte-identical behavior
+// to the previous forced 7.4. The remaining fixed fields mirror the captured
+// sqlcmd v18 login7 (option flags e0 03 00 10, LCID 0x0409); clientid is
+// 0xFF like the capture; no feature extensions are requested.
+func buildLogin7(hostname, username, appname, server, database string, obfuscatedPw []byte, tdsVersion, packetSize uint32) []byte {
 	fields := []struct {
 		val string
 		raw []byte
@@ -346,8 +370,8 @@ func buildLogin7(hostname, username, appname, server, database string, obfuscate
 		}
 	}
 	payload := make([]byte, login7FixedLen+login7TableLen)
-	binary.LittleEndian.PutUint32(payload[4:8], tdsVersion740)
-	binary.LittleEndian.PutUint32(payload[8:12], tdsPacketSize)
+	binary.LittleEndian.PutUint32(payload[4:8], tdsVersion)
+	binary.LittleEndian.PutUint32(payload[8:12], packetSize)
 	payload[24] = 0xE0 // OptionFlags1 (fUseDB | fSetLang | fByteOrder | fChar | fFloat | fDumpLoad)
 	payload[25] = 0x03 // OptionFlags2 (fLanguage | fODBC)
 	payload[26] = 0x00 // TypeFlags
@@ -413,9 +437,18 @@ func scanLoginResponse(buf []byte) (done, loginOK bool, db string) {
 	for pos := 0; pos < len(buf); {
 		t := buf[pos]
 		switch t {
-		case 0xFD, 0xFE, 0xFF: // DONE / DONEINPROC / DONEPROC — fixed 9-byte tail
+		case 0xFD, 0xFE, 0xFF: // DONE / DONEINPROC / DONEPROC
+			// Modern (TDS >= 7.2) DONE is 13 bytes (8-byte rowcount);
+			// legacy (TDS < 7.2 — SQLOLEDB/7.1) is 9 bytes (4-byte
+			// rowcount). A live SQL Server answers a 7.1 client with
+			// the legacy shape even in the login response (version
+			// passthrough fix, 2026-08-26).
+			doneLen := 13
 			if pos+13 > len(buf) {
-				return false, loginOK, db
+				if pos+9 > len(buf) {
+					return false, loginOK, db
+				}
+				doneLen = 9
 			}
 			status := binary.LittleEndian.Uint16(buf[pos+1 : pos+3])
 			if t == 0xFD && status&tdsDoneFinal != 0 {
@@ -432,10 +465,10 @@ func scanLoginResponse(buf []byte) (done, loginOK bool, db string) {
 			// live capture: 389-byte login response, trailing
 			// `fd 00 00` (status 0x0000). Without this rule the harness
 			// waits forever for a second message the server never sends.
-			if t == 0xFD && pos+13 == len(buf) {
+			if t == 0xFD && pos+doneLen == len(buf) {
 				done = true
 			}
-			pos += 13
+			pos += doneLen
 		case 0xAA, 0xAB, 0xAD, 0xAE, 0xE3, 0xE4: // length-prefixed tokens
 			if pos+3 > len(buf) {
 				return false, loginOK, db

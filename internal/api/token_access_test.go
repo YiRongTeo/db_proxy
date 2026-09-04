@@ -154,14 +154,14 @@ func TestTokenAccessMSSQLPresets(t *testing.T) {
 	}
 }
 
-// TestTokenRejectsInvalidDBType: the mssql acceptance must not have loosened
-// the rejection — a db_type outside {mysql, postgres, mssql} still gets 422
-// with the canonical message.
+// TestTokenRejectsInvalidDBType: the mssql/oracle acceptance must not have
+// loosened the rejection — a db_type outside {mysql, postgres, mssql,
+// oracle} still gets 422 with the canonical message.
 func TestTokenRejectsInvalidDBType(t *testing.T) {
 	srv, client, _ := newPresetTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
-	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"oracle","ticket_id":"T-9-3"}`
+	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mongodb","ticket_id":"T-9-3"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST /api/token: %v", err)
@@ -171,7 +171,7 @@ func TestTokenRejectsInvalidDBType(t *testing.T) {
 		t.Fatalf("POST /api/token: status %d, want 422 (body %s)", resp.StatusCode, body)
 	}
 	got, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(got), "db_type must be mysql, postgres or mssql") {
+	if !strings.Contains(string(got), "db_type must be mysql, postgres, mssql or oracle") {
 		t.Errorf("error body = %s, want the canonical db_type message", got)
 	}
 }

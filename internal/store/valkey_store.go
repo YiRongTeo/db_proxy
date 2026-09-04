@@ -135,19 +135,77 @@ func (s *ValkeyStore) Ping(ctx context.Context) error {
 }
 
 // SetToken stores a token payload with a TTL (single-use semantics enforced
-// by the caller using GetDeleteToken).
+// by the caller using GetDeleteToken). ttl <= 0 stores the token WITHOUT an
+// expiry (session mode, Task 9.13): it lives until explicitly deleted.
 func (s *ValkeyStore) SetToken(ctx context.Context, token string, p models.TokenPayload, ttl time.Duration) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	return s.client.Do(ctx, s.client.B().Set().Key("tok:"+token).Value(string(data)).Ex(ttl).Build()).Error()
+	cmd := s.client.B().Set().Key("tok:" + token).Value(string(data))
+	if ttl > 0 {
+		return s.client.Do(ctx, cmd.Ex(ttl).Build()).Error()
+	}
+	return s.client.Do(ctx, cmd.Build()).Error()
 }
 
-// GetDeleteToken atomically reads and deletes a token. Returns (nil, nil)
-// when the token is absent or already consumed — this is the single-use gate.
+// DeleteToken removes a token key unconditionally (Task 9.13 live
+// revocation): the control-plane kill path and external operators both
+// revoke a session by deleting its key, and the data plane's token watchdog
+// closes the running session(s) when it notices. Missing key is not an
+// error.
+func (s *ValkeyStore) DeleteToken(ctx context.Context, token string) error {
+	return s.client.Do(ctx, s.client.B().Del().Key("tok:"+token).Build()).Error()
+}
+
+// TokenAlive reports whether a token key still exists (Task 9.13 session
+// liveness). Session tokens are not consumed, so this is the data plane's
+// revocation signal: false (deleted by any means, or expired) → the
+// watchdog closes the session.
+func (s *ValkeyStore) TokenAlive(ctx context.Context, token string) (bool, error) {
+	n, err := s.client.Do(ctx, s.client.B().Exists().Key("tok:"+token).Build()).AsInt64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// tokenConsumeScript atomically consumes ONE use of a token (Task 9.12
+// option-2 multi-use): returns the payload raw string and decrements the
+// remaining-use counter, deleting the key on the final use. Absent key →
+// nil (valkey.Nil). The TTL is preserved across decrements (SET would
+// otherwise drop it). max_uses absent or < 1 → treated as 1 (single-use).
+// Session-mode tokens (Task 9.13, p.mode == "session") are NOT consumed:
+// the key is returned untouched — they live until revoked (key deleted),
+// expiry, or the data plane's idle/max-lifetime enforcement.
+var tokenConsumeScript = valkey.NewLuaScript(`
+local raw = redis.call('GET', KEYS[1])
+if not raw then return nil end
+local p = cjson.decode(raw)
+if p.mode == 'session' then return raw end
+local uses = p.max_uses
+if uses == nil or uses < 1 then uses = 1 end
+if uses <= 1 then
+  redis.call('DEL', KEYS[1])
+else
+  p.max_uses = uses - 1
+  local ttl = redis.call('PTTL', KEYS[1])
+  if ttl and ttl > 0 then
+    redis.call('SET', KEYS[1], cjson.encode(p), 'PX', ttl)
+  else
+    redis.call('SET', KEYS[1], cjson.encode(p))
+  end
+end
+return raw`)
+
+// GetDeleteToken atomically consumes ONE use of a token and returns the
+// payload. The token is deleted on its final use — single-use tokens
+// (max_uses 0/absent/1) are deleted on the first consume, preserving the
+// historical zero-trust gate exactly. Returns (nil, nil) when the token is
+// absent or fully consumed.
 func (s *ValkeyStore) GetDeleteToken(ctx context.Context, token string) (*models.TokenPayload, error) {
-	raw, err := s.client.Do(ctx, s.client.B().Getdel().Key("tok:"+token).Build()).ToString()
+	res := tokenConsumeScript.Exec(ctx, s.client, []string{"tok:" + token}, []string{})
+	raw, err := res.ToString()
 	if errors.Is(err, valkey.Nil) {
 		return nil, nil
 	}

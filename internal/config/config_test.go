@@ -25,11 +25,14 @@ const (
 func setSecretEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ZT_AUTH_PASSWORD", "admin123")
+	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "checker123")
 	t.Setenv("ZT_CRED_MYSQL_RO_PASSWORD", "ro_pw")
 	t.Setenv("ZT_CRED_MYSQL_RW_PASSWORD", "rw_pw")
 	t.Setenv("ZT_CRED_PG_RO_PASSWORD", "ro_pw")
 	t.Setenv("ZT_CRED_MSSQL_RO_PASSWORD", "ro_pw")
 	t.Setenv("ZT_CRED_MSSQL_RW_PASSWORD", "rw_pw")
+	t.Setenv("ZT_CRED_ORACLE_RO_PASSWORD", "ro_pw")
+	t.Setenv("ZT_CRED_ORACLE_RW_PASSWORD", "rw_pw")
 }
 
 func TestLoadControl(t *testing.T) {
@@ -66,8 +69,8 @@ func TestLoadControl(t *testing.T) {
 	assertTLSDisabled(t, cfg.TLS)
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
-	if got := len(cfg.DBPresets); got != 5 {
-		t.Fatalf("len(DBPresets) = %d, want 5", got)
+	if got := len(cfg.DBPresets); got != 7 {
+		t.Fatalf("len(DBPresets) = %d, want 7", got)
 	}
 
 	wantPresets := []DBPreset{
@@ -78,6 +81,9 @@ func TestLoadControl(t *testing.T) {
 		// <dbtype>:<db_user>@<db_ip>:<db_port> matches data.yaml credentials.
 		{Name: "MSSQL read-only", DBType: "mssql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "read"},
 		{Name: "MSSQL read-write", DBType: "mssql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1434", Access: "write"},
+		// Task 9.14 Oracle — port 1521 matching the oracle-test container.
+		{Name: "Oracle read-only", DBType: "oracle", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "1521", Access: "read"},
+		{Name: "Oracle read-write", DBType: "oracle", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1521", Access: "write"},
 	}
 	for i, want := range wantPresets {
 		got := cfg.DBPresets[i]
@@ -102,6 +108,9 @@ func TestDBPresetAccessValues(t *testing.T) {
 		"PostgreSQL read-only": "read",
 		"MSSQL read-only":      "read",
 		"MSSQL read-write":     "write",
+		// Task 9.14 Oracle (dedicated proxy port :1522, backend :1521).
+		"Oracle read-only":  "read",
+		"Oracle read-write": "write",
 	}
 	for _, p := range cfg.DBPresets {
 		want, ok := wantAccess[p.Name]
@@ -158,8 +167,8 @@ func TestDBPresetJSONWireContract(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("json.Unmarshal(%s) error: %v", s, err)
 	}
-	if len(got) != 5 {
-		t.Fatalf("len = %d, want 5", len(got))
+	if len(got) != 7 {
+		t.Fatalf("len = %d, want 7", len(got))
 	}
 	wantKeys := []string{"name", "db_type", "db_user", "db_ip", "db_port", "access"}
 	for i, m := range got {
@@ -222,6 +231,9 @@ func TestLoadData(t *testing.T) {
 		// (Task 8.7), port 1434 matching the mssql-test container + presets.
 		"mssql:ro_user@127.0.0.1:1434": "ro_pw",
 		"mssql:rw_user@127.0.0.1:1434": "rw_pw",
+		// Task 9.14 Oracle — port 1521 matching the oracle-test container.
+		"oracle:ro_user@127.0.0.1:1521": "ro_pw",
+		"oracle:rw_user@127.0.0.1:1521": "rw_pw",
 	}
 	if got := len(cfg.Credentials); got != len(wantCreds) {
 		t.Fatalf("len(Credentials) = %d, want %d", got, len(wantCreds))
@@ -417,6 +429,75 @@ valkey:
 			t.Errorf("SentinelPassword = %q, want %q (ZT_VALKEY_SENTINEL_PASSWORD)", got, "env-sentpw")
 		}
 	})
+}
+
+// TestTokenMaxUsesEnvBinding (Task 9.12): api.token_max_uses is settable via
+// the config file (default 1 = single-use) AND via both env names —
+// ZT_API_TOKEN_MAX_USES (convention-derived) and the short alias
+// ZT_TOKEN_MAX_USES (first-set wins, long name preferred).
+func TestTokenMaxUsesEnvBinding(t *testing.T) {
+	base := `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+`
+	path := writeTempConfig(t, base)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(default) error: %v", err)
+	}
+	if cfg.TokenMaxUses != 1 {
+		t.Errorf("default TokenMaxUses = %d, want 1 (single-use)", cfg.TokenMaxUses)
+	}
+
+	t.Setenv("ZT_API_TOKEN_MAX_USES", "7")
+	cfg, err = LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(long env) error: %v", err)
+	}
+	if cfg.TokenMaxUses != 7 {
+		t.Errorf("TokenMaxUses = %d, want 7 (ZT_API_TOKEN_MAX_USES)", cfg.TokenMaxUses)
+	}
+
+	// Short alias alone (long name unset): must map to the same key.
+	orig, hadOrig := os.LookupEnv("ZT_API_TOKEN_MAX_USES")
+	if err := os.Unsetenv("ZT_API_TOKEN_MAX_USES"); err != nil {
+		t.Fatalf("Unsetenv(long): %v", err)
+	}
+	if hadOrig {
+		defer os.Setenv("ZT_API_TOKEN_MAX_USES", orig)
+	}
+	t.Setenv("ZT_TOKEN_MAX_USES", "9")
+	cfg, err = LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(short env) error: %v", err)
+	}
+	if cfg.TokenMaxUses != 9 {
+		t.Errorf("TokenMaxUses = %d, want 9 (ZT_TOKEN_MAX_USES alias)", cfg.TokenMaxUses)
+	}
+
+	// Both set: the convention-derived long name wins (BindEnv order).
+	t.Setenv("ZT_API_TOKEN_MAX_USES", "7")
+	cfg, err = LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(both env) error: %v", err)
+	}
+	if cfg.TokenMaxUses != 7 {
+		t.Errorf("TokenMaxUses = %d, want 7 (long name precedence)", cfg.TokenMaxUses)
+	}
+
+	// Empty long name is an EXPLICIT override (allow-empty philosophy): it
+	// shadows the alias and yields 0 → issue path falls back to single-use.
+	t.Setenv("ZT_API_TOKEN_MAX_USES", "")
+	cfg, err = LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(empty long env) error: %v", err)
+	}
+	if cfg.TokenMaxUses != 0 {
+		t.Errorf("TokenMaxUses = %d, want 0 (empty long env = explicit override)", cfg.TokenMaxUses)
+	}
 }
 
 // TestLoadDataOldShapeCompat guards backward compatibility: the pre-Phase-7
@@ -1255,4 +1336,86 @@ auth:
 			t.Errorf("error %q missing the token_ttl_seconds hint", err.Error())
 		}
 	})
+}
+
+// TestSessionKnobsDefaults (Task 9.13): the control defaults (single-use
+// mode, infinite session TTL) and the data defaults (idle 1800, max-lifetime
+// off, revoke poll 1s) must hold with a bare config file.
+func TestSessionKnobsDefaults(t *testing.T) {
+	ctlPath := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+`)
+	cfg, err := LoadControl(ctlPath)
+	if err != nil {
+		t.Fatalf("LoadControl: %v", err)
+	}
+	if cfg.TokenMode != "single-use" {
+		t.Errorf("default TokenMode = %q, want single-use", cfg.TokenMode)
+	}
+	if cfg.SessionTokenTTL != 0 {
+		t.Errorf("default SessionTokenTTL = %d, want 0 (infinite)", cfg.SessionTokenTTL)
+	}
+
+	dataPath := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+`)
+	dcfg, err := LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData: %v", err)
+	}
+	if dcfg.SessionIdleSeconds != 1800 {
+		t.Errorf("default SessionIdleSeconds = %d, want 1800", dcfg.SessionIdleSeconds)
+	}
+	if dcfg.SessionMaxLifetimeSeconds != 0 {
+		t.Errorf("default SessionMaxLifetimeSeconds = %d, want 0 (off)", dcfg.SessionMaxLifetimeSeconds)
+	}
+	if dcfg.RevokePollSeconds != 1 {
+		t.Errorf("default RevokePollSeconds = %d, want 1", dcfg.RevokePollSeconds)
+	}
+}
+
+// TestAuthUsersParsing (Task 9.13): the optional auth.users list parses,
+// ${VAR} password placeholders resolve from the environment, and an empty
+// password in ANY listed user fails fast (never a silently empty credential).
+func TestAuthUsersParsing(t *testing.T) {
+	path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  users:
+    - username: "checker"
+      password: "${ZT_AUTH_CHECKER_PASSWORD}"
+`)
+	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "checker-pw")
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl: %v", err)
+	}
+	if len(cfg.AuthUsers) != 1 || cfg.AuthUsers[0].Username != "checker" || cfg.AuthUsers[0].Password != "checker-pw" {
+		t.Fatalf("AuthUsers = %+v, want [checker/checker-pw]", cfg.AuthUsers)
+	}
+	// The primary pair is untouched by the list.
+	if cfg.AuthUser != "admin" || cfg.AuthPassword != "secret" {
+		t.Fatalf("primary auth = %q/%q, want admin/secret", cfg.AuthUser, cfg.AuthPassword)
+	}
+
+	// Missing env for a listed user → load error, never an empty password.
+	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "")
+	if _, err := LoadControl(path); err == nil {
+		t.Fatal("LoadControl with empty checker password succeeded, want fail-fast")
+	}
+	// Unset env → same fail-fast.
+	if err := os.Unsetenv("ZT_AUTH_CHECKER_PASSWORD"); err != nil {
+		t.Fatalf("unsetenv: %v", err)
+	}
+	if _, err := LoadControl(path); err == nil {
+		t.Fatal("LoadControl with unset checker password succeeded, want fail-fast")
+	}
 }

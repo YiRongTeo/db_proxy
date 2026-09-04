@@ -33,6 +33,9 @@ type pgSession struct {
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
+	// token (Task 9.13) is the raw token string for SESSION-mode sessions
+	// (liveness/revocation handle). Empty for single-use sessions.
+	token string
 	// cancelKey (review 2026-08-17) is the per-session random secret the
 	// proxy hands the client in BackendKeyData and validates on a
 	// CancelRequest — the PG cancel model (pid + secret). Random per
@@ -396,6 +399,15 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 			Message: "token not valid for this protocol"})
 		return
 	}
+	// Task 9.13 session tokens: IP lock (see checkSessionTokenIP).
+	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+		p.metrics.TokensRejected("ip_mismatch")
+		p.metrics.ConnectionsTotal("postgres", "rejected")
+		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)
+		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
+			Message: reason})
+		return
+	}
 	p.metrics.TokensValidated()
 	// The client has spoken — the handshake deadline has done its job. Clear
 	// it now so the backend connect (which can take up to its own bounded
@@ -447,6 +459,9 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		tok:       tok,
 		access:    tok.Access,
 		closer:    func() { client.Close(); front.Close() },
+	}
+	if tok.Mode == "session" {
+		s.token = token
 	}
 	p.registerSession(s)
 	s.threadID = capturePGThreadID(front, p.log)

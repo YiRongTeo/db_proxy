@@ -29,7 +29,7 @@ import (
 // failure.
 func TestBuildLoginErrorShape(t *testing.T) {
 	msg := "Login failed for user 'sess_deadbeef'."
-	payload := buildLoginError(msg)
+	payload := buildLoginError(msg, false)
 	if len(payload) < 3+14+2+12 {
 		t.Fatalf("error payload too small: %d bytes", len(payload))
 	}
@@ -92,6 +92,63 @@ func TestBuildLoginErrorShape(t *testing.T) {
 	done2, ok, _ := scanLoginResponse(payload)
 	if !done2 || ok {
 		t.Fatalf("scan: done=%v loginOK=%v, want true/false", done2, ok)
+	}
+}
+
+// TestBuildLoginErrorLegacyShape pins the version-passthrough DONE tail
+// (2026-08-26): a client that negotiated TDS < 7.2 (SQLOLEDB/7.1) receives
+// the LEGACY 9-byte DONE (4-byte row count), not the modern 13-byte form —
+// otherwise the legacy provider misparses the rejection stream.
+func TestBuildLoginErrorLegacyShape(t *testing.T) {
+	msg := "Login failed for user 'sess_deadbeef'."
+	modern := buildLoginError(msg, false)
+	legacy := buildLoginError(msg, true)
+	if len(modern)-len(legacy) != 4 {
+		t.Fatalf("modern %d bytes, legacy %d bytes — want exactly 4-byte rowcount shrink",
+			len(modern), len(legacy))
+	}
+	if legacy[len(legacy)-9] != 0xFD {
+		t.Fatalf("legacy closing token = %#x, want DONE (0xFD)", legacy[len(legacy)-9])
+	}
+	if status := binary.LittleEndian.Uint16(legacy[len(legacy)-8 : len(legacy)-6]); status != tdsDoneError {
+		t.Fatalf("legacy DONE status = %#x, want %#x", status, tdsDoneError)
+	}
+	for _, b := range legacy[len(legacy)-4:] {
+		if b != 0 {
+			t.Fatalf("legacy DONE rowcount not zeroed")
+		}
+	}
+	// The ERROR token part must be identical in both shapes.
+	if !bytes.Equal(modern[:len(modern)-13], legacy[:len(legacy)-9]) {
+		t.Fatalf("ERROR token differs between modern and legacy shapes")
+	}
+	// The capture parser accepts the legacy 9-byte tail as a completed DONE
+	// (parseDone reads buf positioned at the token).
+	var cap mssqlResultCapture
+	cap.doneLen = 9
+	cap.buf = legacy[len(legacy)-9:]
+	if n, ok := cap.parseDone(); !ok || n != 9 {
+		t.Fatalf("legacy parseDone: n=%d ok=%v, want 9/true", n, ok)
+	}
+	if cap.status != "error" {
+		t.Fatalf("legacy DONE_ERROR status not captured: %q", cap.status)
+	}
+}
+
+// TestBuildTDSAttnAckShapes pins the attention-ack DONE tail (version
+// passthrough fix, 2026-08-26): modern 13-byte, legacy 9-byte.
+func TestBuildTDSAttnAckShapes(t *testing.T) {
+	modern := buildTDSAttnAck(false)
+	legacy := buildTDSAttnAck(true)
+	if len(modern) != 13 || len(legacy) != 9 {
+		t.Fatalf("modern=%d legacy=%d, want 13/9", len(modern), len(legacy))
+	}
+	if modern[0] != 0xFD || legacy[0] != 0xFD {
+		t.Fatalf("attn ack opening token not DONE")
+	}
+	if binary.LittleEndian.Uint16(modern[1:3]) != tdsDoneAttn ||
+		binary.LittleEndian.Uint16(legacy[1:3]) != tdsDoneAttn {
+		t.Fatalf("attn ack status bit missing")
 	}
 }
 

@@ -3,6 +3,7 @@ package models
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"strings"
 	"time"
 )
@@ -23,6 +24,54 @@ type TokenPayload struct {
 	// deadlock fix. The data plane adopts it as its session id; tokens
 	// without it (pre-8.11 / tests) fall back to generating one.
 	SessionID string `json:"session_id,omitempty"`
+	// MaxUses (Task 9.12, option-2 multi-use) is the number of REMAINING
+	// connections this token may open before it is deleted. 0/absent = 1
+	// (single-use — the historical zero-trust default; the data plane
+	// treats any value < 1 as 1). The store decrements it atomically on
+	// every consume; the final use deletes the token. Configured at issue
+	// time via control.yaml api.token_max_uses (env ZT_TOKEN_MAX_USES) —
+	// GUI clients (SSMS/DBeaver) open several connections per session and
+	// need a small budget; the TTL still bounds the window.
+	MaxUses int `json:"max_uses,omitempty"`
+	// Mode (Task 9.13, option-A session tokens) is ""|"single-use" (the
+	// historical behavior) or "session": a session token is NOT consumed
+	// by connections — it stays valid until revoked (key deleted), its
+	// TTL (infinite when the mint TTL is 0), or the data plane's
+	// idle/max-lifetime enforcement. Session tokens are IP-locked:
+	// every connection must come from IP (normalized) or the login is
+	// rejected. Revocation is LIVE: deleting tok:<token> by ANY means
+	// (control-plane kill, valkey-cli, expiry) closes running sessions
+	// within the data plane's revoke poll interval (keyspace-notification
+	// fast path when the server publishes them).
+	Mode     string `json:"mode,omitempty"`
+	IP       string `json:"ip,omitempty"`        // issue-time client IP (normalized), session mode only
+	IssuedAt int64  `json:"issued_at,omitempty"` // unix seconds — max-lifetime anchor (session mode)
+	// IdleSeconds (Task 9.13 per-token idle override) is the session idle
+	// timeout for THIS token, in seconds. 0/absent = follow the data
+	// plane's session.idle_seconds default (which applies to EVERY token
+	// mode). >0 overrides the default for sessions opened with this token.
+	IdleSeconds int `json:"idle_seconds,omitempty"`
+}
+
+// NormalizeIP canonicalizes a client address host for session-token IP
+// locking: strips brackets/port, maps the IPv6 loopback and the IPv4-mapped
+// loopback onto 127.0.0.1 (a Windows box talking to localhost may present
+// either form), and lowercases. Both planes must use it so the minted IP
+// and the connecting IP compare equal.
+func NormalizeIP(host string) string {
+	// SplitHostPort strips [v6]:port / v4:port when present; bare hosts
+	// pass through.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	switch strings.ToLower(host) {
+	case "::1", "::ffff:127.0.0.1", "::ffff:7f00:1":
+		return "127.0.0.1"
+	case "":
+		return ""
+	}
+	return strings.ToLower(host)
 }
 
 // randomHex returns n random bytes hex-encoded (2*n hex chars). rand.Read

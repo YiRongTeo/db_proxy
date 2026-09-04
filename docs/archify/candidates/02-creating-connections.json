@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Creating a DB Connection — Token Issue + Wire Connect",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [930, 900],
+    "views": [
+      { "id": "api-half", "label": "API half — token issue", "focus": ["maker", "control", "valkey"], "note": "The maker asks the control plane to mint a single-use token." },
+      { "id": "wire-half", "label": "Wire half — connect", "focus": ["maker", "dataplane", "valkey", "cred", "db"], "note": "The DB client connects with the token as username." }
+    ]
+  },
+  "participants": [
+    { "id": "maker", "type": "frontend", "label": "Maker", "sublabel": "UI / DB client" },
+    { "id": "control", "type": "backend", "label": "Control Plane", "sublabel": "HTTPS :8080" },
+    { "id": "valkey", "type": "database", "label": "Valkey", "sublabel": "token + session store" },
+    { "id": "checker", "type": "frontend", "label": "Checker UI", "sublabel": "can watch first" },
+    { "id": "dataplane", "type": "backend", "label": "Data Plane", "sublabel": "TCP :3306" },
+    { "id": "cred", "type": "external", "label": "Credentials", "sublabel": "config or API mode" },
+    { "id": "db", "type": "database", "label": "Target DB", "sublabel": "MySQL / PG / MSSQL" }
+  ],
+  "segments": [
+    { "from": 180, "to": 330, "label": "1 · Token issue (API half)" },
+    { "from": 375, "to": 620, "label": "2 · Wire connect (data plane half)" },
+    { "from": 660, "to": 780, "label": "3 · Session live" }
+  ],
+  "messages": [
+    { "id": "token-request", "from": "maker", "to": "control", "y": 195, "label": "POST /api/token (X-Api-Key or session cookie)", "variant": "emphasis" },
+    { "id": "store-token", "from": "control", "to": "valkey", "y": 248, "label": "store tok:<id> — single-use, TTL 300s", "variant": "default" },
+    { "id": "store-session", "from": "control", "to": "valkey", "y": 292, "label": "sess:live:<sid> status=pending + publish action=issued", "variant": "default" },
+    { "id": "token-response", "from": "control", "to": "maker", "y": 335, "label": "200 { token, session_id, db_type, db_user, db, access, expires_at }", "variant": "return" },
+    { "id": "watch-arm", "from": "checker", "to": "valkey", "y": 395, "label": "select session → watch:<sid> armed (before the maker connects)", "variant": "default" },
+    { "id": "client-connect", "from": "maker", "to": "dataplane", "y": 452, "label": "connect — token as username", "variant": "security" },
+    { "id": "getdel", "from": "dataplane", "to": "valkey", "y": 505, "label": "GETDEL tok:<id> — atomic single use", "variant": "security" },
+    { "id": "resolve-password", "from": "dataplane", "to": "cred", "y": 558, "label": "resolve real password (config or credential API)", "variant": "default" },
+    { "id": "backend-login", "from": "dataplane", "to": "db", "y": 612, "label": "connect with REAL credentials — token never sent to the DB", "variant": "emphasis" },
+    { "id": "login-ok", "from": "db", "to": "dataplane", "y": 656, "label": "login OK", "variant": "return" },
+    { "id": "session-established", "from": "dataplane", "to": "maker", "y": 700, "label": "session established — login response relayed byte-exact", "variant": "return" },
+    { "id": "status-active", "from": "dataplane", "to": "valkey", "y": 744, "label": "sess:live:<sid> status=active + publish action=started", "variant": "default" },
+    { "id": "events-fanout", "from": "dataplane", "to": "valkey", "y": 788, "label": "events → queries:<user> / queries:ticket:<t> / queries:sess:<sid>", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "control", "from": 195, "to": 340, "type": "backend" },
+    { "participant": "valkey", "from": 248, "to": 340, "type": "database" },
+    { "participant": "dataplane", "from": 452, "to": 790, "type": "backend" },
+    { "participant": "cred", "from": 558, "to": 612, "type": "external" },
+    { "participant": "db", "from": 612, "to": 662, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Two halves of one promise", "items": ["API half: control plane mints the token — authorization for one connection", "Wire half: DB client connects to :3306 with the token as username", "The session exists (status=pending) from the moment the token is issued"] },
+    { "dot": "emerald", "title": "Checker-first flow", "items": ["A checker can select and watch the session before the maker connects", "watch:<sid> is armed via the checker hub, heartbeat-refreshed", "This ordering is what resolves the maker/checker deadlock"] },
+    { "dot": "rose", "title": "Zero-trust at the wire", "items": ["GETDEL consumes the token atomically — a second connect is rejected", "Real credentials are resolved inside the data plane, memory-only", "The maker's client only ever sees its token"] }
+  ]
+}

@@ -109,7 +109,7 @@ func cleanupMSSQLRow(t *testing.T, marker string) {
 			t.Logf("cleanup: prelogin response: %v", err)
 			return
 		}
-		login := buildLogin7("zt-cleanup", "rw_user", "CLEANUP", "127.0.0.1", "appdb", obfuscatePassword("rw_pw"))
+		login := buildLogin7("zt-cleanup", "rw_user", "CLEANUP", "127.0.0.1", "appdb", obfuscatePassword("rw_pw"), tdsVersion740, tdsPacketSize)
 		if err := writeTDSPacket(conn, tdsLogin7, login); err != nil {
 			t.Logf("cleanup: login7: %v", err)
 			return

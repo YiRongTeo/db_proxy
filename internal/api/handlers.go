@@ -71,6 +71,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		DBPort   string `json:"db_port"`
 		DBType   string `json:"db_type"`
 		TicketID string `json:"ticket_id,omitempty"`
+		// Mode (Task 9.13) requests a token flavor: "single-use" (default)
+		// or "session". Absent → the target preset's token_mode, then the
+		// api.token_mode config default.
+		Mode string `json:"mode,omitempty"`
+		// IdleSeconds (Task 9.13 per-token idle override): the session
+		// idle timeout for THIS token. 0/absent = the data plane's
+		// session.idle_seconds default (applies to every token mode).
+		IdleSeconds int `json:"idle_seconds,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
@@ -107,8 +115,31 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.TicketID = tid
-	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" {
-		http.Error(w, `{"error":"db_type must be mysql, postgres or mssql"}`, http.StatusUnprocessableEntity)
+	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" && req.DBType != "oracle" {
+		http.Error(w, `{"error":"db_type must be mysql, postgres, mssql or oracle"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	// Task 9.13: token mode resolution — request mode wins, then the
+	// target preset's token_mode, then the api.token_mode default.
+	// Anything other than the two known flavors is a client error.
+	mode := req.Mode
+	if mode == "" {
+		mode = a.modeForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort)
+	}
+	if mode == "" {
+		mode = a.cfg.TokenMode
+	}
+	if mode == "" {
+		mode = "single-use" // config default guard
+	}
+	if mode != "single-use" && mode != "session" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be single-use or session"})
+		return
+	}
+	// Task 9.13 per-token idle override: non-negative only (0/absent =
+	// follow the data-plane session.idle_seconds default).
+	if req.IdleSeconds < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "idle_seconds must be >= 0"})
 		return
 	}
 	// Review 9.9 MINOR: issuance throttle — bound token minting. Session
@@ -135,12 +166,42 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		DBPort: req.DBPort, DBType: req.DBType, TicketID: req.TicketID,
 		Access:    a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort),
 		SessionID: models.NewSessionID(),
+		Mode:      mode,
+		// Task 9.13 per-token idle override: 0/absent = the data plane's
+		// session.idle_seconds default (every token mode); >0 overrides it
+		// for sessions opened with this token.
+		IdleSeconds: req.IdleSeconds,
 	}
 	ttl := time.Duration(a.cfg.TokenTTL) * time.Second
+	if mode == "session" {
+		// Task 9.13 session tokens: TTL from api.session_token_ttl_seconds
+		// (0 = INFINITE — the token lives until revoked), stamped issue IP
+		// (every connection must come from it) and issued_at (max-lifetime
+		// anchor). MaxUses is meaningless here — session tokens are not
+		// consumed — so it stays absent.
+		ttl = time.Duration(a.cfg.SessionTokenTTL) * time.Second
+		payload.IP = models.NormalizeIP(clientIP(r))
+		payload.IssuedAt = time.Now().UTC().Unix()
+	} else {
+		// Task 9.12: connection budget per token (1 = single-use default).
+		// Clamped — a config of 0 or negative must never produce a token
+		// that dies on its first use unexpectedly; the store also treats
+		// < 1 as 1, so this is belt-and-braces.
+		payload.MaxUses = a.cfg.TokenMaxUses
+		if payload.MaxUses < 1 {
+			payload.MaxUses = 1
+		}
+	}
 	if err := a.vs.SetToken(r.Context(), token, payload, ttl); err != nil {
 		a.log.Error("token store", "err", err)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
+	}
+	// Task 9.13: -1 signals an infinite session token to the client (the
+	// token never expires — revocation is explicit).
+	expiresIn := int(ttl.Seconds())
+	if mode == "session" && a.cfg.SessionTokenTTL <= 0 {
+		expiresIn = -1
 	}
 	a.issueLimiter.hit(issueKey, time.Now())
 	// The token is stored; now list the session at issue time (pending
@@ -159,8 +220,20 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		Token:     token,
 		Host:      a.cfg.DataPlaneHost,
 		Port:      a.cfg.DataPlanePort,
-		ExpiresIn: a.cfg.TokenTTL,
+		ExpiresIn: expiresIn,
 	})
+}
+
+// modeForPreset resolves a db_preset's optional token_mode (Task 9.13) for
+// the requested target; "" when no preset matches or the preset declares
+// none (the api.token_mode default then applies). Mirrors accessForPreset.
+func (a *api) modeForPreset(dbType, dbUser, dbIP, dbPort string) string {
+	for _, p := range a.cfg.DBPresets {
+		if p.DBType == dbType && p.DBUser == dbUser && p.DBIP == dbIP && p.DBPort == dbPort {
+			return p.TokenMode
+		}
+	}
+	return ""
 }
 
 // pendingSessionRecord is the CONTROL PLANE's sess:live:<sid> payload

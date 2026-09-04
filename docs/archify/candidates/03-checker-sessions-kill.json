@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Checker Sessions & Kill — Monitor + Kill Switch",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [930, 960],
+    "views": [
+      { "id": "watch-flow", "label": "Select + live feed", "focus": ["checker", "valkey", "dataplane"], "note": "Session selection arms the watch key and subscribes the per-session feed." },
+      { "id": "kill-query", "label": "Kill query", "focus": ["checker", "control", "valkey", "dataplane", "db"], "note": "Abort the running statement; the session survives." },
+      { "id": "kill-connection", "label": "Kill connection", "focus": ["checker", "control", "valkey", "dataplane"], "note": "Drop both connections and end the session." }
+    ]
+  },
+  "participants": [
+    { "id": "checker", "type": "frontend", "label": "Checker UI", "sublabel": "Angular SPA :8080" },
+    { "id": "control", "type": "backend", "label": "Control Plane", "sublabel": "HTTPS API + WS hub" },
+    { "id": "valkey", "type": "database", "label": "Valkey", "sublabel": "watch + ctl:kill" },
+    { "id": "dataplane", "type": "backend", "label": "Data Plane", "sublabel": "TCP :3306" },
+    { "id": "db", "type": "database", "label": "Target DB", "sublabel": "MySQL / PG / MSSQL" }
+  ],
+  "segments": [
+    { "from": 180, "to": 350, "label": "1 · Select session + arm watch" },
+    { "from": 395, "to": 610, "label": "2 · Kill query (session survives)" },
+    { "from": 655, "to": 877, "label": "3 · Kill connection (session ends)" }
+  ],
+  "messages": [
+    { "id": "load-sessions", "from": "checker", "to": "control", "y": 195, "label": "GET /api/sessions — status=pending and active", "variant": "default" },
+    { "id": "sessions-list", "from": "control", "to": "checker", "y": 232, "label": "list: username · db_user · db · session_id", "variant": "return" },
+    { "id": "ws-subscribe", "from": "checker", "to": "valkey", "y": 290, "label": "WS subscribe queries:sess:<sid> (per-session isolation)", "variant": "default" },
+    { "id": "arm-watch", "from": "checker", "to": "valkey", "y": 332, "label": "watch:<sid> = 1 — heartbeat-refreshed", "variant": "emphasis" },
+    { "id": "query-events", "from": "dataplane", "to": "valkey", "y": 375, "label": "query events on queries:sess:<sid>", "variant": "default" },
+    { "id": "live-feed", "from": "valkey", "to": "checker", "y": 412, "label": "live events: stmt_type, status, sql, columns/rows if enabled", "variant": "return" },
+    { "id": "kill-query-api", "from": "checker", "to": "control", "y": 470, "label": "POST /api/kill { session_id, mode:\"query\" }", "variant": "security" },
+    { "id": "kill-publish", "from": "control", "to": "valkey", "y": 515, "label": "ctl:kill channel — no HTTP between planes", "variant": "security" },
+    { "id": "kill-signal", "from": "valkey", "to": "dataplane", "y": 557, "label": "kill signal (Valkey only)", "variant": "security" },
+    { "id": "abort-statement", "from": "dataplane", "to": "db", "y": 598, "label": "MySQL KILL QUERY / PG pg_cancel_backend / MSSQL ATTENTION", "variant": "emphasis" },
+    { "id": "query-aborted", "from": "db", "to": "dataplane", "y": 636, "label": "query aborted — session survives", "variant": "return" },
+    { "id": "audit-killed", "from": "dataplane", "to": "checker", "y": 672, "label": "audit event status=error \"query killed\"", "variant": "dashed" },
+    { "id": "kill-conn-api", "from": "checker", "to": "control", "y": 720, "label": "POST /api/kill { session_id, mode:\"connection\" }", "variant": "security" },
+    { "id": "kill-conn-signal", "from": "control", "to": "valkey", "y": 762, "label": "ctl:kill channel", "variant": "security" },
+    { "id": "kill-conn-exec", "from": "valkey", "to": "dataplane", "y": 800, "label": "kill signal", "variant": "security" },
+    { "id": "close-connections", "from": "dataplane", "to": "valkey", "y": 838, "label": "close client + backend, delete sess:live:<sid>", "variant": "emphasis" },
+    { "id": "ended-event", "from": "dataplane", "to": "valkey", "y": 872, "label": "publish lifecycle event action=ended", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "control", "from": 195, "to": 237, "type": "backend" },
+    { "participant": "control", "from": 470, "to": 520, "type": "backend" },
+    { "participant": "control", "from": 720, "to": 767, "type": "backend" },
+    { "participant": "valkey", "from": 290, "to": 417, "type": "database" },
+    { "participant": "dataplane", "from": 375, "to": 677, "type": "backend" },
+    { "participant": "dataplane", "from": 800, "to": 843, "type": "backend" },
+    { "participant": "db", "from": 598, "to": 641, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Monitor", "items": ["Session selector lists pending (\"waiting\") and active sessions", "Selecting a session subscribes only its own queries:sess:<sid> feed", "The watch:<sid> presence key is heartbeat-refreshed while connected"] },
+    { "dot": "rose", "title": "Two-level kill", "items": ["Kill query: per-protocol cancel — session survives", "Kill connection: both sides closed, session ends", "Signals flow checker → control → Valkey → data plane — no HTTP between planes"] },
+    { "dot": "emerald", "title": "Isolation", "items": ["Killing one session never affects others", "A kill-query on an idle session is refused", "Audit events record every kill with status"] }
+  ]
+}

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"strings"
 	"testing"
@@ -216,9 +217,55 @@ func TestLogin7ParseCaptured(t *testing.T) {
 	// client's value is never inspected — only skipped.
 }
 
+// Version passthrough fix (2026-08-26): the proxy previously forced TDS 7.4
+// into the backend login7 regardless of what the client declared. A legacy
+// provider (SQLOLEDB declares 0x71000001) then received a LOGINACK for 7.4 —
+// a version it cannot parse — surfacing as HeidiSQL's "DBMS version is less
+// than 7.0.0". These tests pin the fix: the client's declared TDS version
+// and packet size are parsed from LOGIN7 and rebuilt verbatim on the
+// backend login.
+func TestParseLogin7ClientFixedHeader(t *testing.T) {
+	const legacyTDS = 0x71000001 // SQLOLEDB-era TDS 7.1
+	const legacyPS = 8000
+	pw := obfuscatePassword("ro_pw")
+	msg := buildLogin7("legacy-host", "ro_user", "HeidiSQL", "mssql-test", "appdb", pw, legacyTDS, legacyPS)
+
+	li, err := parseLogin7(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if li.tdsVersion != legacyTDS {
+		t.Fatalf("tdsVersion = %#08x, want %#08x", li.tdsVersion, legacyTDS)
+	}
+	if li.packetSize != legacyPS {
+		t.Fatalf("packetSize = %d, want %d", li.packetSize, legacyPS)
+	}
+}
+
+func TestBuildLogin7VersionPassthroughBytes(t *testing.T) {
+	// Legacy declaration survives verbatim...
+	const legacyTDS = 0x71000001
+	msg := buildLogin7("h", "u", "a", "s", "appdb", nil, legacyTDS, 8000)
+	if got := binary.LittleEndian.Uint32(msg[4:8]); got != legacyTDS {
+		t.Fatalf("backend login7 tdsVersion = %#08x, want %#08x (client's)", got, legacyTDS)
+	}
+	if got := binary.LittleEndian.Uint32(msg[8:12]); got != 8000 {
+		t.Fatalf("backend login7 packetSize = %d, want 8000", got)
+	}
+	// ...and a modern client's declaration produces exactly the bytes the
+	// pre-fix code hardcoded (7.4 / 4096) — modern providers are unaffected.
+	modern := buildLogin7("h", "u", "a", "s", "appdb", nil, tdsVersion740, tdsPacketSize)
+	if got := binary.LittleEndian.Uint32(modern[4:8]); got != tdsVersion740 {
+		t.Fatalf("modern tdsVersion = %#08x, want %#08x", got, tdsVersion740)
+	}
+	if got := binary.LittleEndian.Uint32(modern[8:12]); got != tdsPacketSize {
+		t.Fatalf("modern packetSize = %d, want %d", got, tdsPacketSize)
+	}
+}
+
 func TestBuildLogin7RoundTrip(t *testing.T) {
 	pw := obfuscatePassword("ro_pw")
-	msg := buildLogin7("zerotrust-proxy", "ro_user", "zerotrust-proxy", "mssql-test", "appdb", pw)
+	msg := buildLogin7("zerotrust-proxy", "ro_user", "zerotrust-proxy", "mssql-test", "appdb", pw, tdsVersion740, tdsPacketSize)
 	li, err := parseLogin7(msg)
 	if err != nil {
 		t.Fatal(err)

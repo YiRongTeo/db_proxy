@@ -1,5 +1,6 @@
 listen:
   addr: ":3306"            # shared port for MySQL + PostgreSQL + MSSQL (protocol detected per connection)
+  oracle_addr: ":1522"     # Task 9.14 DEDICATED Oracle/TNS listener (user decision 2026-09-01); empty = off
   detect_delay_ms: 200     # grace period before assuming MySQL (server-first protocol)
   max_conns: 100           # concurrent connection cap enforced by the dispatcher
 tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
@@ -51,6 +52,11 @@ credentials:                  # Data Plane owns DB credentials (zero-trust); key
     password: "${ZT_CRED_MSSQL_RO_PASSWORD}"
   - key: "mssql:rw_user@127.0.0.1:1434"
     password: "${ZT_CRED_MSSQL_RW_PASSWORD}"
+  # Task 9.14 Oracle (dedicated listener :1522; backend :1521):
+  - key: "oracle:ro_user@127.0.0.1:1521"
+    password: "${ZT_CRED_ORACLE_RO_PASSWORD}"
+  - key: "oracle:rw_user@127.0.0.1:1521"
+    password: "${ZT_CRED_ORACLE_RW_PASSWORD}"
 # Task 8.8 query logging (user directive 2026-08-13): every query passing
 # through the proxy is ALWAYS logged with full context (username, ticket_id,
 # db_user, db, db_type, stmt_type, status, session_id, sql). log_query_output
@@ -67,6 +73,23 @@ log_query_output: false
 # behavior). Negative values fall back to the default (20).
 # Env: ZT_GATE_WAIT_SECONDS.
 gate_wait_seconds: 20
+# session enforcement (Task 9.13; all 0 = off):
+#   idle_seconds: close sessions idle this long (0 = off). Default 1800.
+#     Applies to EVERY token mode (single-use AND session) — the safety
+#     valve: a forgotten GUI window cannot pin a backend connection
+#     forever. Per-token override: mint with "idle_seconds": N
+#     (0 = the default here). Env: ZT_SESSION_IDLE_SECONDS.
+#   max_lifetime_seconds: hard cap on session duration from token issue
+#     (0 = off). Env: ZT_SESSION_MAX_LIFETIME_SECONDS.
+#   revoke_poll_seconds: token-liveness poll interval — deleting tok:<token>
+#     by ANY means (control-plane kill, valkey-cli, expiry) closes running
+#     sessions within this many seconds (default 1). The keyspace-notification
+#     fast path revokes instantly when the server publishes del/expired
+#     events (notify-keyspace-events KEx). Env: ZT_SESSION_REVOKE_POLL_SECONDS.
+session:
+  idle_seconds: 1800
+  max_lifetime_seconds: 0
+  revoke_poll_seconds: 1
 # Task 9.8 metrics (user directive 2026-08-15): OpenTelemetry instruments
 # for the data plane, exposed on an HTTP endpoint a Prometheus server can
 # scrape. DISABLED by default — zero overhead (the proxies' metrics wrapper

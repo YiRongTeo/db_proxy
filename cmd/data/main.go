@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -134,6 +137,8 @@ func main() {
 	// TDS 8.0 wiring; nil keeps the plaintext ENCRYPT_NOT_SUP path (sqlcmd
 	// needs -N o then).
 	mssqlProxy := proxy.NewMSSQLProxy(log, vs, credResolver, dataTLS)
+	// Task 9.14 Oracle (Phase 1): dedicated listener, terminate-then-relay.
+	oracleProxy := proxy.NewOracleProxy(log, vs, credResolver)
 	// Task 8.8 query logging: every query is ALWAYS logged with context;
 	// the captured result payload (columns/rows/row_count/truncated) is
 	// added only when log_query_output is on (configs/data.yaml,
@@ -157,11 +162,14 @@ func main() {
 		log.Error("metrics", "err", err)
 		os.Exit(1)
 	}
+	oracleProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	mysqlProxy.SetMetrics(m)
 	pgProxy.SetMetrics(m)
 	mssqlProxy.SetMetrics(m)
+	oracleProxy.SetMetrics(m)
 	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
 	killer.SetMetrics(m)
+	killer.SetStore(vs)
 
 	// Task 9.8 metrics endpoint: when enabled, serve the Prometheus scrape
 	// on its own goroutine (configs/data.yaml metrics block,
@@ -202,6 +210,37 @@ func main() {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- d.Serve(l, ctx) }()
 
+	// Task 9.14 Oracle: DEDICATED listener (user decision 2026-09-01 —
+	// protocol isolation; mysql/pg/mssql keep the shared :3306). Empty
+	// oracle_addr = the listener is not started.
+	if cfg.ListenOracleAddr != "" {
+		ol, err := net.Listen("tcp", cfg.ListenOracleAddr)
+		if err != nil {
+			log.Error("oracle listen", "err", err)
+			os.Exit(1)
+		}
+		log.Info("oracle listener", "addr", cfg.ListenOracleAddr)
+		go func() {
+			defer ol.Close()
+			var wg sync.WaitGroup
+			for ctx.Err() == nil {
+				c, err := ol.Accept()
+				if err != nil {
+					if ctx.Err() == nil {
+						log.Error("oracle accept", "err", err)
+					}
+					return
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					oracleProxy.HandleConn(c)
+				}()
+			}
+			wg.Wait()
+		}()
+	}
+
 	// Kill switch (Task 6.4 + Task 8.3 two-level kill): subscribe to the
 	// ctl:kill channel — the ONLY coupling between planes (no HTTP). Each
 	// message carries {"session_id": "...", "mode": "query"|"connection"}
@@ -231,6 +270,63 @@ func main() {
 				log.Info(line, "session_id", sid)
 			default:
 				log.Warn(line, "session_id", sid)
+			}
+		}
+	}()
+
+	// Task 9.13 session tokens — LIVE revocation, two cooperating paths:
+	//
+	// 1. Poll backstop (always on): the sweeper re-checks every session
+	//    token's key every session.revoke_poll_seconds and closes the
+	//    session when the key is gone (deleted by ANY means — control
+	//    plane kill, valkey-cli, expiry) or the idle/max-lifetime policy
+	//    trips. Works even when the server publishes no keyspace events.
+	// 2. Keyspace fast path (when the server publishes del/expired
+	//    events, notify-keyspace-events KEx): the same deletion closes
+	//    sessions instantly instead of within one poll interval.
+	sweepPolicy := proxy.SessionPolicy{
+		Idle:        time.Duration(cfg.SessionIdleSeconds) * time.Second,
+		MaxLifetime: time.Duration(cfg.SessionMaxLifetimeSeconds) * time.Second,
+		Poll:        time.Duration(cfg.RevokePollSeconds) * time.Second,
+	}
+	go proxy.RunSessionSweeper(ctx, log, sweepPolicy, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+
+	// Keyspace-notification subscription: __keyevent@<db>__:<event>. The
+	// channel carries the event type, the message the affected key. Only
+	// del/expired on tok:* matter — everything else is dropped. The
+	// subscription is best-effort: servers without keyspace notifications
+	// simply never emit, and the poll backstop above covers revocation.
+	// Unlike Subscribe (which restarts nothing), a dropped subscription
+	// is re-armed on its error return — same pattern as the kill
+	// subscriber's wrapper.
+	keyCh := make(chan store.KeyEvent, 16)
+	go func() {
+		defer close(keyCh)
+		pattern := fmt.Sprintf("__keyevent@%d__:*", cfg.Valkey.DB)
+		for ctx.Err() == nil {
+			if err := vs.SubscribeEvents(ctx, pattern, true, keyCh); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("keyspace subscriber", "err", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+		}
+	}()
+	go func() {
+		for ev := range keyCh {
+			kind := strings.TrimPrefix(ev.Channel, fmt.Sprintf("__keyevent@%d__:", cfg.Valkey.DB))
+			if kind != "del" && kind != "expired" {
+				continue
+			}
+			if !strings.HasPrefix(ev.Message, "tok:") {
+				continue
+			}
+			token := strings.TrimPrefix(ev.Message, "tok:")
+			total := mysqlProxy.RevokeToken(token) + pgProxy.RevokeToken(token) + mssqlProxy.RevokeToken(token) + oracleProxy.RevokeToken(token)
+			if total > 0 {
+				log.Info("token key revoked — sessions closed", "token", token, "sessions", total)
 			}
 		}
 	}()

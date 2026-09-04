@@ -114,7 +114,7 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 			// Task 9.10 stall: never forward anything past the held queue.
 			if !p.gateMSSQLHold(s, frames, typ == tdsAttention) {
 				if typ == tdsAttention {
-					_ = writeTDSMessage(client, tdsTabular, buildTDSAttnAck())
+					_ = writeTDSMessage(client, tdsTabular, buildTDSAttnAck(s.shortDone))
 				} else {
 					p.gateMSSQLReject(client, s, gatingMessage(s.id))
 				}
@@ -187,7 +187,7 @@ func (p *MSSQLProxy) gateMSSQLBlocked(s *mssqlSession, typ byte) string {
 // reaches the backend, so no backend response will complete the capture).
 func (p *MSSQLProxy) gateMSSQLReject(client net.Conn, s *mssqlSession, msg string) {
 	s.writeMu.Lock() // serialize with the relay's client writes (Task 9.10)
-	_ = writeTDSMessage(client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
+	_ = writeTDSMessage(client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14, s.shortDone))
 	s.writeMu.Unlock()
 	p.publishBlocked(s, msg)
 }
@@ -304,6 +304,10 @@ func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession
 	}
 	s.mu.Lock()
 	s.pending = &ev
-	s.capture = &mssqlResultCapture{}
+	doneLen := 13
+	if s.shortDone {
+		doneLen = 9
+	}
+	s.capture = &mssqlResultCapture{doneLen: doneLen}
 	s.mu.Unlock()
 }

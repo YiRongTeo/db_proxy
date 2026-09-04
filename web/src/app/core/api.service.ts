@@ -30,7 +30,7 @@ export interface TokenRequest {
   db_user: string;
   db_ip: string;
   db_port: string;
-  db_type: 'mysql' | 'postgres';
+  db_type: 'mysql' | 'postgres' | 'mssql' | 'oracle';
   ticket_id?: string;
 }
 
@@ -69,7 +69,7 @@ export interface QueryEvent {
   db_user: string;
   db_ip: string;
   db_port: string;
-  db_type: string; // mysql | postgres
+  db_type: string; // mysql | postgres | mssql | oracle
   sql: string;
   client_addr: string;
   // Phase 6 enhancement fields (internal/models.QueryEvent — omitempty, may be absent).

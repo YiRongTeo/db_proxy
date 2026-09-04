@@ -238,6 +238,11 @@ func TestTokenIssueListsPendingSession(t *testing.T) {
 			if p.SessionID != sid {
 				t.Errorf("stored payload session_id = %q, want the listed sid %q", p.SessionID, sid)
 			}
+			// Task 9.12: the stored payload carries the configured
+			// connection budget (single-use default in this fixture).
+			if p.MaxUses != 1 {
+				t.Errorf("stored payload max_uses = %d, want 1 (config default)", p.MaxUses)
+			}
 
 			// (b) issued event on queries:<user> and queries:sess:<sid>.
 			ev := recvIssuedEvent(t, userCh)

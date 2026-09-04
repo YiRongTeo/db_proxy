@@ -33,6 +33,9 @@ type mysqlSession struct {
 	lastSeen  time.Time            // last activity — heartbeat stamp (UTC)
 	tok       *models.TokenPayload // credential context for kill-query's second backend conn (Task 8.3)
 	access    string               // token access level: "write" → maker write-gate applies (Task 8.6)
+	// token (Task 9.13) is the raw token string for SESSION-mode sessions
+	// (liveness/revocation handle). Empty for single-use sessions.
+	token string
 
 	// Task 8.13 grace hold: the client/backend conns for the wait
 	// goroutine's flush (forward held commands to the backend) and drain
@@ -340,6 +343,14 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "token not valid for this protocol"))
 		return
 	}
+	// Task 9.13 session tokens: IP lock (see checkSessionTokenIP).
+	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+		p.metrics.TokensRejected("ip_mismatch")
+		p.metrics.ConnectionsTotal("mysql", "rejected")
+		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)
+		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", reason))
+		return
+	}
 	p.metrics.TokensValidated()
 
 	// 4. backend connection (real credentials, client-requested database)
@@ -384,6 +395,9 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		tok:       tok,
 		access:    tok.Access,
 		closer:    func() { client.Close(); backend.Close() },
+	}
+	if tok.Mode == "session" {
+		s.token = token
 	}
 	p.registerSession(s)
 	s.threadID = captureMySQLThreadID(backend, p.log)

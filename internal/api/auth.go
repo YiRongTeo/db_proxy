@@ -101,6 +101,21 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// validCredentials accepts the primary auth.username/password pair OR any
+// entry of the optional auth.users list (Task 9.13 — a dedicated checker
+// account for SoD testing; every comparison is constant-time).
+func (a *authMiddleware) validCredentials(username, password string) bool {
+	if secureEqual(username, a.cfg.AuthUser) && secureEqual(password, a.cfg.AuthPassword) {
+		return true
+	}
+	for _, u := range a.cfg.AuthUsers {
+		if secureEqual(username, u.Username) && secureEqual(password, u.Password) {
+			return true
+		}
+	}
+	return false
+}
+
 // sessionTLS reports whether the plane serves HTTPS — the zt_session cookie
 // gets the Secure attribute only then (review 9.9: no Secure flag on
 // plaintext dev deployments, where an HTTPS-only cookie would break login).
@@ -184,7 +199,7 @@ func (a *authMiddleware) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"too many attempts"}`, http.StatusTooManyRequests)
 		return
 	}
-	if !secureEqual(req.Username, a.cfg.AuthUser) || !secureEqual(req.Password, a.cfg.AuthPassword) {
+	if !a.validCredentials(req.Username, req.Password) {
 		a.loginLimiter.hit(key, time.Now())
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return

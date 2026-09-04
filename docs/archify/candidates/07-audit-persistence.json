@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Session Audit Persistence — MySQL zt_audit.sessions",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 380],
+    "views": [
+      { "id": "audit-path", "label": "Events → durable rows", "focus": ["token", "hub", "writer", "sessions"], "note": "Every lifecycle event becomes an idempotent upsert in the audit table." }
+    ]
+  },
+  "stages": [
+    { "label": "Control plane :8080" },
+    { "label": "Audit writer" },
+    { "label": "MySQL :3307" }
+  ],
+  "nodes": [
+    { "id": "token", "type": "backend", "label": "POST /api/token", "sublabel": "token issue", "stage": 0, "row": 0, "tag": "pending row" },
+    { "id": "hub", "type": "backend", "label": "WS hub", "sublabel": "lifecycle + watch hooks", "stage": 0, "row": 1, "tag": "started / ended / watcher" },
+    { "id": "writer", "type": "backend", "label": "Audit writer", "sublabel": "idempotent upserts", "stage": 1, "row": 0, "tag": "session_id key" },
+    { "id": "sessions", "type": "database", "label": "zt_audit.sessions", "sublabel": "durable history", "stage": 2, "row": 0, "tag": "maker + checker" }
+  ],
+  "flows": [
+    { "id": "token-row", "from": "token", "to": "writer", "label": "insert pending row", "classification": "maker username, ticket", "variant": "default", "labelAt": [270, 245] },
+    { "id": "hub-row", "from": "hub", "to": "writer", "label": "started / ended / watcher attach-detach", "classification": "checker_username updates", "variant": "default", "fromSide": "right", "toSide": "left", "via": [[200, 271], [200, 157]], "labelAt": [200, 210] },
+    { "id": "writer-store", "from": "writer", "to": "sessions", "label": "idempotent upserts", "classification": "durable rows", "variant": "emphasis", "route": "straight", "labelAt": [422, 157] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Lifecycle mapping", "items": ["Token issued → INSERT status=pending with maker, ticket, db fields", "Maker connects → UPDATE status=active, started_at", "Checker attach/detach → checker_username set / NULL (current watcher only)", "Session ends → UPDATE status=ended, ended_at"] },
+    { "dot": "emerald", "title": "Operational contract", "items": ["enabled: false (default) → zero overhead, hooks are no-ops", "Enabled + missing field or unreachable MySQL → fail-fast at startup", "Runtime write failure → non-fatal: logged, access never breaks"] },
+    { "dot": "rose", "title": "Relationship to live state", "items": ["Live sessions live in Valkey sess:live:<sid>, served by GET /api/sessions", "This table is the durable trail — it outlives the live directory", "maker username is pinned; never overwritten by later updates"] }
+  ]
+}

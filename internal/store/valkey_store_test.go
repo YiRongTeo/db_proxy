@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,6 +250,99 @@ func TestSetTokenGetDeleteTokenSingleUse(t *testing.T) {
 	}
 	if got2 != nil {
 		t.Fatalf("second GetDeleteToken: expected nil (single-use), got %+v", got2)
+	}
+}
+
+// TestTokenMultiUseBudget (Task 9.12, option-2 multi-use): a token issued
+// with max_uses=N survives N-1 consumes (payload returned, counter
+// decremented atomically, TTL preserved) and dies on the Nth. A token with
+// max_uses absent/0 stays single-use (covered above).
+func TestTokenMultiUseBudget(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	token := uniqueToken(t)
+	cleanupKey(t, s, "tok:"+token)
+
+	const budget = 3
+	want := models.TokenPayload{
+		Username: "alice",
+		DBUser:   "db_alice",
+		DBIP:     "10.0.0.5",
+		DBPort:   "1434",
+		DBType:   "mssql",
+		TicketID: "T-9-12",
+		MaxUses:  budget,
+	}
+	if err := s.SetToken(ctx, token, want, 300*time.Second); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	// Budget-1 successful consumes; the returned payload matches the
+	// original (MaxUses is the remaining count only inside the store).
+	for i := 1; i < budget; i++ {
+		got, err := s.GetDeleteToken(ctx, token)
+		if err != nil {
+			t.Fatalf("consume %d: %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("consume %d: expected payload, got nil (budget %d)", i, budget)
+		}
+		if got.Username != want.Username || got.DBType != want.DBType {
+			t.Fatalf("consume %d: payload %+v, want %+v", i, *got, want)
+		}
+	}
+
+	// The token must still EXIST with a live TTL after the budget-1
+	// consumes (the Lua decrement re-applies the remaining TTL — a bare
+	// SET would have dropped it and the token would die instantly).
+	ttl, err := s.client.Do(ctx, s.client.B().Ttl().Key("tok:"+token).Build()).AsInt64()
+	if err != nil {
+		t.Fatalf("TTL after consumes: %v", err)
+	}
+	if ttl <= 0 || ttl > 300 {
+		t.Fatalf("TTL after %d consumes = %d, want (0, 300]", budget-1, ttl)
+	}
+
+	// Budget exhausted: the Nth consume deletes the token.
+	got, err := s.GetDeleteToken(ctx, token)
+	if err != nil {
+		t.Fatalf("final consume: %v", err)
+	}
+	if got == nil {
+		t.Fatal("final consume: expected payload (the Nth use is still allowed)")
+	}
+	got2, err := s.GetDeleteToken(ctx, token)
+	if err != nil {
+		t.Fatalf("post-budget consume: %v", err)
+	}
+	if got2 != nil {
+		t.Fatalf("post-budget consume: expected nil (budget exhausted), got %+v", got2)
+	}
+}
+
+// TestTokenMultiUseBudgetSurvivesExpiryBoundary: decrements re-apply the
+// remaining TTL — verify the token still expires on schedule even after
+// uses, and that a consume AFTER expiry returns nil.
+func TestTokenMultiUseBudgetSurvivesExpiryBoundary(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	token := uniqueToken(t)
+	cleanupKey(t, s, "tok:"+token)
+
+	if err := s.SetToken(ctx, token, models.TokenPayload{Username: "bob", MaxUses: 4}, time.Second); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	// One consume to exercise the TTL-preserving rewrite path.
+	if got, err := s.GetDeleteToken(ctx, token); err != nil || got == nil {
+		t.Fatalf("consume: got=%v err=%v", got, err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	got, err := s.GetDeleteToken(ctx, token)
+	if err != nil {
+		t.Fatalf("GetDeleteToken after expiry: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil after TTL expiry (post-decrement), got %+v", got)
 	}
 }
 
@@ -662,5 +756,72 @@ func TestSessionLivePendingExpiry(t *testing.T) {
 		if bytes.Contains(r, []byte(`"session_id":"`+sid+`"`)) {
 			t.Fatalf("pending record %s still listed after TTL expiry", sid)
 		}
+	}
+}
+
+// TestSessionTokenNotConsumed (Task 9.13): a session-mode token survives
+// ANY number of consumes — payload returned each time, key and max_uses
+// untouched, TTL preserved. Revocation is external (DeleteToken) or expiry.
+func TestSessionTokenNotConsumed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	token := uniqueToken(t)
+	cleanupKey(t, s, "tok:"+token)
+
+	payload := models.TokenPayload{
+		Username: "alice", DBUser: "ro_user", DBType: "mssql",
+		Mode: "session", IP: "127.0.0.1", IssuedAt: 1,
+	}
+	if err := s.SetToken(ctx, token, payload, 2*time.Second); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		got, err := s.GetDeleteToken(ctx, token)
+		if err != nil {
+			t.Fatalf("consume %d: %v", i, err)
+		}
+		if got == nil || got.Mode != "session" || got.IP != "127.0.0.1" {
+			t.Fatalf("consume %d: got %+v, want the session payload", i, got)
+		}
+	}
+	// Key still alive with its budget untouched.
+	alive, err := s.TokenAlive(ctx, token)
+	if err != nil || !alive {
+		t.Fatalf("TokenAlive after 5 consumes: %v %v", alive, err)
+	}
+	raw, err := s.client.Do(ctx, s.client.B().Get().Key("tok:"+token).Build()).ToString()
+	if err != nil {
+		t.Fatalf("get raw: %v", err)
+	}
+	if strings.Contains(raw, "max_uses") {
+		t.Errorf("session token payload gained a max_uses field: %s", raw)
+	}
+}
+
+// TestSessionTokenInfiniteTTL (Task 9.13): ttl <= 0 stores the token with
+// NO expiry — it lives until DeleteToken removes it.
+func TestSessionTokenInfiniteTTL(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	token := uniqueToken(t)
+	cleanupKey(t, s, "tok:"+token)
+
+	if err := s.SetToken(ctx, token, models.TokenPayload{Username: "bob", Mode: "session", IP: "127.0.0.1"}, 0); err != nil {
+		t.Fatalf("SetToken(infinite): %v", err)
+	}
+	ttl, err := s.client.Do(ctx, s.client.B().Pttl().Key("tok:"+token).Build()).AsInt64()
+	if err != nil {
+		t.Fatalf("pttl: %v", err)
+	}
+	if ttl != -1 {
+		t.Fatalf("PTTL = %d, want -1 (no expiry)", ttl)
+	}
+	// DeleteToken revokes it; a consume afterwards is nil.
+	if err := s.DeleteToken(ctx, token); err != nil {
+		t.Fatalf("DeleteToken: %v", err)
+	}
+	got, err := s.GetDeleteToken(ctx, token)
+	if err != nil || got != nil {
+		t.Fatalf("consume after DeleteToken: got=%v err=%v, want nil", got, err)
 	}
 }

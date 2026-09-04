@@ -99,6 +99,7 @@ type mssqlResultCapture struct {
 	overflow  bool   // a token grew past capMaxEvent — parsing stalled
 	buf       []byte // partial token bytes across packets
 	doneFlag  bool
+	doneLen   int // expected DONE token size: 13 modern (default), 9 legacy (TDS < 7.2 sessions)
 }
 
 // tdsColType is the parsed TYPE_INFO of one result column — enough to walk
@@ -655,9 +656,17 @@ func (c *mssqlResultCapture) parseRow(nbc bool) (int, bool) {
 	return tokenLen, true
 }
 
-// parseDone consumes a DONE-family token: status(2) curcmd(2) rowcount(8).
+// parseDone consumes a DONE-family token: status(2) curcmd(2) rowcount(8)
+// in the modern (TDS ≥ 7.2) shape, or status(2) rowcount(4) in the legacy
+// shape SQL Server uses with clients that negotiated TDS < 7.2 (live
+// verified 2026-08-26 against a SQLOLEDB-style 7.1 login). doneLen selects
+// the expected size; the caller owns the session's negotiated version.
 func (c *mssqlResultCapture) parseDone() (int, bool) {
-	if len(c.buf) < 13 {
+	doneLen := c.doneLen
+	if doneLen != 9 && doneLen != 13 {
+		doneLen = 13
+	}
+	if len(c.buf) < doneLen {
 		return 0, false
 	}
 	status := binary.LittleEndian.Uint16(c.buf[1:3])
@@ -673,7 +682,7 @@ func (c *mssqlResultCapture) parseDone() (int, bool) {
 	} else if status&tdsDoneFinal != 0 {
 		c.finish()
 	}
-	return 13, true
+	return doneLen, true
 }
 
 // parseError consumes an ERROR token and completes the capture with

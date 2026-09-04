@@ -4,11 +4,39 @@ http:
 api:
   api_key: ""                 # empty → external /api/token disabled; set via ZT_API_API_KEY (viper maps api.api_key → ZT_API_API_KEY, NOT ZT_API_KEY)
   token_ttl_seconds: 300
+  # token_mode (Task 9.13; env ZT_API_TOKEN_MODE): the DEFAULT token flavor
+  # when a mint request carries no mode and the target preset declares none.
+  #   single-use (default): consumed atomically per connection budget.
+  #   session: IP-locked, NON-consuming token with LIVE revocation — see
+  #     api.session_token_ttl_seconds below and data.yaml session.*.
+  token_mode: "session"
+  # session_token_ttl_seconds (Task 9.13; env ZT_API_SESSION_TOKEN_TTL_SECONDS):
+  # lifetime of session-mode tokens. 0 = INFINITE (default): the token lives
+  # until revoked — delete tok:<token> by any means (control-plane kill,
+  # valkey-cli, an operator tool) and running sessions close immediately
+  # (keyspace fast path) or within session.revoke_poll_seconds (poll backstop).
+  # The data plane's session.idle_seconds is the recommended safety valve.
+  session_token_ttl_seconds: 0
+  # token_max_uses (Task 9.12, option-2 multi-use; env ZT_TOKEN_MAX_USES):
+  # how many CONNECTIONS one issued token may open before it is deleted.
+  # 1 = single-use (the zero-trust default — one token, one connection).
+  # GUI clients (SSMS/DBeaver/Azure Data Studio) open several connections
+  # per session automatically, so a small budget (e.g. 4) makes them
+  # usable; the TTL still bounds the window and each use is atomic, so a
+  # stolen token can open at most this many connections.
+  token_max_uses: 4
   data_plane_host: "127.0.0.1"
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
   username: "admin"
   password: ""                # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUTH_PASSWORD in .env (see .env.example); empty = plane refuses to start
+  # users (Task 9.13): OPTIONAL extra UI accounts beyond the primary pair —
+  # e.g. a dedicated CHECKER so maker and checker roles use different
+  # identities (the SoD watch rejects checker == maker). Passwords are
+  # ${VAR} placeholders from the environment; empty = plane refuses to start.
+  users:
+    - username: "checker"
+      password: "${ZT_AUTH_CHECKER_PASSWORD}"
   session_ttl_hours: 8
 db_presets:
   - name: "MySQL read-only"
@@ -43,6 +71,19 @@ db_presets:
     db_user: "rw_user"
     db_ip: "127.0.0.1"
     db_port: "1434"
+    access: "write"
+  # Task 9.14 Oracle (dedicated proxy listener :1522; backend :1521):
+  - name: "Oracle read-only"
+    db_type: "oracle"
+    db_user: "ro_user"
+    db_ip: "127.0.0.1"
+    db_port: "1521"
+    access: "read"
+  - name: "Oracle read-write"
+    db_type: "oracle"
+    db_user: "rw_user"
+    db_ip: "127.0.0.1"
+    db_port: "1521"
     access: "write"
 tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
   enabled: false

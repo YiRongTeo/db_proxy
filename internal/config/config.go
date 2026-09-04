@@ -25,6 +25,12 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 	// makes the auth fail-fast (review round 3) fire on empty env overrides.
 	v.AllowEmptyEnv(true)
 	v.AutomaticEnv()
+	// Explicit aliases (Task 9.12): the convention-derived name for
+	// api.token_max_uses is ZT_API_TOKEN_MAX_USES; the short form
+	// ZT_TOKEN_MAX_USES is accepted too (first set wins, both fall back to
+	// the config file). Without BindEnv, ZT_TOKEN_MAX_USES would silently
+	// not map and the budget would silently stay 1.
+	v.BindEnv("api.token_max_uses", "ZT_API_TOKEN_MAX_USES", "ZT_TOKEN_MAX_USES")
 	if err := v.ReadInConfig(); err != nil {
 		return fmt.Errorf("read config %s: %w", path, err)
 	}
@@ -57,11 +63,11 @@ type ValkeySSL struct {
 // master via SentinelAddrs/MasterName. The old flat shape
 // (valkey: {addr, password, db}) still parses: mode defaults to "direct".
 type ValkeyConfig struct {
-	Mode          string    `mapstructure:"mode"`
-	Addr          string    `mapstructure:"addr"`
-	MasterName    string    `mapstructure:"master_name"`
-	SentinelAddrs []string  `mapstructure:"sentinel_addrs"`
-	Password      string    `mapstructure:"password"`
+	Mode          string   `mapstructure:"mode"`
+	Addr          string   `mapstructure:"addr"`
+	MasterName    string   `mapstructure:"master_name"`
+	SentinelAddrs []string `mapstructure:"sentinel_addrs"`
+	Password      string   `mapstructure:"password"`
 	// SentinelPassword is the sentinel's OWN requirepass (AUTH <password>).
 	// Sentinels have no ACL users — a username must never be sent (valkey-go
 	// would emit AUTH <user> <pass>, which a requirepass-only sentinel
@@ -73,19 +79,49 @@ type ValkeyConfig struct {
 
 // ControlConfig mirrors configs/control.yaml.
 type ControlConfig struct {
-	HTTPAddr      string
-	StaticDir     string
-	APIKey        string
-	TokenTTL      int
-	DataPlaneHost string
-	DataPlanePort string
-	AuthUser      string
-	AuthPassword  string
-	SessionTTL    int // hours
-	DBPresets     []DBPreset
-	TLS           *CertConfig
-	Valkey        ValkeyConfig
-	Audit         AuditConfig
+	HTTPAddr  string
+	StaticDir string
+	APIKey    string
+	TokenTTL  int
+	// TokenMaxUses (Task 9.12): connection budget per issued token — 1 =
+	// single-use (default); >1 lets GUI clients (SSMS/DBeaver) open their
+	// several automatic connections. Env: ZT_TOKEN_MAX_USES.
+	TokenMaxUses int
+	// TokenMode (Task 9.13, option-A session tokens; yaml api.token_mode,
+	// env ZT_API_TOKEN_MODE) is the DEFAULT issue mode when a mint request
+	// carries no mode and the target preset declares none: "single-use"
+	// (default — every token dies after its connection budget) or
+	// "session" (IP-locked, non-consuming tokens with live revocation;
+	// TTL from SessionTokenTTL — 0 = infinite).
+	TokenMode string
+	// SessionTokenTTL (yaml api.session_token_ttl_seconds, env
+	// ZT_API_SESSION_TOKEN_TTL_SECONDS) is the lifetime of session-mode
+	// tokens. 0 = infinite (default): the token lives until revoked
+	// (key deleted) or the data plane's idle/max-lifetime enforcement.
+	// Single-use tokens keep api.token_ttl_seconds.
+	SessionTokenTTL int
+	DataPlaneHost   string
+	DataPlanePort   string
+	AuthUser        string
+	AuthPassword    string
+	// AuthUsers (Task 9.13, SoD testing) are OPTIONAL additional UI
+	// users beyond the primary auth.username/password pair — e.g. a
+	// dedicated checker account so maker and checker roles use different
+	// identities (the SoD watch rejects checker == maker). Passwords are
+	// ${VAR} placeholders resolved from the environment (same fail-fast
+	// rule as the primary pair: an empty password refuses to start).
+	AuthUsers  []AuthUserConfig
+	SessionTTL int // hours
+	DBPresets  []DBPreset
+	TLS        *CertConfig
+	Valkey     ValkeyConfig
+	Audit      AuditConfig
+}
+
+// AuthUserConfig is one entry of the optional auth.users list.
+type AuthUserConfig struct {
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
 }
 
 // MySQLAuditConfig is the optional session-audit MySQL block (Task 9.7,
@@ -122,6 +158,10 @@ type DBPreset struct {
 	DBIP   string `mapstructure:"db_ip" json:"db_ip"`
 	DBPort string `mapstructure:"db_port" json:"db_port"`
 	Access string `mapstructure:"access" json:"access"` // read | write (Task 8.6)
+	// TokenMode (Task 9.13; optional): "session" marks a GUI-friendly
+	// preset whose minted tokens are IP-locked, non-consuming session
+	// tokens (live revocation). Absent = the api.token_mode default.
+	TokenMode string `mapstructure:"token_mode,omitempty" json:"token_mode,omitempty"`
 }
 
 // readValkey reads the valkey block through the SAME viper instance that read
@@ -227,6 +267,10 @@ func LoadControl(path string) (*ControlConfig, error) {
 	v := viper.New()
 	if err := load(v, path, map[string]any{
 		"http.addr": ":8080", "api.token_ttl_seconds": 300,
+		"api.token_max_uses": 1,
+		// Task 9.13 session tokens: default issue mode single-use; session
+		// TTL 0 = infinite (revocation is explicit, never timer-based).
+		"api.token_mode": "single-use", "api.session_token_ttl_seconds": 0,
 		"auth.session_ttl_hours": 8, "valkey.addr": "127.0.0.1:6379",
 		"valkey.mode": "direct",
 		// Task 9.7 session audit: OFF by default (no DB dependency unless
@@ -249,17 +293,20 @@ func LoadControl(path string) (*ControlConfig, error) {
 		return nil, err
 	}
 	cfg := &ControlConfig{
-		HTTPAddr:      v.GetString("http.addr"),
-		StaticDir:     v.GetString("http.static_dir"),
-		APIKey:        v.GetString("api.api_key"),
-		TokenTTL:      v.GetInt("api.token_ttl_seconds"),
-		DataPlaneHost: v.GetString("api.data_plane_host"),
-		DataPlanePort: v.GetString("api.data_plane_port"),
-		AuthUser:      v.GetString("auth.username"),
-		AuthPassword:  v.GetString("auth.password"),
-		SessionTTL:    v.GetInt("auth.session_ttl_hours"),
-		TLS:           tlsCfg,
-		Audit:         auditCfg,
+		HTTPAddr:        v.GetString("http.addr"),
+		StaticDir:       v.GetString("http.static_dir"),
+		APIKey:          v.GetString("api.api_key"),
+		TokenTTL:        v.GetInt("api.token_ttl_seconds"),
+		TokenMaxUses:    v.GetInt("api.token_max_uses"),
+		TokenMode:       v.GetString("api.token_mode"),
+		SessionTokenTTL: v.GetInt("api.session_token_ttl_seconds"),
+		DataPlaneHost:   v.GetString("api.data_plane_host"),
+		DataPlanePort:   v.GetString("api.data_plane_port"),
+		AuthUser:        v.GetString("auth.username"),
+		AuthPassword:    v.GetString("auth.password"),
+		SessionTTL:      v.GetInt("auth.session_ttl_hours"),
+		TLS:             tlsCfg,
+		Audit:           auditCfg,
 	}
 	// Review round 3: auth fail-fast — AutomaticEnv is set, so an empty env
 	// override (e.g. ZT_AUTH_PASSWORD="") silently overrides the defaults map
@@ -271,6 +318,26 @@ func LoadControl(path string) (*ControlConfig, error) {
 	}
 	if cfg.AuthPassword == "" {
 		return nil, fmt.Errorf("auth.password is required (set ZT_AUTH_PASSWORD in .env — see .env.example)")
+	}
+	// Task 9.13: extra users — ${VAR} password placeholders resolved from
+	// the environment; empty username/password in ANY user is a load
+	// error (same unguessable-credentials rule as the primary pair).
+	if err := v.UnmarshalKey("auth.users", &cfg.AuthUsers); err != nil {
+		return nil, fmt.Errorf("unmarshal auth.users: %w", err)
+	}
+	for i := range cfg.AuthUsers {
+		u := &cfg.AuthUsers[i]
+		if u.Username == "" {
+			return nil, fmt.Errorf("auth.users[%d].username is required", i)
+		}
+		pw, err := expandEnv(u.Password)
+		if err != nil {
+			return nil, fmt.Errorf("auth.users[%d].password (%s): %w", i, u.Username, err)
+		}
+		if pw == "" {
+			return nil, fmt.Errorf("auth.users[%d].password (%s) is required (set ZT_AUTH_<USER>_PASSWORD in .env — see .env.example)", i, u.Username)
+		}
+		u.Password = pw
 	}
 	if cfg.TokenTTL <= 0 {
 		return nil, fmt.Errorf("api.token_ttl_seconds must be > 0, got %d", cfg.TokenTTL)
@@ -314,11 +381,16 @@ type MetricsConfig struct {
 
 // DataConfig mirrors configs/data.yaml.
 type DataConfig struct {
-	ListenAddr    string
-	DetectDelayMS int
-	MaxConns      int
-	TLS           *CertConfig
-	Valkey        ValkeyConfig
+	ListenAddr string
+	// ListenOracleAddr (yaml listen.oracle_addr, env ZT_ORACLE_ADDR; Task
+	// 9.14) is the DEDICATED Oracle/TNS listener address. Empty (default)
+	// = the Oracle listener is not started (it is wired together with the
+	// OracleProxy).
+	ListenOracleAddr string
+	DetectDelayMS    int
+	MaxConns         int
+	TLS              *CertConfig
+	Valkey           ValkeyConfig
 	// LogQueryOutput (yaml log_query_output, env ZT_LOG_QUERY_OUTPUT; Task
 	// 8.8) controls whether the data plane's query log lines carry the
 	// CAPTURED RESULT PAYLOAD (columns/rows/row_count/truncated). Default
@@ -350,6 +422,24 @@ type DataConfig struct {
 	// overhead); enabled=true serves the instruments at listen+path and
 	// fails fast at load on a malformed listen address.
 	Metrics MetricsConfig
+	// Session enforcement knobs (Task 9.13 option-A session tokens). These
+	// are DATA-plane-side: session-mode sessions are checked on a ticker.
+	// SessionIdleSeconds (yaml session.idle_seconds, env
+	// ZT_SESSION_IDLE_SECONDS): close sessions idle this long (0 = off).
+	// Default 1800 — the safety valve for infinite tokens: a forgotten
+	// GUI window cannot pin a backend connection forever.
+	SessionIdleSeconds int
+	// SessionMaxLifetimeSeconds (yaml session.max_lifetime_seconds, env
+	// ZT_SESSION_MAX_LIFETIME_SECONDS): hard cap on session duration from
+	// token issue (payload issued_at); 0 = off (default).
+	SessionMaxLifetimeSeconds int
+	// RevokePollSeconds (yaml session.revoke_poll_seconds, env
+	// ZT_SESSION_REVOKE_POLL_SECONDS): token-liveness poll interval for
+	// live revocation — deleting tok:<token> by any means closes running
+	// sessions within this many seconds (default 1). The valkey
+	// keyspace-notification fast path (when the server publishes del/
+	// expired events) revokes instantly regardless.
+	RevokePollSeconds int
 }
 
 // LoadData reads the Data Plane config (configs/data.yaml). Secrets come
@@ -380,6 +470,13 @@ func LoadData(path string) (*DataConfig, error) {
 		// Task 8.8: query log lines carry context only by default; the
 		// captured result payload (rows) is opt-in via log_query_output.
 		"log_query_output": false,
+		// Task 9.13 session enforcement: idle 30 min default (the safety
+		// valve for infinite session tokens), max-lifetime off, revoke
+		// poll 1s (key deleted → sessions close within ~1s; keyspace
+		// notifications make it instant when the server publishes them).
+		"session.idle_seconds":         1800,
+		"session.max_lifetime_seconds": 0,
+		"session.revoke_poll_seconds":  1,
 		// Task 8.13: the maker write-gate grace window — blocked SQL
 		// commands on an unwatched write session wait this long for a
 		// checker instead of failing instantly (default 20; 0 = reject
@@ -440,16 +537,20 @@ func LoadData(path string) (*DataConfig, error) {
 		}
 	}
 	cfg := &DataConfig{
-		ListenAddr:        v.GetString("listen.addr"),
-		DetectDelayMS:     v.GetInt("listen.detect_delay_ms"),
-		MaxConns:          v.GetInt("listen.max_conns"),
-		TLS:               tlsCfg,
-		LogQueryOutput:    v.GetBool("log_query_output"),
-		GateWaitSeconds:   gateWait,
-		CredentialsSource: source,
-		CredentialsAPI:    apiCfg,
-		Credentials:       map[string]string{},
-		Metrics:           mcfg,
+		ListenAddr:                v.GetString("listen.addr"),
+		ListenOracleAddr:          v.GetString("listen.oracle_addr"),
+		DetectDelayMS:             v.GetInt("listen.detect_delay_ms"),
+		MaxConns:                  v.GetInt("listen.max_conns"),
+		TLS:                       tlsCfg,
+		LogQueryOutput:            v.GetBool("log_query_output"),
+		GateWaitSeconds:           gateWait,
+		CredentialsSource:         source,
+		CredentialsAPI:            apiCfg,
+		Credentials:               map[string]string{},
+		SessionIdleSeconds:        v.GetInt("session.idle_seconds"),
+		SessionMaxLifetimeSeconds: v.GetInt("session.max_lifetime_seconds"),
+		RevokePollSeconds:         v.GetInt("session.revoke_poll_seconds"),
+		Metrics:                   mcfg,
 	}
 	vc, err := readValkey(v)
 	if err != nil {

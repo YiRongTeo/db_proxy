@@ -7,6 +7,38 @@ import (
 	"github.com/valkey-io/valkey-go"
 )
 
+// KeyEvent is one pub/sub message WITH its channel name — needed for
+// valkey keyspace notifications, where the CHANNEL carries the event type
+// (__keyevent@0__:del / :expired) and the MESSAGE is the affected key.
+type KeyEvent struct {
+	Channel string
+	Message string
+}
+
+// SubscribeEvents streams (channel, message) pairs from a channel or
+// pattern — same semantics as Subscribe, but the channel name is kept
+// (Task 9.13 keyspace fast path). Blocks until ctx is cancelled or the
+// connection fails; non-blocking send to out (slow consumers drop).
+func (s *ValkeyStore) SubscribeEvents(ctx context.Context, channel string, pattern bool, out chan<- KeyEvent) error {
+	var cmd valkey.Completed
+	if pattern {
+		cmd = s.client.B().Psubscribe().Pattern(channel).Build()
+	} else {
+		cmd = s.client.B().Subscribe().Channel(channel).Build()
+	}
+	err := s.client.Receive(ctx, cmd, func(msg valkey.PubSubMessage) {
+		select {
+		case out <- KeyEvent{Channel: msg.Channel, Message: msg.Message}:
+		case <-ctx.Done():
+		default:
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("subscribe events %s: %w", channel, err)
+	}
+	return nil
+}
+
 // Publish sends a raw JSON message to a channel.
 func (s *ValkeyStore) Publish(ctx context.Context, channel string, message []byte) error {
 	return s.client.Do(ctx, s.client.B().Publish().Channel(channel).Message(string(message)).Build()).Error()

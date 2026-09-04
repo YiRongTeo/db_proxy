@@ -596,8 +596,15 @@ func (p *MSSQLProxy) closeMSSQLGateWait(s *mssqlSession) {
 // ATTENTION (Task 9.10): a single DONE token (0xFD) with the DONE_ATTN
 // status bit (0x0020), curcmd 0, rowcount 0 — the 13-byte shape the real
 // server sends for an attention ack (live capture `fd 20 00 …`).
-func buildTDSAttnAck() []byte {
-	out := make([]byte, 13)
+func buildTDSAttnAck(shortDone bool) []byte {
+	// DONE_ATTN token: type(1) + status(2, DONE_ATTN bit) + curcmd(2) +
+	// rowcount — 13 bytes modern (8-byte rowcount), 9 bytes legacy
+	// (TDS < 7.2, 4-byte rowcount; version passthrough fix, 2026-08-26).
+	n := 13
+	if shortDone {
+		n = 9
+	}
+	out := make([]byte, n)
 	out[0] = 0xFD
 	out[1] = tdsDoneAttn
 	out[2] = 0x00
@@ -615,9 +622,9 @@ func (p *MSSQLProxy) gateMSSQLRejectEntries(s *mssqlSession, entries []mssqlGate
 	s.writeMu.Lock()
 	for _, e := range entries {
 		if e.attn {
-			_ = writeTDSMessage(s.client, tdsTabular, buildTDSAttnAck())
+			_ = writeTDSMessage(s.client, tdsTabular, buildTDSAttnAck(s.shortDone))
 		} else {
-			_ = writeTDSMessage(s.client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14))
+			_ = writeTDSMessage(s.client, tdsTabular, buildTDSErrorToken(msg, 18456, 1, 14, s.shortDone))
 		}
 	}
 	s.writeMu.Unlock()

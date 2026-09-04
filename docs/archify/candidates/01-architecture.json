@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Project-D — Zero-Trust JIT Database Access Gateway",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1175, 500],
+    "views": [
+      { "id": "token-flow", "label": "Token request path", "focus": ["maker", "control", "valkey", "client", "dataplane"], "note": "Follow a token from issue through the wire connect." },
+      { "id": "checker-and-kill", "label": "Checker + kill path", "focus": ["checker", "control", "valkey", "dataplane"], "note": "Watch presence and kill signals flow only through Valkey." },
+      { "id": "backend-connect", "label": "Backend connections", "focus": ["dataplane", "mysql", "pg", "mssql", "prometheus"], "note": "Real credentials are resolved inside the data plane." }
+    ]
+  },
+  "components": [
+    { "id": "maker", "type": "frontend", "label": "Maker / Ticketing UI", "sublabel": "requests a token", "pos": [30, 90], "size": [130, 66] },
+    { "id": "checker", "type": "frontend", "label": "Checker UI", "sublabel": "watches + kills", "pos": [30, 240], "size": [130, 66] },
+    { "id": "client", "type": "external", "label": "DB Client", "sublabel": "mysql / psql / sqlcmd", "pos": [30, 360], "size": [130, 66] },
+    { "id": "control", "type": "backend", "label": "Control Plane", "sublabel": "HTTPS API + WS hub + Angular SPA  :8080", "pos": [235, 170], "size": [190, 80] },
+    { "id": "valkey", "type": "database", "label": "Valkey", "sublabel": "the only coupling between planes", "pos": [500, 170], "size": [170, 80], "tag": "tok: · watch: · sess:live: · queries:*" },
+    { "id": "dataplane", "type": "backend", "label": "Data Plane", "sublabel": "protocol sniffer + 3 proxies  :3306", "pos": [760, 170], "size": [190, 80] },
+    { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "target :3307", "pos": [1030, 100], "size": [130, 62] },
+    { "id": "pg", "type": "database", "label": "PostgreSQL", "sublabel": "target :5433", "pos": [1030, 240], "size": [130, 62] },
+    { "id": "mssql", "type": "database", "label": "MSSQL", "sublabel": "target :1434", "pos": [1030, 380], "size": [130, 62] },
+    { "id": "audit", "type": "database", "label": "Audit MySQL", "sublabel": "zt_audit.sessions :3307", "pos": [320, 385], "size": [150, 62] },
+    { "id": "prometheus", "type": "cloud", "label": "Prometheus", "sublabel": "scrape :9464/metrics", "pos": [545, 385], "size": [150, 62] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Clients", "wraps": ["maker", "checker", "client"], "pad": 8 },
+    { "kind": "region", "label": "Control plane :8080", "wraps": ["control"] },
+    { "kind": "region", "label": "Valkey — the only coupling", "wraps": ["valkey"] },
+    { "kind": "region", "label": "Data plane :3306", "wraps": ["dataplane"] },
+    { "kind": "region", "label": "Target databases", "wraps": ["mysql", "pg", "mssql"], "pad": 6 },
+    { "kind": "region", "label": "Observability — optional", "wraps": ["audit", "prometheus"], "pad": 8 }
+  ],
+  "connections": [
+    { "id": "maker-token", "from": "maker", "to": "control", "label": "POST /api/token", "variant": "emphasis", "labelAt": [205, 100] },
+    { "id": "checker-ws", "from": "checker", "to": "control", "label": "WS queries:* · POST /api/kill", "labelAt": [190, 320] },
+    { "id": "client-connect", "from": "client", "to": "dataplane", "label": "connect — token as username", "variant": "security", "fromSide": "bottom", "toSide": "bottom", "via": [[95, 520], [855, 520]] },
+    { "id": "control-valkey", "from": "control", "to": "valkey", "label": "GETDEL / SETEX / PubSub", "labelAt": [462, 264] },
+    { "id": "valkey-dataplane", "from": "valkey", "to": "dataplane", "label": "GETDEL / PubSub / watch keys", "labelAt": [715, 264] },
+    { "id": "dp-mysql", "from": "dataplane", "to": "mysql", "label": "real credentials", "variant": "security", "fromSide": "right", "toSide": "left", "labelAt": [1105, 176] },
+    { "id": "dp-pg", "from": "dataplane", "to": "pg", "label": "real credentials", "variant": "security", "fromSide": "right", "toSide": "left", "labelAt": [1105, 316] },
+    { "id": "dp-mssql", "from": "dataplane", "to": "mssql", "label": "real credentials", "variant": "security", "fromSide": "right", "toSide": "left", "labelAt": [1105, 456] },
+    { "id": "control-audit", "from": "control", "to": "audit", "label": "session rows (maker + checker)", "variant": "dashed", "fromSide": "bottom", "toSide": "top" },
+    { "id": "dp-prometheus", "from": "dataplane", "to": "prometheus", "label": "OTel metrics", "variant": "dashed", "fromSide": "bottom", "toSide": "top" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Zero-trust core", "items": ["No credentials to clients — makers only ever hold a single-use token", "Token consumed atomically (GETDEL) on first connect; 300 s TTL", "Real DB username/password resolved inside the data plane"] },
+    { "dot": "emerald", "title": "Plane isolation", "items": ["Control and data planes couple only through Valkey", "No HTTP between planes — kill and events flow via Pub/Sub", "Read-write access requires a live checker (write-gating)"] },
+    { "dot": "rose", "title": "Audit everywhere", "items": ["Every query logged with username, ticket, db user, statement type", "Query output capture behind a config flag", "Optional MySQL audit table + OTel metrics endpoint"] }
+  ]
+}

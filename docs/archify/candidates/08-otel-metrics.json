@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "OpenTelemetry Metrics — Data Plane → Prometheus",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 380],
+    "views": [
+      { "id": "metric-path", "label": "Instruments → scrape", "focus": ["proxies", "meter", "endpoint", "prometheus", "grafana"], "note": "Operational moments are wired to instruments; Prometheus scrapes OpenMetrics text." }
+    ]
+  },
+  "stages": [
+    { "label": "Data plane :3306" },
+    { "label": "Meter" },
+    { "label": "HTTP endpoint" },
+    { "label": "Observability" }
+  ],
+  "nodes": [
+    { "id": "proxies", "type": "backend", "label": "Proxies", "sublabel": "MySQL / PG / MSSQL", "stage": 0, "row": 0, "tag": "operational moments" },
+    { "id": "meter", "type": "backend", "label": "Meter", "sublabel": "zerotrust.proxy", "stage": 1, "row": 0, "tag": "counters/updown/hist" },
+    { "id": "endpoint", "type": "cloud", "label": ":9464/metrics", "sublabel": "OpenMetrics text", "stage": 2, "row": 0, "tag": "promhttp handler" },
+    { "id": "prometheus", "type": "cloud", "label": "Prometheus", "sublabel": "scrape every 15s", "stage": 3, "row": 0, "tag": "zerotrust_proxy_*" },
+    { "id": "grafana", "type": "frontend", "label": "Grafana / alerts", "sublabel": "dashboards", "stage": 3, "row": 1, "tag": "visualize" }
+  ],
+  "flows": [
+    { "id": "instruments", "from": "proxies", "to": "meter", "label": "counters, updown, histograms", "classification": "wired at operational moments", "variant": "emphasis", "labelAt": [220, 215] },
+    { "id": "export", "from": "meter", "to": "endpoint", "label": "promhttp handler", "classification": "OpenMetrics text", "variant": "default", "route": "straight", "labelAt": [422, 157] },
+    { "id": "scrape", "from": "prometheus", "to": "endpoint", "label": "scrape 15s", "classification": "pull", "variant": "emphasis", "fromSide": "left", "toSide": "right", "route": "straight", "labelAt": [640, 205] },
+    { "id": "dashboards", "from": "prometheus", "to": "grafana", "label": "metrics + alerts", "classification": "dashboards", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [745, 210] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Instruments at the moments", "items": ["tokens_validated / tokens_rejected — token GETDEL outcome", "connections_total / connections_active — session lifecycle", "queries_total (stmt_type, status) + gate_blocks_total — every query and gate block", "kills_total, session_duration, query_duration"] },
+    { "dot": "emerald", "title": "Counted twice on purpose", "items": ["A gated command increments gate_blocks_total AND queries_total{status=error}", "Its audit event is a query event with error status — both counts agree", "Names are namespaced zerotrust_proxy_* for Prometheus conventions"] },
+    { "dot": "rose", "title": "Configuration", "items": ["enabled: false (default) → nil wrapper, one nil check per call site", "Invalid listen address / empty path → fail-fast at startup", "When on, the log line msg=\"metrics endpoint\" is the operational signal"] }
+  ]
+}

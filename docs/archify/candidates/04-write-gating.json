@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Write-Gating — Maker–Checker Gate on Read-Write Sessions",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [930, 960],
+    "views": [
+      { "id": "blocked-path", "label": "Blocked — no checker", "focus": ["maker", "dataplane", "valkey"], "note": "The held command times out with a readable error; nothing reaches the DB." },
+      { "id": "reopen-path", "label": "Re-open — checker attaches", "focus": ["checker", "valkey", "dataplane", "db"], "note": "A returning checker re-opens the gate; the maker resumes without reconnecting." }
+    ]
+  },
+  "participants": [
+    { "id": "maker", "type": "frontend", "label": "Maker (rw)", "sublabel": "sqlcmd / mysql / psql" },
+    { "id": "dataplane", "type": "backend", "label": "Data Plane", "sublabel": "per-command gate" },
+    { "id": "valkey", "type": "database", "label": "Valkey", "sublabel": "watch:<sid> presence" },
+    { "id": "checker", "type": "frontend", "label": "Checker UI", "sublabel": "watches the session" },
+    { "id": "db", "type": "database", "label": "Target DB", "sublabel": "MySQL / PG / MSSQL" }
+  ],
+  "segments": [
+    { "from": 180, "to": 330, "label": "1 · Connect + gate check" },
+    { "from": 375, "to": 560, "label": "2 · No checker — grace window rejects" },
+    { "from": 605, "to": 877, "label": "3 · Checker attaches — gate re-opens (no latch)" }
+  ],
+  "messages": [
+    { "id": "connect-rw", "from": "maker", "to": "dataplane", "y": 195, "label": "connect with rw token", "variant": "security" },
+    { "id": "getdel-access", "from": "dataplane", "to": "valkey", "y": 240, "label": "GETDEL token → access=write", "variant": "security" },
+    { "id": "insert-no-checker", "from": "maker", "to": "dataplane", "y": 295, "label": "INSERT ... — no checker yet", "variant": "emphasis" },
+    { "id": "probe-watch", "from": "dataplane", "to": "valkey", "y": 355, "label": "probe watch:<sid> → absent; wait up to gate_wait_seconds (default 20s)", "variant": "default" },
+    { "id": "gate-error", "from": "dataplane", "to": "maker", "y": 415, "label": "readable auth error — mysql 1045 / pg 28000 / mssql login-fail", "variant": "security" },
+    { "id": "audit-error", "from": "dataplane", "to": "valkey", "y": 465, "label": "audit event status=error \"maker gating: no checker connected\"", "variant": "dashed" },
+    { "id": "checker-watch", "from": "checker", "to": "valkey", "y": 530, "label": "select session → watch:<sid> = 1 (identity-checked: checker ≠ maker)", "variant": "emphasis" },
+    { "id": "next-command", "from": "maker", "to": "dataplane", "y": 600, "label": "next command — same connection, no reconnect", "variant": "emphasis" },
+    { "id": "gate-open", "from": "dataplane", "to": "valkey", "y": 650, "label": "watch:<sid> present → gate open", "variant": "default" },
+    { "id": "forward-query", "from": "dataplane", "to": "db", "y": 705, "label": "command forwarded — held queries flush in order", "variant": "emphasis" },
+    { "id": "rows-ok", "from": "db", "to": "dataplane", "y": 755, "label": "rows / OK", "variant": "return" },
+    { "id": "result-to-maker", "from": "dataplane", "to": "maker", "y": 800, "label": "result", "variant": "return" },
+    { "id": "audit-ok", "from": "dataplane", "to": "valkey", "y": 845, "label": "audit event status=ok", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "dataplane", "from": 195, "to": 470, "type": "backend" },
+    { "participant": "dataplane", "from": 600, "to": 850, "type": "backend" },
+    { "participant": "valkey", "from": 240, "to": 250, "type": "database" },
+    { "participant": "valkey", "from": 355, "to": 360, "type": "database" },
+    { "participant": "valkey", "from": 530, "to": 655, "type": "database" },
+    { "participant": "db", "from": 705, "to": 760, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "rose", "title": "The rule", "items": ["access=write sessions cannot execute SQL without a watching checker", "Enforced inside the data plane, per command, before any byte is forwarded", "Read-only makers are never gated"] },
+    { "dot": "cyan", "title": "Grace + re-open", "items": ["Unwatched commands are held for gate_wait_seconds (default 20, 0 = reject)", "A checker arriving in the window unblocks held commands, in order", "No permanent latch — a returning checker re-opens the gate"] },
+    { "dot": "amber", "title": "Separation of duties", "items": ["The watcher cannot be the session's maker — WS attach is identity-checked", "Same user → 1008 policy-violation close, no watch:<sid> lease", "Unknown/expired session record → fail-closed, rejected the same way"] }
+  ]
+}
