@@ -135,7 +135,10 @@ func TestKillPublishesCtlKill(t *testing.T) {
 // 200 and the issued tok:<token> key exists in Valkey with the ticket.
 func TestTokenRequiresTicketID(t *testing.T) {
 	srv, client, _ := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	// /api/token's session leg still resolves the legacy cookie session
+	// (until Task 7) — since Task 6 /api/login issues a JWT and no cookie,
+	// the cookie session is planted directly.
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 
 	noTicket := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3306","db_type":"mysql"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",

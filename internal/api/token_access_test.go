@@ -79,7 +79,10 @@ func issueToken(t *testing.T, client *http.Client, base, body string) string {
 // (the data plane treats absent access as read).
 func TestTokenAccessFromPreset(t *testing.T) {
 	srv, client, vs, _ := newPresetTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	// The /api/token session leg still resolves the legacy cookie session
+	// (until Task 7) — since Task 6 /api/login issues a JWT and no cookie,
+	// the cookie session is planted directly.
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 	ctx := context.Background()
 
 	cases := []struct {
@@ -116,7 +119,7 @@ func TestTokenAccessFromPreset(t *testing.T) {
 // and the issue-time session id + ticket.
 func TestTokenAccessMSSQLPresets(t *testing.T) {
 	srv, client, vs, _ := newPresetTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 	ctx := context.Background()
 
 	cases := []struct {
@@ -156,7 +159,7 @@ func TestTokenAccessMSSQLPresets(t *testing.T) {
 // oracle} still gets 422 with the canonical message.
 func TestTokenRejectsInvalidDBType(t *testing.T) {
 	srv, client, _, _ := newPresetTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL) // legacy cookie session for the /api/token leg (until Task 7)
+	cookieSessionAs(t, client, srv.URL, testJWTUser) // legacy cookie session for the /api/token leg (until Task 7)
 
 	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mongodb","ticket_id":"T-9-3"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json", strings.NewReader(body))

@@ -121,8 +121,10 @@ func tokenBody(username string) string {
 func TestTokenUsernameBindingAccept(t *testing.T) {
 	srv, client, _ := newTestAPIServer(t)
 	// /api/token's session leg still resolves the legacy cookie session
-	// (the bare route is migrated to JWT in Task 7) — loginViaAPI supplies it.
-	loginViaAPI(t, client, srv.URL)
+	// (the bare route is migrated to JWT in Task 7) — /api/login has issued
+	// a JWT, no cookie, since Task 6, so the cookie session is planted
+	// directly.
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
 		strings.NewReader(tokenBody("admin")))
@@ -140,7 +142,7 @@ func TestTokenUsernameBindingAccept(t *testing.T) {
 // rejected — the body cannot forge a different maker identity.
 func TestTokenUsernameBindingMismatch(t *testing.T) {
 	srv, client, _ := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
 		strings.NewReader(tokenBody("alice")))
@@ -165,7 +167,7 @@ func TestTokenUsernameBindingMismatch(t *testing.T) {
 // SESSION username (the body is never trusted).
 func TestTokenUsernameEmptyBindsSession(t *testing.T) {
 	srv, client, _ := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	cookieSessionAs(t, client, srv.URL, testJWTUser)
 
 	// Strip the username field entirely.
 	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-9.9"}`

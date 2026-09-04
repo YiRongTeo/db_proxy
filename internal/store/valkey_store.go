@@ -256,6 +256,44 @@ func (s *ValkeyStore) DeleteSession(ctx context.Context, id string) error {
 	return s.client.Do(ctx, s.client.B().Del().Key("sess:ui:"+id).Build()).Error()
 }
 
+// jwtDenyPrefix keys the bearer-JWT jti denylist (Task 6): jwt:deny:<jti>
+// EXISTS while that token id is revoked. /api/logout writes the key with a
+// TTL equal to the token's remaining life; requireJWT consults it before
+// accepting a token, so a logged-out token is rejected until it would have
+// expired on its own. jti values are 32-hex-char randoms (jwt.go newJTI),
+// so the keyspace cannot collide with anything else and a denial can never
+// leak principal data.
+const jwtDenyPrefix = "jwt:deny:"
+
+// DenyJWT marks a token id as revoked until it expires. ttl is the token's
+// REMAINING life (the caller computes exp - now; requireJWT only consults
+// the denylist for unexpired tokens, so the entry need live no longer).
+// Mirrors SetWatchConn's SET … EX pattern. Empty jti and non-positive ttl
+// are caller bugs and refused — a bare jwt:deny: key or a never-expiring
+// denial must never be written.
+func (s *ValkeyStore) DenyJWT(ctx context.Context, jti string, ttl time.Duration) error {
+	if jti == "" {
+		return errors.New("deny jwt: empty jti")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("deny jwt: ttl must be > 0, got %v", ttl)
+	}
+	return s.client.Do(ctx, s.client.B().Set().
+		Key(jwtDenyPrefix + jti).
+		Value("1").Ex(ttl).Build()).Error()
+}
+
+// JWTDenied reports whether a token id sits on the denylist (EXISTS
+// jwt:deny:<jti>). An absent/expired entry reports false. requireJWT treats
+// an error as FAIL CLOSED (the caller rejects the request).
+func (s *ValkeyStore) JWTDenied(ctx context.Context, jti string) (bool, error) {
+	n, err := s.client.Do(ctx, s.client.B().Exists().Key(jwtDenyPrefix+jti).Build()).AsInt64()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // sessionLivePrefix keys the session directory entries (Task 8.2):
 // sess:live:<session_id> = JSON session record with a heartbeat TTL.
 const sessionLivePrefix = "sess:live:"

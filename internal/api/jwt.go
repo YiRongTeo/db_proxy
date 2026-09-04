@@ -92,16 +92,18 @@ func signJWT(cfg *config.ControlConfig, username, role string, ttl time.Duration
 var errUnauthorizedJWT = errors.New("unauthorized")
 
 // parseJWT verifies a raw bearer token against the middleware's config and
-// returns the principal session. Signature (HS256, cfg secret), exp, iss
-// and aud are all enforced by jwt/v5 parser options; sub and role are
-// checked afterwards (role ABSENT → reject, plan decision). When JWT auth
-// is not configured (jwt.enabled=false or an empty secret/issuer/audience —
-// the pre-JWT legacy cookie mode) the middleware fails CLOSED: no token can
-// be trusted, so every request is rejected.
-func (a *authMiddleware) parseJWT(raw string) (*models.Session, error) {
+// returns the principal session plus the verified claims (the jti the
+// Task 6 denylist needs — requireJWT consults it, handleLogout denylists
+// it). Signature (HS256, cfg secret), exp, iss and aud are all enforced by
+// jwt/v5 parser options; sub and role are checked afterwards (role ABSENT →
+// reject, plan decision). When JWT auth is not configured (jwt.enabled=false
+// or an empty secret/issuer/audience — the pre-JWT legacy cookie mode) the
+// middleware fails CLOSED: no token can be trusted, so every request is
+// rejected.
+func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error) {
 	j := a.cfg.JWT
 	if !j.Enabled || j.Secret == "" || j.Issuer == "" || j.Audience == "" {
-		return nil, errUnauthorizedJWT
+		return nil, jwtClaims{}, errUnauthorizedJWT
 	}
 	claims := &jwtClaims{}
 	tok, err := jwt.ParseWithClaims(raw, claims,
@@ -119,36 +121,66 @@ func (a *authMiddleware) parseJWT(raw string) (*models.Session, error) {
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 	)
 	if err != nil || !tok.Valid {
-		return nil, errUnauthorizedJWT
+		return nil, jwtClaims{}, errUnauthorizedJWT
 	}
 	if claims.Subject == "" {
-		return nil, errUnauthorizedJWT // no anonymous principals
+		return nil, jwtClaims{}, errUnauthorizedJWT // no anonymous principals
 	}
 	if claims.Role != "maker" && claims.Role != "checker" {
-		return nil, errUnauthorizedJWT // role absent or not a known role → reject
+		return nil, jwtClaims{}, errUnauthorizedJWT // role absent or not a known role → reject
 	}
-	return &models.Session{Username: claims.Subject, Role: claims.Role}, nil
+	return &models.Session{Username: claims.Subject, Role: claims.Role}, *claims, nil
 }
 
 // requireJWT guards a route with a self-issued HS256 bearer token: it reads
-// "Authorization: Bearer <token>", verifies signature + exp + iss + aud
-// (parseJWT), and injects the principal session under sessionKey{} so
-// sessionFrom(r) consumers keep working unchanged. Any failure answers 401
-// with the standard unauthorized body — the exact contract requireSession
-// had on these routes. (Valkey jti denylist consult: Task 6.)
+// "Authorization: Bearer ***", verifies signature + exp + iss + aud
+// (parseJWT), consults the Valkey jti denylist (Task 6: a logged-out token
+// is rejected even though its signature is fine), and injects the principal
+// session under sessionKey{} so sessionFrom(r) consumers keep working
+// unchanged. Any failure answers 401 with the standard unauthorized body —
+// the exact contract requireSession had on these routes. A denylist
+// consult ERROR fails CLOSED (401): revocation state must never be skipped
+// because the store hiccuped.
 func (a *authMiddleware) requireJWT(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(h, bearerPrefix) {
+		raw := bearerToken(r)
+		if raw == "" {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		sess, err := a.parseJWT(strings.TrimSpace(h[len(bearerPrefix):]))
+		sess, claims, err := a.parseJWT(raw)
 		if err != nil || sess == nil {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		// Task 6: a token id on the denylist (handleLogout wrote it) is
+		// revoked — 401. Tokens without a jti are skipped (never deniable);
+		// self-issued tokens always carry one (signJWT/newJTI).
+		if claims.ID != "" {
+			denied, err := a.vs.JWTDenied(r.Context(), claims.ID)
+			if err != nil {
+				a.log.Warn("requireJWT: denylist consult failed", "err", err)
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			if denied {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+		}
 		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// bearerToken extracts the raw token from "Authorization: Bearer ***"; ""
+// when the header is absent or uses any other scheme. The strict prefix
+// check keeps e.g. "Bearerish xyz" out — parseJWT must only ever see a real
+// bearer value (or "").
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, bearerPrefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(bearerPrefix):])
 }

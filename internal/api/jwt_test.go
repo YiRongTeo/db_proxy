@@ -7,6 +7,7 @@ package api
 // covered by the migrated route tests (me/kill/sessions/ws).
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"zerotrust-proxy/internal/config"
 	"zerotrust-proxy/internal/models"
+	"zerotrust-proxy/internal/store"
 )
 
 // requireJWTCapture runs req through a requireJWT-wrapped handler that
@@ -42,6 +44,40 @@ func testJWTFixture() *authMiddleware {
 	}}
 }
 
+// testJWTStoreFixture is testJWTFixture wired to the LIVE Valkey — the jti
+// denylist consult in requireJWT (Task 6) needs a.vs. Only the
+// acceptance-path tests need it: every rejection branch fails in parseJWT
+// (or at the header) before the store is touched, so the plain cfg-only
+// fixture stays sufficient for them.
+func testJWTStoreFixture(t *testing.T) *authMiddleware {
+	t.Helper()
+	a := testJWTFixture()
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	a.vs = vs
+	return a
+}
+
+// jwtID parses a signed token with the config secret and returns its jti
+// claim — test access to the denylist key of a minted token.
+func jwtID(t *testing.T, cfg *config.ControlConfig, tok string) string {
+	t.Helper()
+	claims := &jwtClaims{}
+	_, err := jwt.ParseWithClaims(tok, claims, func(*jwt.Token) (any, error) {
+		return []byte(cfg.JWT.Secret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	if err != nil {
+		t.Fatalf("parse token for jti: %v", err)
+	}
+	if claims.ID == "" {
+		t.Fatal("token carries no jti")
+	}
+	return claims.ID
+}
+
 // bearerReq builds a GET request with the given Authorization header value
 // ("" = no header at all).
 func bearerReq(header string) *http.Request {
@@ -59,7 +95,7 @@ func bearerReq(header string) *http.Request {
 // consumers (handleMe, SoD checkerMayWatch, audit, mint binding) are
 // unchanged.
 func TestRequireJWTValidTokenInjectsSession(t *testing.T) {
-	a := testJWTFixture()
+	a := testJWTStoreFixture(t)
 	tok := mintJWT(t, a.cfg, "alice", "checker")
 
 	sess, status := requireJWTCapture(t, a, bearerReq(authHeader(tok)))
@@ -76,7 +112,7 @@ func TestRequireJWTValidTokenInjectsSession(t *testing.T) {
 
 // TestRequireJWTValidTokenMakerRole: the maker role round-trips too.
 func TestRequireJWTValidTokenMakerRole(t *testing.T) {
-	a := testJWTFixture()
+	a := testJWTStoreFixture(t)
 	tok := mintJWT(t, a.cfg, "bob", "maker")
 
 	sess, status := requireJWTCapture(t, a, bearerReq(authHeader(tok)))
@@ -85,6 +121,25 @@ func TestRequireJWTValidTokenMakerRole(t *testing.T) {
 	}
 	if sess == nil || sess.Role != "maker" || sess.Username != "bob" {
 		t.Errorf("injected session = %+v, want Username=bob Role=maker", sess)
+	}
+}
+
+// TestRequireJWTDeniedToken: a token whose jti sits on the Valkey denylist
+// (Task 6 — the state /api/logout writes) is rejected with 401 even though
+// its signature/exp/iss/aud/role all verify. The consult runs AFTER
+// signature validation, so only genuinely valid tokens reach it.
+func TestRequireJWTDeniedToken(t *testing.T) {
+	a := testJWTStoreFixture(t)
+	tok := mintJWT(t, a.cfg, "alice", "checker")
+
+	if _, status := requireJWTCapture(t, a, bearerReq(authHeader(tok))); status != http.StatusOK {
+		t.Fatalf("pre-deny status %d, want 200", status)
+	}
+	if err := a.vs.DenyJWT(context.Background(), jwtID(t, a.cfg, tok), 5*time.Minute); err != nil {
+		t.Fatalf("DenyJWT: %v", err)
+	}
+	if _, status := requireJWTCapture(t, a, bearerReq(authHeader(tok))); status != http.StatusUnauthorized {
+		t.Errorf("denied token: status %d, want 401", status)
 	}
 }
 

@@ -1,10 +1,9 @@
 package api
 
-// Task 5: GET /api/me is guarded by requireJWT — the bearer token the SPA
-// will receive from /api/login (Task 6) replaces the zt_session cookie on
-// this route. The legacy cookie login still exists (until Task 6/4) and is
-// exercised where it still governs: /api/login itself and the /api/token
-// session leg.
+// Task 5/6: GET /api/me is guarded by requireJWT — the bearer token issued
+// by /api/login (JWT since Task 6) replaces the legacy zt_session cookie on
+// this route. /api/me reports {username, role} for the SPA's boot-time
+// session restore; logout (Task 6) denylists the token so a replay is 401.
 
 import (
 	"context"
@@ -60,13 +59,12 @@ func TestMeRequiresJWT(t *testing.T) {
 	}
 }
 
-// TestMeAfterLogin: log in through the real endpoint (still cookie-based
-// until Task 6) and present a bearer token for the logged-in principal —
-// GET /api/me → 200 with the session's username.
+// TestMeAfterLogin: log in through the real endpoint and present the
+// returned JWT — GET /api/me → 200 with the principal's username and role.
 func TestMeAfterLogin(t *testing.T) {
-	srv, client, cfg := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
-	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
+	srv, client, _ := newTestAPIServer(t)
+	tok := loginJWT(t, client, srv.URL, testJWTUser, testJWTPassword)
+	client = withBearer(client, tok)
 
 	resp, err := client.Get(srv.URL + "/api/me")
 	if err != nil {
@@ -83,19 +81,34 @@ func TestMeAfterLogin(t *testing.T) {
 	if got["username"] != testJWTUser {
 		t.Errorf("GET /api/me username = %q, want %q", got["username"], testJWTUser)
 	}
+	if got["role"] != "maker" {
+		t.Errorf("GET /api/me role = %q, want maker", got["role"])
+	}
 }
 
-// TestMeAfterLogout: POST /api/logout still clears the legacy zt_session
-// cookie (200). Bearer revocation is NOT wired yet — the jti denylist lands
-// in Task 6 — so this test asserts the transitional contract: after logout
-// the cookie is gone and a client with no bearer (and no cookie) is
-// rejected by /api/me. Task 6 rewrites logout to denylist the presented
-// token and adds the token-revocation assertions.
+// TestMeAfterLogout: POST /api/logout with the presented bearer token →
+// 200; the logged-out token replayed on /api/me → 401 (the jti denylist of
+// Task 6).
 func TestMeAfterLogout(t *testing.T) {
 	srv, client, _ := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	tok := loginJWT(t, client, srv.URL, testJWTUser, testJWTPassword)
+	authed := withBearer(client, tok)
 
-	resp, err := client.Post(srv.URL+"/api/logout", "application/json", nil)
+	resp, err := authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me before logout: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/me before logout: status %d, want 200", resp.StatusCode)
+	}
+
+	logoutReq, err := http.NewRequest(http.MethodPost, srv.URL+"/api/logout", nil)
+	if err != nil {
+		t.Fatalf("new logout request: %v", err)
+	}
+	logoutReq.Header.Set("Authorization", authHeader(tok))
+	resp, err = authed.Do(logoutReq)
 	if err != nil {
 		t.Fatalf("POST /api/logout: %v", err)
 	}
@@ -104,12 +117,12 @@ func TestMeAfterLogout(t *testing.T) {
 		t.Fatalf("POST /api/logout: status %d, want 200", resp.StatusCode)
 	}
 
-	resp, err = client.Get(srv.URL + "/api/me")
+	resp, err = authed.Get(srv.URL + "/api/me")
 	if err != nil {
 		t.Fatalf("GET /api/me: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("GET /api/me after logout (no bearer, no cookie): status %d, want 401", resp.StatusCode)
+		t.Errorf("GET /api/me with logged-out token: status %d, want 401", resp.StatusCode)
 	}
 }

@@ -825,3 +825,94 @@ func TestSessionTokenInfiniteTTL(t *testing.T) {
 		t.Fatalf("consume after DeleteToken: got=%v err=%v, want nil", got, err)
 	}
 }
+
+// --- Task 6: bearer-JWT jti denylist (jwt:deny:<jti> keys) ------------------
+
+func uniqueJTI(t *testing.T) string {
+	t.Helper()
+	id, err := newID()
+	if err != nil {
+		t.Fatalf("newID: %v", err)
+	}
+	return "test-jti-" + id
+}
+
+// TestJWTDenyLifecycle: a fresh jti is not denied; DenyJWT puts it on the
+// list (JWTDenied true) with a bounded TTL; cleanupKey removes it for the
+// next run.
+func TestJWTDenyLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	jti := uniqueJTI(t)
+	cleanupKey(t, s, "jwt:deny:"+jti)
+
+	denied, err := s.JWTDenied(ctx, jti)
+	if err != nil {
+		t.Fatalf("JWTDenied(fresh): %v", err)
+	}
+	if denied {
+		t.Error("JWTDenied(fresh) = true, want false")
+	}
+
+	if err := s.DenyJWT(ctx, jti, 60*time.Second); err != nil {
+		t.Fatalf("DenyJWT: %v", err)
+	}
+	denied, err = s.JWTDenied(ctx, jti)
+	if err != nil {
+		t.Fatalf("JWTDenied(after deny): %v", err)
+	}
+	if !denied {
+		t.Error("JWTDenied(after deny) = false, want true")
+	}
+	// The denylist key carries a TTL bounded by the caller's ttl — a
+	// revoked jti must not outlive the token it denies.
+	ttl, err := s.client.Do(ctx, s.client.B().Ttl().Key("jwt:deny:"+jti).Build()).AsInt64()
+	if err != nil {
+		t.Fatalf("TTL(jwt:deny:): %v", err)
+	}
+	if ttl <= 0 || ttl > 60 {
+		t.Errorf("denylist TTL = %d, want (0, 60]", ttl)
+	}
+}
+
+// TestJWTDenyExpires: the denylist entry self-expires with its TTL — after
+// the token's natural lifetime nothing remembers the jti.
+func TestJWTDenyExpires(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	jti := uniqueJTI(t)
+	cleanupKey(t, s, "jwt:deny:"+jti)
+
+	if err := s.DenyJWT(ctx, jti, time.Second); err != nil {
+		t.Fatalf("DenyJWT: %v", err)
+	}
+	if denied, err := s.JWTDenied(ctx, jti); err != nil || !denied {
+		t.Fatalf("JWTDenied right after deny = %v (err %v), want true", denied, err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	denied, err := s.JWTDenied(ctx, jti)
+	if err != nil {
+		t.Fatalf("JWTDenied after expiry: %v", err)
+	}
+	if denied {
+		t.Error("JWTDenied after TTL expiry = true, want false")
+	}
+}
+
+// TestDenyJWTRejectsBadInput: an empty jti or non-positive TTL is a caller
+// bug — the store refuses instead of writing a poisoned jwt:deny: key or a
+// never-expiring denial.
+func TestDenyJWTRejectsBadInput(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.DenyJWT(ctx, "", 60*time.Second); err == nil {
+		t.Error("DenyJWT(empty jti) = nil error, want error")
+	}
+	if err := s.DenyJWT(ctx, "some-jti", 0); err == nil {
+		t.Error("DenyJWT(ttl 0) = nil error, want error")
+	}
+	if err := s.DenyJWT(ctx, "some-jti", -time.Second); err == nil {
+		t.Error("DenyJWT(negative ttl) = nil error, want error")
+	}
+}

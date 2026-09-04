@@ -3,10 +3,9 @@ package api
 // Task 9.13 — optional extra UI users (auth.users): a dedicated checker
 // account so maker and checker roles can use different identities (the SoD
 // watch rejects checker == maker). The primary admin pair stays the
-// primary; extra users authenticate through the same /api/login endpoint
-// (which still issues the legacy cookie until Task 6, when it switches to
-// returning a JWT — /api/me already demands the bearer, so the guarded-route
-// leg below presents a minted checker token).
+// primary; extra users authenticate through the same /api/login endpoint,
+// which (Task 6) issues a JWT carrying the user's declared role — the
+// guarded-route leg below presents the REAL login token.
 
 import (
 	"context"
@@ -57,11 +56,16 @@ func TestExtraUserLogin(t *testing.T) {
 
 	client := newJarClient(t)
 
-	if got := loginAs(t, client, srv.URL, "checker", "checker-pw"); got != http.StatusOK {
-		t.Fatalf("checker login status %d, want 200", got)
+	// The extra user's login token carries their declared role (checker).
+	_, login := doLogin(t, client, srv.URL, "checker", "checker-pw")
+	if login.Token == "" {
+		t.Fatal("checker login: empty token")
 	}
-	// /api/me is bearer-guarded: present a token for the checker identity.
-	authed := withBearer(client, mintJWT(t, cfg, "checker", "checker"))
+	if login.Username != "checker" || login.Role != "checker" {
+		t.Errorf("checker login = %+v, want username=checker role=checker", login)
+	}
+	// /api/me is bearer-guarded: the login token authenticates as checker.
+	authed := withBearer(client, login.Token)
 	resp, err := authed.Get(srv.URL + "/api/me")
 	if err != nil {
 		t.Fatalf("GET /api/me: %v", err)
@@ -69,8 +73,8 @@ func TestExtraUserLogin(t *testing.T) {
 	defer resp.Body.Close()
 	body := make([]byte, 256)
 	n, _ := resp.Body.Read(body)
-	if !strings.Contains(string(body[:n]), `"username":"checker"`) {
-		t.Errorf("/api/me = %s, want username checker", string(body[:n]))
+	if !strings.Contains(string(body[:n]), `"username":"checker"`) || !strings.Contains(string(body[:n]), `"role":"checker"`) {
+		t.Errorf("/api/me = %s, want username checker + role checker", string(body[:n]))
 	}
 
 	// Wrong password for the extra user → 401.

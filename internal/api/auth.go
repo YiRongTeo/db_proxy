@@ -116,11 +116,22 @@ func (a *authMiddleware) validCredentials(username, password string) bool {
 	return false
 }
 
-// sessionTLS reports whether the plane serves HTTPS — the zt_session cookie
-// gets the Secure attribute only then (review 9.9: no Secure flag on
-// plaintext dev deployments, where an HTTPS-only cookie would break login).
-func (a *authMiddleware) sessionTLS() bool {
-	return a.cfg.TLS != nil && a.cfg.TLS.Enabled
+// roleFor resolves a principal's maker|checker role from the config (Task 6
+// JWT login): the primary auth.username maps to cfg.AuthRole, and each
+// auth.users entry carries its own declared role. Callers have already
+// passed validCredentials, so the user IS one of those identities — "" is
+// returned only if the config changed between the two lookups (never in
+// practice; handleLogin treats it as internal).
+func (a *authMiddleware) roleFor(username string) string {
+	if secureEqual(username, a.cfg.AuthUser) {
+		return a.cfg.AuthRole
+	}
+	for _, u := range a.cfg.AuthUsers {
+		if secureEqual(username, u.Username) {
+			return u.Role
+		}
+	}
+	return ""
 }
 
 type authMiddleware struct {
@@ -177,11 +188,16 @@ func sessionFrom(r *http.Request) *models.Session {
 	return nil
 }
 
-// handleLogin validates credentials (constant-time compares) and creates a
-// Valkey-backed session. Failed attempts are rate-limited per (IP,
-// username): after loginMaxFailures failures in loginRateWindow the key is
-// blocked with 429 until the window rolls over (review 9.9 login rate
-// limit).
+// handleLogin (JWT since Task 6; registered only when
+// auth.jwt.login_enabled) validates credentials (constant-time compares)
+// and self-issues an HS256 bearer JWT: 200 {token, username, role,
+// expires_in}. NO cookie and NO Valkey session — the token is the only
+// credential handed to the SPA. The role comes from the config lookup
+// (roleFor): primary auth.username → cfg.AuthRole, an auth.users match →
+// that entry's role. Failed attempts are rate-limited per (IP, username)
+// EXACTLY as before (review 9.9): after loginMaxFailures failures in
+// loginRateWindow the key is blocked with 429 until the window rolls over,
+// and a success clears the counter.
 func (a *authMiddleware) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
@@ -205,41 +221,81 @@ func (a *authMiddleware) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.loginLimiter.clear(key)
-	id, err := a.vs.CreateSession(r.Context(), models.Session{
-		Username: req.Username,
-	}, time.Duration(a.cfg.SessionTTL)*time.Hour)
-	if err != nil {
+	role := a.roleFor(req.Username)
+	if role == "" {
+		// Unreachable after validCredentials — config raced between the two
+		// lookups. Never issue an un-role'd token (an accidental superuser).
+		a.log.Error("login: no role for authenticated user", "username", req.Username)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: id, Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: a.cfg.SessionTTL * 3600,
-		Secure: a.sessionTLS(), // review 9.9: Secure cookie when the plane serves TLS
+	ttlSeconds := a.cfg.JWT.TTLSeconds
+	if ttlSeconds <= 0 {
+		// Config bug (auth.jwt.ttl_seconds default 28800): an instant-expiry
+		// token would 401 on every guarded route — refuse to mint it.
+		a.log.Error("login: auth.jwt.ttl_seconds must be > 0", "ttl_seconds", ttlSeconds)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	token, err := signJWT(a.cfg, req.Username, role, time.Duration(ttlSeconds)*time.Second, time.Now())
+	if err != nil {
+		a.log.Error("login: sign jwt", "err", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":      token,
+		"username":   req.Username,
+		"role":       role,
+		"expires_in": ttlSeconds,
 	})
-	writeJSON(w, http.StatusOK, map[string]string{"username": req.Username})
 }
 
-// handleMe reports the session-authenticated caller's username (Task 5.7).
-// requireSession already rejected unauthenticated requests with 401, so the
-// session is always present (review 9.9: the unreachable nil branch was
-// dead code — removed).
+// handleMe reports the bearer-authenticated caller's username AND role
+// (Task 5.7 route; role added Task 6 for the SPA's boot-time session
+// restore). requireJWT already rejected unauthenticated requests with 401,
+// so the session is always present.
 func (a *authMiddleware) handleMe(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"username": sessionFrom(r).Username})
+	sess := sessionFrom(r)
+	writeJSON(w, http.StatusOK, map[string]string{"username": sess.Username, "role": sess.Role})
 }
 
+// handleLogout (JWT since Task 6) revokes the PRESENTED bearer token: the
+// token's jti is denylisted in Valkey for the token's remaining life
+// (exp - now, floored at 1s) — replaying the same token on a guarded route
+// then answers 401 until it would have expired anyway. No cookie, no
+// session delete: the jwt:deny:<jti> key IS the revocation. A missing or
+// unverifiable bearer is rejected 401 (nothing to revoke, nothing leaked);
+// a denylist write failure answers 500 — silent logout would leave the
+// token live while the SPA believes it is gone.
 func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
-		// Review 9.9 MINOR: a failed session delete is logged, not silent.
-		if err := a.vs.DeleteSession(r.Context(), c.Value); err != nil {
-			a.log.Warn("logout: session delete failed", "err", err)
-		}
-		// The clear cookie mirrors the set cookie's attributes (Secure in
-		// particular) so browsers actually replace it.
-		http.SetCookie(w, &http.Cookie{
-			Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
-			HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.sessionTLS(),
-		})
+	raw := bearerToken(r)
+	if raw == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	sess, claims, err := a.parseJWT(raw)
+	if err != nil || sess == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if claims.ID == "" {
+		// A valid token without a jti cannot be revoked — fail loudly
+		// instead of pretending the logout happened.
+		a.log.Error("logout: token carries no jti — cannot revoke")
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	// Deny for the token's remaining life (floor 1s): parseJWT already
+	// rejected expired tokens, so exp is in the future.
+	remaining := time.Until(claims.ExpiresAt.Time)
+	if remaining < time.Second {
+		remaining = time.Second
+	}
+	if err := a.vs.DenyJWT(r.Context(), claims.ID, remaining); err != nil {
+		a.log.Error("logout: deny jwt failed", "err", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }

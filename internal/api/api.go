@@ -62,8 +62,13 @@ func NewAPI(log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, 
 func (a *api) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
-	mux.HandleFunc("POST /api/login", a.auth.handleLogin)
-	mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
+	// Task 6: /api/login + /api/logout exist ONLY when auth.jwt.login_enabled
+	// — with login disabled the plane may run external-JWT-only, and the
+	// paths fall through to the spaHandler /api guard (404), never HTML.
+	if a.cfg.JWT.LoginEnabled {
+		mux.HandleFunc("POST /api/login", a.auth.handleLogin)
+		mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
+	}
 	mux.HandleFunc("GET /api/me", a.auth.requireJWT(a.auth.handleMe)) // Task 5.7: boot-time session restore (bearer JWT since Task 5)
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireJWT(a.handleDBPresets))
 	mux.HandleFunc("POST /api/token", a.handleToken)                         // auth inside (key OR cookie session — JWT migration is Task 7)

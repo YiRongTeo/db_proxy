@@ -9,6 +9,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -54,8 +55,10 @@ func testJWTBlock() config.JWTConfig {
 // JWT issuer/audience/secret: short exp (5 minutes), jti present. This is
 // the direct replacement for the cookie-session test helpers: mint a token
 // for the desired user+role and send requests with the Authorization header
-// (authHeader/withBearer). login still issues COOKIES until Task 6 — tests
-// must NOT expect /api/login to return a JWT yet.
+// (authHeader/withBearer). Since Task 6 the REAL login endpoint also
+// returns such a token (see loginJWT); mintJWT stays for identities the
+// login endpoint cannot authenticate (e.g. non-configured users on flows
+// that pair minted tokens with a legacy cookie session).
 func mintJWT(t *testing.T, cfg *config.ControlConfig, username, role string) string {
 	t.Helper()
 	tok, err := signJWT(cfg, username, role, 5*time.Minute, time.Now())
@@ -113,17 +116,13 @@ func newJarClient(t *testing.T) *http.Client {
 	return &http.Client{Jar: jar}
 }
 
-// loginViaAPI logs in through the real POST /api/login endpoint, letting
-// the cookie jar capture the zt_session cookie. KEPT (cookie-based): it is
-// the LEGACY session source for /api/token, whose bare route still resolves
-// sessions from the cookie until Task 4/7 migrates it — and /api/login
-// still issues cookies until Task 6. requireJWT-guarded routes do NOT
-// accept the cookie: pair the cookie session with withBearer(mintJWT(...))
-// when a flow hits both /api/token and a guarded route.
-func loginViaAPI(t *testing.T, client *http.Client, base string) {
+// loginJWT logs in through the real POST /api/login endpoint (Task 6
+// contract: valid creds → 200 {token, username, role, expires_in}, no
+// cookie) and returns the issued bearer token.
+func loginJWT(t *testing.T, client *http.Client, base, username, password string) string {
 	t.Helper()
 	resp, err := client.Post(base+"/api/login", "application/json",
-		strings.NewReader(`{"username":"`+testJWTUser+`","password":"`+testJWTPassword+`"}`))
+		strings.NewReader(`{"username":"`+username+`","password":"`+password+`"}`))
 	if err != nil {
 		t.Fatalf("POST /api/login: %v", err)
 	}
@@ -131,6 +130,38 @@ func loginViaAPI(t *testing.T, client *http.Client, base string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/login: status %d, want 200", resp.StatusCode)
 	}
+	var got struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode login body: %v", err)
+	}
+	if got.Token == "" {
+		t.Fatal("POST /api/login: empty token")
+	}
+	return got.Token
+}
+
+// newRawStore opens a package-level Valkey handle for tests that need one
+// beyond the server fixture (e.g. planting a legacy session cookie).
+func newRawStore(t *testing.T) *store.ValkeyStore {
+	t.Helper()
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	return vs
+}
+
+// cookieSessionAs installs a LEGACY zt_session cookie for user directly in
+// Valkey — the session source for /api/token flows whose bare route still
+// resolves cookie sessions until Task 4/7. Since Task 6 /api/login issues a
+// JWT and NO cookie, cookie-leg tests create the legacy session directly
+// instead of logging in (sessionAs with a throwaway store).
+func cookieSessionAs(t *testing.T, client *http.Client, base, user string) {
+	t.Helper()
+	sessionAs(t, client, base, newRawStore(t), user)
 }
 
 // sessionAs creates a LEGACY UI session for user directly in Valkey and
