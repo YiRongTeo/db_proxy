@@ -1,12 +1,17 @@
 import { Injectable, OnDestroy, signal } from '@angular/core';
 import { webSocket, WebSocketSubject, WebSocketSubjectConfig } from 'rxjs/webSocket';
 import { QueryEvent } from './api.service';
+import { TokenStore } from './token-store.service';
 
 /**
  * Checker-dashboard live feed. Monitor-only: connects to
- * ws://<origin>/ws/checker?channel=<channel> (HttpOnly session cookie is sent
- * automatically for same-origin WebSockets) and buffers decoded QueryEvents
- * in a 500-entry ring buffer.
+ * ws://<origin>/ws/checker?channel=<channel>&access_token=<jwt> (Task 11:
+ * browsers cannot set WebSocket handshake headers, so the bearer JWT held by
+ * the TokenStore rides as the access_token query param — the Task 9 backend
+ * accepts it as a fallback after the Authorization header) and buffers
+ * decoded QueryEvents in a 500-entry ring buffer. With no stored token the
+ * feed stays disconnected instead of dialing a handshake the server would
+ * reject as anonymous.
  *
  * NOTE (testability): rxjs 7.8.2's WebSocketSubject honors the `WebSocketCtor`
  * config key (it constructs the socket with `new WebSocketCtor(url)`); the
@@ -16,7 +21,9 @@ import { QueryEvent } from './api.service';
  * Task 8.15 seam: `connectState` is the ACCURATE socket state, driven by real
  * socket events (openObserver / error / complete), never by optimism. The
  * legacy `connected` signal keeps its documented optimistic semantics
- * (true right after connect()) for tests and any remaining consumers; the
+ * (true right after connect()) for tests and any remaining consumers — the
+ * one exception since Task 11 is connect() with no stored JWT, which returns
+ * early (nothing dialed) and leaves `connected` false. The
  * checker toolbar is driven by `connectState` (Task 9.11), and `connected`
  * is explicitly cleared in disconnect() — previously it could only flip
  * false via the socket's error/complete callbacks, which rxjs 7.8 never fires
@@ -28,6 +35,8 @@ import { QueryEvent } from './api.service';
  */
 @Injectable({ providedIn: 'root' })
 export class LiveQueryService implements OnDestroy {
+  constructor(private readonly tokens: TokenStore) {}
+
   private socket: WebSocketSubject<QueryEvent> | null = null;
 
   /** Bumped on every connect/disconnect; callbacks from older sockets are ignored. */
@@ -57,10 +66,25 @@ export class LiveQueryService implements OnDestroy {
 
   connect(channel: string) {
     this.disconnect();
+    // Task 11: the Task 9 backend requires an authenticated WS (requireJWTWS
+    // — Authorization header first, access_token query fallback), and
+    // browsers cannot set WebSocket handshake headers, so the bearer JWT
+    // from the TokenStore rides on the URL. No token → stay in the
+    // disconnected state (disconnect() above already reset the signals)
+    // instead of dialing a feed the server would reject.
+    const token = this.tokens.get();
+    if (!token) {
+      this.connected.set(false);
+      this.connectState.set('closed');
+      return;
+    }
     const gen = ++this.generation;
-    const url = `${location.origin.replace(/^http/, 'ws')}/ws/checker?channel=${encodeURIComponent(channel)}`;
-    // Task 9.11: no withCredentials key — rxjs 7.8.2 ignores it at runtime
-    // (cookies ride along on same-origin WebSockets automatically).
+    const url =
+      `${location.origin.replace(/^http/, 'ws')}/ws/checker` +
+      `?channel=${encodeURIComponent(channel)}&access_token=${encodeURIComponent(token)}`;
+    // Task 9.11: no withCredentials key — rxjs 7.8.2 ignores it at runtime.
+    // The cookie rationale is gone since Task 11: the WS is authenticated by
+    // the access_token query param above, not by a session cookie.
     const config: WebSocketSubjectConfig<QueryEvent> = {
       url,
       // The real "socket opened" notification (rxjs fires openObserver.next

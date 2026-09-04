@@ -51,6 +51,23 @@ describe('LoginComponent', () => {
     expect(nav).toHaveBeenCalledWith(['/maker']);
   });
 
+  it('navigates to /checker after login when the server reports role checker', async () => {
+    api.login.mockReturnValue(
+      of({ token: 'jwt-checker', username: 'carol', role: 'checker', expires_in: 28800 }),
+    );
+    const nav = navigateSpy();
+    const fixture = TestBed.createComponent(LoginComponent);
+    const comp = fixture.componentInstance;
+    fixture.detectChanges();
+
+    comp.username.set('carol');
+    comp.password.set('s3cret');
+    comp.submit();
+    await fixture.whenStable();
+
+    expect(nav).toHaveBeenCalledWith(['/checker']);
+  });
+
   it('navigates to returnUrl after login when the authGuard redirected here', async () => {
     TestBed.overrideProvider(ActivatedRoute, { useValue: routeWithReturnUrl('/checker') });
     const nav = navigateSpy();
@@ -123,6 +140,20 @@ describe('LoginComponent', () => {
     fixture.detectChanges();
 
     expect(nav).toHaveBeenCalledWith(['/maker']);
+  });
+
+  it('redirects to /checker on init when an existing session belongs to a checker', async () => {
+    api.login.mockReturnValue(
+      of({ token: 'jwt-checker', username: 'carol', role: 'checker', expires_in: 28800 }),
+    );
+    const nav = navigateSpy();
+    const auth = TestBed.inject(AuthService);
+    auth.login('carol', 's3cret').subscribe(); // sets user + role signals
+
+    const fixture = TestBed.createComponent(LoginComponent);
+    fixture.detectChanges();
+
+    expect(nav).toHaveBeenCalledWith(['/checker']);
   });
 
   it('redirects to returnUrl on init when a session already exists', async () => {

@@ -10,10 +10,14 @@ import { AuthService } from '../../core/auth.service';
 
 /**
  * Sign-in form (Task 2.8, replaces the placeholder). Submits credentials to
- * POST /api/login via AuthService; the HttpOnly `zt_session` cookie carries
- * the session from there on. Already-logged-in visitors bounce straight to
- * their `returnUrl` (or /maker). After a successful login the visitor is sent
- * to `returnUrl` when the authGuard redirected here with one (Task 5.7).
+ * POST /api/login via AuthService; since Task 10 the returned bearer JWT is
+ * held by the TokenStore (no more session cookie) and rides on every
+ * subsequent REST call (authInterceptor) and the checker WS (Task 11).
+ * Already-logged-in visitors bounce straight to their `returnUrl` (or their
+ * role's landing page). After a successful login the visitor is sent to
+ * `returnUrl` when the authGuard redirected here with one (Task 5.7) — and
+ * otherwise to the role-aware landing (Task 11): checker → /checker,
+ * maker → /maker.
  */
 @Component({
   selector: 'app-login',
@@ -41,8 +45,19 @@ export class LoginComponent implements OnInit {
 
   ngOnInit(): void {
     if (this.auth.isLoggedIn()) {
-      void this.router.navigate([this.returnUrl() ?? '/maker']);
+      void this.router.navigate([this.returnUrl() ?? this.defaultLanding()]);
     }
+  }
+
+  /**
+   * Role-aware landing page (Task 11): checkers land on the checker
+   * dashboard, makers on the maker portal. The role is the
+   * SERVER-confirmed one mirrored by AuthService from the login response /
+   * /api/me (never a client-side guess); anything other than 'checker'
+   * (maker, null, …) falls back to /maker.
+   */
+  private defaultLanding(): string {
+    return this.auth.role() === 'checker' ? '/checker' : '/maker';
   }
 
   /**
@@ -65,7 +80,7 @@ export class LoginComponent implements OnInit {
     this.auth.login(this.username().trim(), this.password()).subscribe({
       next: () => {
         this.submitting.set(false);
-        void this.router.navigate([this.returnUrl() ?? '/maker']);
+        void this.router.navigate([this.returnUrl() ?? this.defaultLanding()]);
       },
       error: (err) => {
         this.submitting.set(false);

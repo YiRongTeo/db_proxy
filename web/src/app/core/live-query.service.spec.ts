@@ -1,6 +1,10 @@
 import { TestBed } from '@angular/core/testing';
 import { QueryEvent } from './api.service';
 import { LiveQueryService } from './live-query.service';
+import { TokenStore } from './token-store.service';
+
+/** JWT the specs seed into the real TokenStore (Task 10/11 pattern). */
+const TEST_JWT = 'jwt-token-123';
 
 /**
  * Fake WebSocket wired through the LiveQueryService.socketCtor seam
@@ -64,6 +68,9 @@ describe('LiveQueryService', () => {
     TestBed.configureTestingModule({});
     service = TestBed.inject(LiveQueryService);
     service.socketCtor = FakeWebSocket as unknown as new (url: string) => WebSocket;
+    // Task 11: connect() refuses to dial without a stored JWT, so every
+    // dialing test seeds the real TokenStore first.
+    TestBed.inject(TokenStore).set(TEST_JWT);
   });
 
   it('appends QueryEvents to the ring buffer and caps it at 500', () => {
@@ -71,7 +78,9 @@ describe('LiveQueryService', () => {
     const fake = FakeWebSocket.instances[0];
     expect(fake).toBeDefined();
     expect(service.connected()).toBe(true);
-    expect(fake.url).toMatch(/^ws:\/\/.+\/ws\/checker\?channel=alice$/);
+    // Task 11: the URL carries the bearer JWT as access_token (browsers
+    // cannot set WS handshake headers) — channel first, token appended.
+    expect(fake.url).toMatch(/\/ws\/checker\?channel=alice&access_token=jwt-token-123$/);
 
     fake.open(); // rxjs wires the destination inside onopen
 
@@ -137,7 +146,19 @@ describe('LiveQueryService', () => {
     service.connect('bob');
     const second = FakeWebSocket.instances[1];
     expect(second).not.toBe(first);
-    expect(second.url).toMatch(/channel=bob$/);
+    expect(second.url).toMatch(/channel=bob&access_token=jwt-token-123$/);
     expect(service.connected()).toBe(true);
+  });
+
+  it('refuses to dial the WS without a stored JWT (stays disconnected)', () => {
+    // No token seeded: connect() must not open a socket — the server would
+    // reject an anonymous feed, so the state stays 'closed' (disconnected).
+    TestBed.inject(TokenStore).clear();
+
+    service.connect('alice');
+
+    expect(FakeWebSocket.instances.length).toBe(0); // nothing dialed
+    expect(service.connected()).toBe(false);
+    expect(service.connectState()).toBe('closed');
   });
 });

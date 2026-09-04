@@ -6,7 +6,11 @@ import { ApiService, QueryEvent, SessionInfo } from '../../core/api.service';
 import { AuthService } from '../../core/auth.service';
 import { LiveQueryService } from '../../core/live-query.service';
 import { NzMessageService } from 'ng-zorro-antd/message';
+import { TokenStore } from '../../core/token-store.service';
 import { CheckerDashboardComponent } from './checker-dashboard.component';
+
+/** JWT seeded into the real TokenStore so LiveQueryService dials (Task 11). */
+const TEST_JWT = 'jwt-token-123';
 
 /** Landing route for the 401 → /login navigation assertions (Task 9.11). */
 @Component({ template: '', standalone: true })
@@ -210,6 +214,10 @@ describe('CheckerDashboardComponent', () => {
     });
     service = TestBed.inject(LiveQueryService);
     service.socketCtor = FakeWebSocket as unknown as new (url: string) => WebSocket;
+    // Task 11: LiveQueryService refuses to dial without a stored JWT, so
+    // every dashboard spec seeds the real TokenStore before the component
+    // auto-connects on init.
+    TestBed.inject(TokenStore).set(TEST_JWT);
   });
 
   it('auto-connects to the default * channel on init and shows the live-feed tag once open', () => {
@@ -218,7 +226,7 @@ describe('CheckerDashboardComponent', () => {
 
     const fake = FakeWebSocket.instances[0];
     expect(fake).toBeDefined();
-    expect(fake.url).toMatch(/\/ws\/checker\?channel=\*$/); // '*' is not escaped by encodeURIComponent
+    expect(fake.url).toMatch(/\/ws\/checker\?channel=\*&access_token=jwt-token-123$/); // '*' is not escaped by encodeURIComponent
     expect(service.connected()).toBe(true); // legacy optimistic flag flips immediately
 
     // The status tag is DERIVED from the REAL socket state (Task 8.15): it
@@ -333,7 +341,7 @@ describe('CheckerDashboardComponent', () => {
 
     const second = FakeWebSocket.instances[1];
     expect(second).toBeDefined();
-    expect(second.url).toMatch(/channel=bob$/);
+    expect(second.url).toMatch(/channel=bob&access_token=jwt-token-123$/);
     expect(service.events().length).toBe(0); // fresh ring buffer
   });
 
@@ -724,7 +732,9 @@ describe('CheckerDashboardComponent', () => {
 
     const second = FakeWebSocket.instances[1];
     expect(second).toBeDefined();
-    expect(second.url).toContain(`channel=${encodeURIComponent('sess:sess-abc123')}`);
+    expect(second.url).toContain(
+      `channel=${encodeURIComponent('sess:sess-abc123')}&access_token=${TEST_JWT}`,
+    );
     // Session-context header note shows the session id + username.
     const note = fixture.nativeElement.querySelector('.session-context-tag') as HTMLElement;
     expect(note).not.toBeNull();
@@ -735,7 +745,7 @@ describe('CheckerDashboardComponent', () => {
     fixture.detectChanges();
     const third = FakeWebSocket.instances[2];
     expect(third).toBeDefined();
-    expect(third.url).toMatch(/\/ws\/checker\?channel=\*$/);
+    expect(third.url).toMatch(/\/ws\/checker\?channel=\*&access_token=jwt-token-123$/);
     expect(fixture.nativeElement.querySelector('.session-context-tag')).toBeNull();
   });
 
