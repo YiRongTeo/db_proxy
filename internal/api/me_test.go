@@ -1,9 +1,9 @@
 package api
 
 // Task 5/6: GET /api/me is guarded by requireJWT — the bearer token issued
-// by /api/login (JWT since Task 6) replaces the legacy zt_session cookie on
-// this route. /api/me reports {username, role} for the SPA's boot-time
-// session restore; logout (Task 6) denylists the token so a replay is 401.
+// by /api/login (JWT since Task 6) authenticates the caller. /api/me reports
+// {username, role} for the SPA's boot-time session restore; logout (Task 6)
+// denylists the token so a replay is 401.
 
 import (
 	"context"
@@ -42,7 +42,7 @@ func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *config.Con
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	return srv, newJarClient(t), cfg
+	return srv, &http.Client{}, cfg
 }
 
 // TestMeRequiresJWT: GET /api/me without an Authorization header → 401.

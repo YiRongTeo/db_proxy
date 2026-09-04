@@ -129,16 +129,14 @@ func TestKillPublishesCtlKill(t *testing.T) {
 
 // --- POST /api/token ticket requirement (Task 6.5, spec amendment 9b) ---
 
-// TestTokenRequiresTicketID: with a valid legacy UI session (the /api/token
-// bare route still resolves sessions from the cookie until Task 7), a token request
-// WITHOUT ticket_id → 400 {"error":"ticket_id required"}; WITH ticket_id →
-// 200 and the issued tok:<token> key exists in Valkey with the ticket.
+// TestTokenRequiresTicketID: with a valid bearer principal (the /api/token
+// bare route resolves it since Task 4), a token request WITHOUT ticket_id →
+// 400 {"error":"ticket_id required"}; WITH ticket_id → 200 and the issued
+// tok:<token> key exists in Valkey with the ticket.
 func TestTokenRequiresTicketID(t *testing.T) {
-	srv, client, _ := newTestAPIServer(t)
-	// /api/token's session leg still resolves the legacy cookie session
-	// (until Task 7) — since Task 6 /api/login issues a JWT and no cookie,
-	// the cookie session is planted directly.
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, cfg := newTestAPIServer(t)
+	// Authenticate as the fixture user with a minted JWT.
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	noTicket := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3306","db_type":"mysql"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",

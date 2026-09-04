@@ -53,12 +53,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// handleToken issues a single-use DB token. Auth: valid API key OR UI session.
+// handleToken issues a single-use DB token. Auth: valid bearer JWT OR API key.
 func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
-	// Bare route (no requireSession wrapper): resolve the session cookie
-	// ourselves to support the "API key OR session" auth model.
-	if sess, err := a.auth.sessionFromRequest(r); err == nil && sess != nil {
-		r = r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess))
+	// Bare route (no requireJWT wrapper): resolve the bearer principal
+	// ourselves to support the "JWT OR API key" auth model — the rewire that
+	// retired the UI-session branch (Task 4). A missing or unverifiable
+	// bearer simply leaves no principal; the API-key check below then decides
+	// (the same degrade semantics the old branch had).
+	if raw := bearerToken(r); raw != "" {
+		if sess, _, err := a.auth.parseJWT(raw); err == nil && sess != nil {
+			r = r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess))
+		}
 	}
 	if !a.auth.validAPIKey(r) && sessionFrom(r) == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)

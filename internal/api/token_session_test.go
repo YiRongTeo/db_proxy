@@ -218,10 +218,9 @@ func TestTokenIssueListsPendingSession(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// The /api/token leg still runs on the legacy cookie session
-			// (bare route, migrated in Task 7); GET /api/sessions below is
-			// requireJWT-guarded, so the same client carries a bearer too.
-			sessionAs(t, client, srv.URL, vs, tc.user)
+			// The /api/token bare route resolves the bearer principal
+			// (Task 4) and GET /api/sessions below is requireJWT-guarded —
+			// the same client's bearer drives both.
 			authed := withBearer(client, mintJWT(t, cfg, tc.user, "maker"))
 			userCh := subscribeAPI(t, vs, "queries:"+tc.user)
 			body := fmt.Sprintf(`{"username":%q,"db_user":%q,"db_ip":"127.0.0.1","db_port":"3307","db_type":%q,"ticket_id":"T-8-11"}`,

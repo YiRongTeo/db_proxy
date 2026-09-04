@@ -51,7 +51,7 @@ func newModeTestAPIServer(t *testing.T, tokenMode string, sessionTTL int) (*http
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	return srv, newJarClient(t), vs, cfg
+	return srv, &http.Client{}, vs, cfg
 }
 
 // issueTokenFull posts a token request (session-authenticated) and returns
@@ -93,8 +93,8 @@ func fetchPayload(t *testing.T, vs *store.ValkeyStore, token string) map[string]
 }
 
 func TestTokenIssueSessionMode(t *testing.T) {
-	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, vs, cfg := newModeTestAPIServer(t, "single-use", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 	token, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"session"}`)
 	if status != http.StatusOK {
@@ -119,8 +119,8 @@ func TestTokenIssueSessionMode(t *testing.T) {
 }
 
 func TestTokenIssueSessionModeFiniteTTL(t *testing.T) {
-	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 300)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, _, cfg := newModeTestAPIServer(t, "single-use", 300)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 	_, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"session"}`)
 	if status != http.StatusOK {
@@ -132,8 +132,8 @@ func TestTokenIssueSessionModeFiniteTTL(t *testing.T) {
 }
 
 func TestTokenIssueInvalidMode(t *testing.T) {
-	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, _, cfg := newModeTestAPIServer(t, "single-use", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 	_, _, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"bogus"}`)
 	if status != http.StatusBadRequest {
@@ -142,8 +142,8 @@ func TestTokenIssueInvalidMode(t *testing.T) {
 }
 
 func TestTokenIssuePresetTokenMode(t *testing.T) {
-	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, vs, cfg := newModeTestAPIServer(t, "single-use", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 
 	// The rw_user preset declares token_mode: session → no request mode
 	// needed.
@@ -174,8 +174,8 @@ func TestTokenIssuePresetTokenMode(t *testing.T) {
 
 func TestTokenIssueConfigDefaultSession(t *testing.T) {
 	// api.token_mode: session as the global default (GUI deployment).
-	srv, client, vs, _ := newModeTestAPIServer(t, "session", 0)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, vs, cfg := newModeTestAPIServer(t, "session", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 	token, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13"}`)
 	if status != http.StatusOK {
@@ -190,8 +190,8 @@ func TestTokenIssueConfigDefaultSession(t *testing.T) {
 }
 
 func TestTokenIssueIdleOverride(t *testing.T) {
-	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
-	sessionAs(t, client, srv.URL, vs, "alice")
+	srv, client, vs, cfg := newModeTestAPIServer(t, "single-use", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 
 	// Per-token idle override lands in the stored payload (any mode).
 	token, _, status := issueTokenFull(t, client, srv.URL,

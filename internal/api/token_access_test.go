@@ -46,7 +46,7 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	return srv, newJarClient(t), vs, cfg
+	return srv, &http.Client{}, vs, cfg
 }
 
 // issueToken posts a token request through the real endpoint and returns the
@@ -78,11 +78,10 @@ func issueToken(t *testing.T, client *http.Client, base, body string) string {
 // preset, read for the read-only presets, "" for targets no preset matches
 // (the data plane treats absent access as read).
 func TestTokenAccessFromPreset(t *testing.T) {
-	srv, client, vs, _ := newPresetTestAPIServer(t)
-	// The /api/token session leg still resolves the legacy cookie session
-	// (until Task 7) — since Task 6 /api/login issues a JWT and no cookie,
-	// the cookie session is planted directly.
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, vs, cfg := newPresetTestAPIServer(t)
+	// The /api/token bare route resolves the bearer principal (Task 4):
+	// authenticate as the fixture user with a minted JWT.
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 	ctx := context.Background()
 
 	cases := []struct {
@@ -118,8 +117,8 @@ func TestTokenAccessFromPreset(t *testing.T) {
 // the full target fields (db_user/db_ip/db_port), the preset's access level
 // and the issue-time session id + ticket.
 func TestTokenAccessMSSQLPresets(t *testing.T) {
-	srv, client, vs, _ := newPresetTestAPIServer(t)
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, vs, cfg := newPresetTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 	ctx := context.Background()
 
 	cases := []struct {
@@ -158,8 +157,8 @@ func TestTokenAccessMSSQLPresets(t *testing.T) {
 // loosened the rejection — a db_type outside {mysql, postgres, mssql,
 // oracle} still gets 422 with the canonical message.
 func TestTokenRejectsInvalidDBType(t *testing.T) {
-	srv, client, _, _ := newPresetTestAPIServer(t)
-	cookieSessionAs(t, client, srv.URL, testJWTUser) // legacy cookie session for the /api/token leg (until Task 7)
+	srv, client, _, cfg := newPresetTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mongodb","ticket_id":"T-9-3"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json", strings.NewReader(body))

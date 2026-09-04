@@ -219,43 +219,6 @@ func (s *ValkeyStore) GetDeleteToken(ctx context.Context, token string) (*models
 	return &p, nil
 }
 
-// CreateSession stores a UI session with a TTL and returns its id.
-func (s *ValkeyStore) CreateSession(ctx context.Context, sess models.Session, ttl time.Duration) (string, error) {
-	id, err := newID()
-	if err != nil {
-		return "", err
-	}
-	data, err := json.Marshal(sess)
-	if err != nil {
-		return "", err
-	}
-	key := "sess:ui:" + id
-	if err := s.client.Do(ctx, s.client.B().Set().Key(key).Value(string(data)).Ex(ttl).Build()).Error(); err != nil {
-		return "", err
-	}
-	return id, nil
-}
-
-// GetSession returns the session for an id, or nil if absent/expired.
-func (s *ValkeyStore) GetSession(ctx context.Context, id string) (*models.Session, error) {
-	raw, err := s.client.Do(ctx, s.client.B().Get().Key("sess:ui:"+id).Build()).ToString()
-	if errors.Is(err, valkey.Nil) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var sess models.Session
-	if err := json.Unmarshal([]byte(raw), &sess); err != nil {
-		return nil, err
-	}
-	return &sess, nil
-}
-
-func (s *ValkeyStore) DeleteSession(ctx context.Context, id string) error {
-	return s.client.Do(ctx, s.client.B().Del().Key("sess:ui:"+id).Build()).Error()
-}
-
 // jwtDenyPrefix keys the bearer-JWT jti denylist (Task 6): jwt:deny:<jti>
 // EXISTS while that token id is revoked. /api/logout writes the key with a
 // TTL equal to the token's remaining life; requireJWT consults it before
@@ -279,7 +242,7 @@ func (s *ValkeyStore) DenyJWT(ctx context.Context, jti string, ttl time.Duration
 		return fmt.Errorf("deny jwt: ttl must be > 0, got %v", ttl)
 	}
 	return s.client.Do(ctx, s.client.B().Set().
-		Key(jwtDenyPrefix + jti).
+		Key(jwtDenyPrefix+jti).
 		Value("1").Ex(ttl).Build()).Error()
 }
 

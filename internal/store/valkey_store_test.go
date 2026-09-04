@@ -367,43 +367,6 @@ func TestTokenExpiry(t *testing.T) {
 	}
 }
 
-func TestSessionLifecycle(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	id, err := s.CreateSession(ctx, models.Session{Username: "carol"}, 60*time.Second)
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if id == "" {
-		t.Fatal("CreateSession: returned empty id")
-	}
-	cleanupKey(t, s, "sess:ui:"+id)
-
-	sess, err := s.GetSession(ctx, id)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("GetSession: expected session, got nil")
-	}
-	if sess.Username != "carol" {
-		t.Fatalf("GetSession: username = %q, want %q", sess.Username, "carol")
-	}
-
-	if err := s.DeleteSession(ctx, id); err != nil {
-		t.Fatalf("DeleteSession: %v", err)
-	}
-
-	sess, err = s.GetSession(ctx, id)
-	if err != nil {
-		t.Fatalf("GetSession after delete: %v", err)
-	}
-	if sess != nil {
-		t.Fatalf("GetSession after delete: expected nil, got %+v", sess)
-	}
-}
-
 // --- Task 8.2: session directory (sess:live:* keys) -------------------------
 
 func uniqueSid(t *testing.T) string {

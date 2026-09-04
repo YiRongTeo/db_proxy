@@ -2,12 +2,12 @@ package api
 
 // Task 6 — /api/login + /api/logout JWT contract. login_enabled=true:
 // POST /api/login validates credentials (constant-time, rate-limited) and
-// answers 200 {token, username, role, expires_in} — NO zt_session cookie,
-// NO Valkey session. The issued token drives the requireJWT-guarded routes.
-// POST /api/logout denylists the presented token's jti in Valkey (TTL =
-// remaining token life), so replaying the same token on a guarded route →
-// 401. login_enabled=false: neither route is registered → 404 via the
-// spaHandler /api guard.
+// answers 200 {token, username, role, expires_in} — the bearer token IS the
+// credential; nothing is stored server-side. The issued token drives the
+// requireJWT-guarded routes. POST /api/logout denylists the presented
+// token's jti in Valkey (TTL = remaining token life), so replaying the same
+// token on a guarded route → 401. login_enabled=false: neither route is
+// registered → 404 via the spaHandler /api guard.
 
 import (
 	"context"
@@ -57,7 +57,7 @@ func newJWTLoginServer(t *testing.T, loginEnabled bool, users []config.AuthUserC
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	return srv, newJarClient(t), cfg
+	return srv, &http.Client{}, cfg
 }
 
 // doLogin posts /api/login and returns the response plus the decoded body

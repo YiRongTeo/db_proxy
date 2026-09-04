@@ -6,20 +6,20 @@ package api
 // values — so a token minted in a test verifies in the server's requireJWT.
 // The secret is a dev-only constant; production secrets come from
 // ${ZT_JWT_SECRET} and are fail-fast non-empty (config.go Task 2).
+//
+// The legacy session-planting helpers and the jar client were removed with
+// the UI-session machinery in Task 4 — minted bearer tokens
+// (mintJWT/withBearer) or the real /api/login endpoint (loginJWT) are the
+// only auth paths left.
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"zerotrust-proxy/internal/config"
-	"zerotrust-proxy/internal/models"
-	"zerotrust-proxy/internal/store"
 )
 
 // Fixed identity for the fixtures' primary account.
@@ -53,12 +53,12 @@ func testJWTBlock() config.JWTConfig {
 
 // mintJWT signs a VALID HS256 token for username with role, bound to cfg's
 // JWT issuer/audience/secret: short exp (5 minutes), jti present. This is
-// the direct replacement for the cookie-session test helpers: mint a token
-// for the desired user+role and send requests with the Authorization header
-// (authHeader/withBearer). Since Task 6 the REAL login endpoint also
-// returns such a token (see loginJWT); mintJWT stays for identities the
-// login endpoint cannot authenticate (e.g. non-configured users on flows
-// that pair minted tokens with a legacy cookie session).
+// the direct replacement for the legacy session-planting test helpers: mint
+// a token for the desired user+role and send requests with the
+// Authorization header (authHeader/withBearer). Since Task 6 the REAL login
+// endpoint also returns such a token (see loginJWT); mintJWT stays for
+// identities the login endpoint cannot authenticate (non-configured users —
+// the /api/token bare route resolves the bearer principal since Task 4).
 func mintJWT(t *testing.T, cfg *config.ControlConfig, username, role string) string {
 	t.Helper()
 	tok, err := signJWT(cfg, username, role, 5*time.Minute, time.Now())
@@ -75,7 +75,7 @@ func authHeader(token string) string {
 
 // bearerTransport is an http.RoundTripper that attaches the bearer token to
 // every request it forwards — the test-side equivalent of the SPA attaching
-// "Authorization: Bearer <jwt>" per call. The underlying request is cloned
+// "Authorization: Bearer ***" per call. The underlying request is cloned
 // so the caller's headers are never mutated.
 type bearerTransport struct {
 	base  http.RoundTripper
@@ -89,8 +89,8 @@ func (t bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // withBearer returns a shallow copy of client that sends the given bearer
-// token on every request (cookie jar and other settings are preserved). Use
-// it after mintJWT to drive requireJWT-guarded routes:
+// token on every request. Use it after mintJWT to drive requireJWT-guarded
+// routes (and, since Task 4, the bare /api/token route):
 //
 //	client = withBearer(client, mintJWT(t, cfg, "admin", "maker"))
 func withBearer(client *http.Client, token string) *http.Client {
@@ -103,22 +103,9 @@ func withBearer(client *http.Client, token string) *http.Client {
 	return &clone
 }
 
-// newJarClient returns an http.Client with a fresh cookie jar — the shape
-// every fixture historically returned (the jar still matters while the
-// legacy zt_session cookie legs of /api/token and /api/login exist; Task 4
-// retires the cookie machinery and the jars with it).
-func newJarClient(t *testing.T) *http.Client {
-	t.Helper()
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return &http.Client{Jar: jar}
-}
-
 // loginJWT logs in through the real POST /api/login endpoint (Task 6
-// contract: valid creds → 200 {token, username, role, expires_in}, no
-// cookie) and returns the issued bearer token.
+// contract: valid creds → 200 {token, username, role, expires_in}) and
+// returns the issued bearer token.
 func loginJWT(t *testing.T, client *http.Client, base, username, password string) string {
 	t.Helper()
 	resp, err := client.Post(base+"/api/login", "application/json",
@@ -140,49 +127,4 @@ func loginJWT(t *testing.T, client *http.Client, base, username, password string
 		t.Fatal("POST /api/login: empty token")
 	}
 	return got.Token
-}
-
-// newRawStore opens a package-level Valkey handle for tests that need one
-// beyond the server fixture (e.g. planting a legacy session cookie).
-func newRawStore(t *testing.T) *store.ValkeyStore {
-	t.Helper()
-	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
-	if err != nil {
-		t.Fatalf("NewValkeyStore: %v", err)
-	}
-	t.Cleanup(vs.Close)
-	return vs
-}
-
-// cookieSessionAs installs a LEGACY zt_session cookie for user directly in
-// Valkey — the session source for /api/token flows whose bare route still
-// resolves cookie sessions until Task 4/7. Since Task 6 /api/login issues a
-// JWT and NO cookie, cookie-leg tests create the legacy session directly
-// instead of logging in (sessionAs with a throwaway store).
-func cookieSessionAs(t *testing.T, client *http.Client, base, user string) {
-	t.Helper()
-	sessionAs(t, client, base, newRawStore(t), user)
-}
-
-// sessionAs creates a LEGACY UI session for user directly in Valkey and
-// installs the zt_session cookie on the client — the session source for
-// flows that mint tokens as a NON-configured user through /api/token (its
-// bare route resolves sessions from the cookie until Task 4/7; the login
-// endpoint only ever authenticates configured accounts). SessionAs itself
-// is deleted with the cookie machinery in Task 4; until then, flows that
-// ALSO hit requireJWT-guarded routes pair it with
-// withBearer(mintJWT(...)) so those legs run on the bearer token.
-func sessionAs(t *testing.T, client *http.Client, base string, vs *store.ValkeyStore, user string) {
-	t.Helper()
-	id, err := vs.CreateSession(context.Background(), models.Session{Username: user}, 8*time.Hour)
-	if err != nil {
-		t.Fatalf("CreateSession(%q): %v", user, err)
-	}
-	u, err := url.Parse(base)
-	if err != nil {
-		t.Fatalf("parse base %q: %v", base, err)
-	}
-	client.Jar.SetCookies(u, []*http.Cookie{{
-		Name: sessionCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
-	}})
 }

@@ -3,9 +3,8 @@ package api
 // JWT conversion (Task 5): self-issued HS256 bearer tokens are the Control
 // Plane's request credential. requireJWT guards the session-required routes
 // (/api/me, /api/db-presets, /api/kill, /api/sessions, /ws/checker),
-// replacing the legacy zt_session cookie middleware on those routes (the
-// cookie machinery itself is removed in Task 4; the Valkey jti denylist
-// lands in Task 6).
+// replacing the legacy UI-session middleware (removed in Task 4); the Valkey
+// jti denylist (Task 6) revokes tokens.
 //
 // The token carries the principal in the sub claim plus an explicit
 // maker|checker role claim. requireJWT verifies signature + exp + iss + aud
@@ -97,9 +96,8 @@ var errUnauthorizedJWT = errors.New("unauthorized")
 // it). Signature (HS256, cfg secret), exp, iss and aud are all enforced by
 // jwt/v5 parser options; sub and role are checked afterwards (role ABSENT →
 // reject, plan decision). When JWT auth is not configured (jwt.enabled=false
-// or an empty secret/issuer/audience — the pre-JWT legacy cookie mode) the
-// middleware fails CLOSED: no token can be trusted, so every request is
-// rejected.
+// or an empty secret/issuer/audience) the middleware fails CLOSED: no token
+// can be trusted, so every request is rejected.
 func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error) {
 	j := a.cfg.JWT
 	if !j.Enabled || j.Secret == "" || j.Issuer == "" || j.Audience == "" {
@@ -138,9 +136,9 @@ func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error
 // is rejected even though its signature is fine), and injects the principal
 // session under sessionKey{} so sessionFrom(r) consumers keep working
 // unchanged. Any failure answers 401 with the standard unauthorized body —
-// the exact contract requireSession had on these routes. A denylist
-// consult ERROR fails CLOSED (401): revocation state must never be skipped
-// because the store hiccuped.
+// the same 401 these routes answered under the legacy UI-session
+// middleware. A denylist consult ERROR fails CLOSED (401): revocation state
+// must never be skipped because the store hiccuped.
 func (a *authMiddleware) requireJWT(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw := bearerToken(r)

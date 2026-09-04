@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"log/slog"
@@ -15,8 +14,6 @@ import (
 	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
-
-const sessionCookie = "zt_session"
 
 // loginRateWindow / loginMaxFailures bound the per-(IP, username)
 // failed-login backoff (review 9.9): after loginMaxFailures failures within
@@ -141,31 +138,6 @@ type authMiddleware struct {
 	// Review 9.9: per-(IP, username) failed-login backoff (wired in NewAPI;
 	// tests may inject a shortened limiter).
 	loginLimiter *rateLimiter
-}
-
-// sessionFromRequest resolves the UI session from the zt_session cookie
-// when present and valid, otherwise nil — the SINGLE cookie-resolution
-// helper shared by requireSession and the bare /api/token route (review
-// 9.9: the duplicated sessionFromCookie helper was removed).
-func (a *authMiddleware) sessionFromRequest(r *http.Request) (*models.Session, error) {
-	c, err := r.Cookie(sessionCookie)
-	if err != nil || c.Value == "" {
-		return nil, nil
-	}
-	return a.vs.GetSession(r.Context(), c.Value)
-}
-
-// requireSession rejects requests without a valid UI session cookie.
-func (a *authMiddleware) requireSession(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		sess, err := a.sessionFromRequest(r)
-		if err != nil || sess == nil {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
-		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
-		next(w, r.WithContext(ctx))
-	}
 }
 
 // validAPIKey reports whether the X-Api-Key header matches config, in

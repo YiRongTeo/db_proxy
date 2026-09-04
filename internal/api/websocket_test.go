@@ -45,7 +45,7 @@ func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.Va
 	a.watchHeartbeat = 200 * time.Millisecond
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	return srv, newJarClient(t), vs, cfg
+	return srv, &http.Client{}, vs, cfg
 }
 
 // dialWSChecker opens a checker WebSocket with the given channel param.

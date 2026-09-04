@@ -119,12 +119,10 @@ func tokenBody(username string) string {
 // session-authenticated requester may send a body username that MATCHES the
 // session — the token is issued for the session username.
 func TestTokenUsernameBindingAccept(t *testing.T) {
-	srv, client, _ := newTestAPIServer(t)
-	// /api/token's session leg still resolves the legacy cookie session
-	// (the bare route is migrated to JWT in Task 7) — /api/login has issued
-	// a JWT, no cookie, since Task 6, so the cookie session is planted
-	// directly.
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, cfg := newTestAPIServer(t)
+	// The /api/token bare route resolves the bearer principal (Task 4):
+	// authenticate as admin with a minted JWT.
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
 		strings.NewReader(tokenBody("admin")))
@@ -141,8 +139,8 @@ func TestTokenUsernameBindingAccept(t *testing.T) {
 // authenticated as admin sending a body username for ANOTHER user is
 // rejected — the body cannot forge a different maker identity.
 func TestTokenUsernameBindingMismatch(t *testing.T) {
-	srv, client, _ := newTestAPIServer(t)
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
 		strings.NewReader(tokenBody("alice")))
@@ -166,8 +164,8 @@ func TestTokenUsernameBindingMismatch(t *testing.T) {
 // requester may OMIT the body username — the token is then issued for the
 // SESSION username (the body is never trusted).
 func TestTokenUsernameEmptyBindsSession(t *testing.T) {
-	srv, client, _ := newTestAPIServer(t)
-	cookieSessionAs(t, client, srv.URL, testJWTUser)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	// Strip the username field entirely.
 	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-9.9"}`

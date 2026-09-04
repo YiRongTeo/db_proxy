@@ -71,7 +71,7 @@ func (a *api) Routes() http.Handler {
 	}
 	mux.HandleFunc("GET /api/me", a.auth.requireJWT(a.auth.handleMe)) // Task 5.7: boot-time session restore (bearer JWT since Task 5)
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireJWT(a.handleDBPresets))
-	mux.HandleFunc("POST /api/token", a.handleToken)                         // auth inside (key OR cookie session — JWT migration is Task 7)
+	mux.HandleFunc("POST /api/token", a.handleToken)                         // auth inside (API key OR bearer JWT — Task 4 rewired the bare route; API key removal is Task 7)
 	mux.HandleFunc("POST /api/kill", a.auth.requireJWT(a.handleKill))        // Task 6.5: checker kill button
 	mux.HandleFunc("GET /api/sessions", a.auth.requireJWT(a.handleSessions)) // Task 8.4: session directory
 	mux.HandleFunc("GET /ws/checker", a.auth.requireJWT(a.handleWS))         // Task 2.4

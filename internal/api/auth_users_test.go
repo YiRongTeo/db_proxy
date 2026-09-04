@@ -54,7 +54,7 @@ func TestExtraUserLogin(t *testing.T) {
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
 
-	client := newJarClient(t)
+	client := &http.Client{}
 
 	// The extra user's login token carries their declared role (checker).
 	_, login := doLogin(t, client, srv.URL, "checker", "checker-pw")

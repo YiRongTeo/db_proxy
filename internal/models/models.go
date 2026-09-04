@@ -139,9 +139,9 @@ type QueryEvent struct {
 }
 
 // Session is the authenticated principal — username plus maker/checker
-// role — carried in the request context (the JWT middleware of Task 4
-// builds it under sessionKey{}). The legacy sess:ui cookie-session
-// storage it once described is gone (Task 4).
+// role — carried in the request context: requireJWT (and the bare
+// /api/token route since Task 4) parses a self-issued bearer JWT and builds
+// this under sessionKey{}, where sessionFrom(r) consumers read it.
 type Session struct {
 	Username string `json:"username"`
 	Role     string `json:"role,omitempty"` // "maker" | "checker"

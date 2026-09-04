@@ -76,7 +76,7 @@ func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store
 	t.Cleanup(cancel)
 	go a.RunAuditLifecycle(ctx)
 
-	return srv, newJarClient(t), vs, assertDB, cfg
+	return srv, &http.Client{}, vs, assertDB, cfg
 }
 
 // auditDSN builds the DSN for the throwaway audit database (root dev creds).
@@ -201,12 +201,10 @@ func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 	srv, client, vs, db, cfg := newAuditTestAPIServer(t)
 
 	user := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
-	// Review 9.9a: the token is issued for the SESSION user — the maker
-	// under test needs its own session (the login endpoint only knows
-	// admin). /api/token's session leg still runs on the legacy cookie
-	// (Task 7 migrates it); GET /api/sessions is requireJWT-guarded, so the
-	// same client carries a bearer token too.
-	sessionAs(t, client, srv.URL, vs, user)
+	// Review 9.9a: the token is issued for the SESSION (bearer) user — the
+	// maker under test authenticates with its own minted JWT (the login
+	// endpoint only knows admin). The same bearer drives /api/token (bare
+	// route, Task 4) and the requireJWT-guarded GET /api/sessions.
 	authed := withBearer(client, mintJWT(t, cfg, user, "maker"))
 	sid := issueAuditToken(t, authed, srv, vs, user, "ro_user", "T-9-7")
 
@@ -246,7 +244,6 @@ func TestAuditLifecycleConsumer(t *testing.T) {
 
 	user := fmt.Sprintf("audit-lc-%d", time.Now().UnixNano())
 	// Review 9.9a: the token is issued for the SESSION user.
-	sessionAs(t, client, srv.URL, vs, user) // legacy cookie leg for /api/token
 	authed := withBearer(client, mintJWT(t, cfg, user, "maker"))
 	sid := issueAuditToken(t, authed, srv, vs, user, "rw_user", "T-LC")
 
@@ -291,8 +288,7 @@ func TestWSCheckerAuditAttachDetach(t *testing.T) {
 
 	maker := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
 	checker := fmt.Sprintf("audit-checker-%d", time.Now().UnixNano())
-	// Review 9.9a: the token is issued for the SESSION user (the maker).
-	sessionAs(t, client, srv.URL, vs, maker) // legacy cookie leg for /api/token
+	// Review 9.9a: the token is issued for the SESSION (bearer) user — the maker.
 	authed := withBearer(client, mintJWT(t, cfg, maker, "maker"))
 	sid := issueAuditToken(t, authed, srv, vs, maker, "ro_user", "T-WS")
 
