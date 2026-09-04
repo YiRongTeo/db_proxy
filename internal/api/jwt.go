@@ -171,6 +171,46 @@ func (a *authMiddleware) requireJWT(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requireChecker role-gates the checker surface (Task 8): /ws/checker,
+// POST /api/kill and GET /api/sessions are wrapped
+// requireJWT(requireChecker(...)) — authentication first, authorization
+// second. A checker-role principal is ALWAYS allowed (the checker surface
+// is theirs); a maker-role principal is allowed ONLY when cfg's
+// auth.allow_maker_watch is true — the single-account deployment escape
+// hatch the operator chooses in config, never a grant the maker can claim
+// from a token. Anything else answers 403; the body mirrors requireJWT's
+// JSON error style and leaks nothing about the config. The session is
+// always present (requireJWT ran first), but the middleware fails CLOSED
+// if it is missing all the same.
+//
+// NOTE (Task 8.5 audit): this gate does NOT touch the SoD username check —
+// checkerMayWatch still runs inside handleWS for channel=sess:<sid> and
+// rejects watcher == session maker regardless of role or flag.
+func (a *authMiddleware) requireChecker(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sess := sessionFrom(r)
+		if sess == nil {
+			// Unreachable when composed after requireJWT — fail closed.
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
+		switch sess.Role {
+		case "checker":
+			next(w, r)
+		case "maker":
+			if a.cfg.AllowMakerWatch {
+				next(w, r)
+				return
+			}
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+		default:
+			// parseJWT rejects unknown roles before this point; fail
+			// closed rather than guess.
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+		}
+	}
+}
+
 // bearerToken extracts the raw token from "Authorization: Bearer ***"; ""
 // when the header is absent or uses any other scheme. The strict prefix
 // check keeps e.g. "Bearerish xyz" out — parseJWT must only ever see a real

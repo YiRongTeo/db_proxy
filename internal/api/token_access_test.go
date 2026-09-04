@@ -18,6 +18,9 @@ import (
 
 // newPresetTestAPIServer is newTestAPIServer with the committed db_presets
 // wired into the config, so handleToken can resolve access levels.
+// AllowMakerWatch is TRUE: this fixture models a single-account deployment
+// whose maker drives both /api/token and the GET /api/sessions directory
+// listing (the Task 8 role gate admits maker role only with the flag).
 func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
@@ -26,13 +29,14 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     testJWTUser,
-		AuthPassword: testJWTPassword,
-		AuthRole:     "maker",
-		JWT:          testJWTBlock(),
-		SessionTTL:   8,
-		TokenTTL:     60,
-		StaticDir:    t.TempDir(),
+		AuthUser:        testJWTUser,
+		AuthPassword:    testJWTPassword,
+		AuthRole:        "maker",
+		AllowMakerWatch: true, // maker may list/watch in this fixture (Task 8)
+		JWT:             testJWTBlock(),
+		SessionTTL:      8,
+		TokenTTL:        60,
+		StaticDir:       t.TempDir(),
 		DBPresets: []config.DBPreset{
 			{Name: "MySQL read-only", DBType: "mysql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "read"},
 			{Name: "MySQL read-write", DBType: "mysql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "write"},

@@ -29,7 +29,9 @@ import (
 // newAuditTestAPIServer is newPresetTestAPIServer with an audit writer wired
 // in (mysql-test, throwaway database) AND the RunAuditLifecycle consumer
 // started (the production wiring). Returns the server, client, store and a
-// raw *sql.DB for row assertions.
+// raw *sql.DB for row assertions. AllowMakerWatch is TRUE like
+// newPresetTestAPIServer: the maker under test drives both /api/token and
+// the GET /api/sessions listing that observes the pending row (Task 8).
 func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *sql.DB, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
@@ -38,13 +40,14 @@ func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     testJWTUser,
-		AuthPassword: testJWTPassword,
-		AuthRole:     "maker",
-		JWT:          testJWTBlock(),
-		SessionTTL:   8,
-		TokenTTL:     60,
-		StaticDir:    t.TempDir(),
+		AuthUser:        testJWTUser,
+		AuthPassword:    testJWTPassword,
+		AuthRole:        "maker",
+		AllowMakerWatch: true, // maker may list/watch in this fixture (Task 8)
+		JWT:             testJWTBlock(),
+		SessionTTL:      8,
+		TokenTTL:        60,
+		StaticDir:       t.TempDir(),
 		DBPresets: []config.DBPreset{
 			{Name: "MySQL read-only", DBType: "mysql", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "read"},
 			{Name: "MySQL read-write", DBType: "mysql", DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "3307", Access: "write"},
