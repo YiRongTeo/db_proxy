@@ -26,6 +26,7 @@ func setSecretEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ZT_AUTH_PASSWORD", "admin123")
 	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "checker123")
+	t.Setenv("ZT_JWT_SECRET", "jwt-dev-secret-0123456789abcdef0123456789")
 	t.Setenv("ZT_CRED_MYSQL_RO_PASSWORD", "ro_pw")
 	t.Setenv("ZT_CRED_MYSQL_RW_PASSWORD", "rw_pw")
 	t.Setenv("ZT_CRED_PG_RO_PASSWORD", "ro_pw")
@@ -59,6 +60,33 @@ func TestLoadControl(t *testing.T) {
 	}
 	if got := cfg.SessionTTL; got != 8 {
 		t.Errorf("SessionTTL = %d, want 8", got)
+	}
+	// JWT conversion (Task 2): the committed auth block declares the
+	// primary role, per-user roles, allow_maker_watch and the jwt block.
+	if got := cfg.AuthRole; got != "maker" {
+		t.Errorf("AuthRole = %q, want %q", got, "maker")
+	}
+	if cfg.AllowMakerWatch {
+		t.Error("AllowMakerWatch = true, want false (committed default)")
+	}
+	if len(cfg.AuthUsers) != 1 || cfg.AuthUsers[0].Username != "checker" || cfg.AuthUsers[0].Role != "checker" {
+		t.Errorf("AuthUsers = %+v, want [checker/checker]", cfg.AuthUsers)
+	}
+	j := cfg.JWT
+	if !j.Enabled || !j.LoginEnabled {
+		t.Errorf("JWT.Enabled/LoginEnabled = %v/%v, want true/true", j.Enabled, j.LoginEnabled)
+	}
+	if got := j.Issuer; got != "zerotrust-proxy" {
+		t.Errorf("JWT.Issuer = %q, want %q", got, "zerotrust-proxy")
+	}
+	if got := j.Audience; got != "zt-api" {
+		t.Errorf("JWT.Audience = %q, want %q", got, "zt-api")
+	}
+	if got := j.TTLSeconds; got != 28800 {
+		t.Errorf("JWT.TTLSeconds = %d, want 28800", got)
+	}
+	if got := j.Secret; got != "jwt-dev-secret-0123456789abcdef0123456789" {
+		t.Errorf("JWT.Secret = %q, want the expanded ZT_JWT_SECRET", got)
 	}
 	if got := cfg.Valkey.Mode; got != "direct" {
 		t.Errorf("Valkey.Mode = %q, want %q", got, "direct")
@@ -301,6 +329,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises
+  # valkey sentinel mode, not JWT.
+  jwt:
+    enabled: false
 valkey:
   mode: sentinel
   addr: "10.0.0.5:6379"
@@ -372,6 +404,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): this fixture exercises
+  # valkey sentinel auth, not JWT — no roles/secret needed.
+  jwt:
+    enabled: false
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -393,6 +429,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises
+  # valkey sentinel auth, not JWT.
+  jwt:
+    enabled: false
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -415,6 +455,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): this fixture exercises
+  # valkey sentinel auth, not JWT — no roles/secret needed.
+  jwt:
+    enabled: false
 valkey:
   mode: sentinel
   master_name: "mymaster"
@@ -442,6 +486,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises
+  # api.token_max_uses env binding, not JWT.
+  jwt:
+    enabled: false
 `
 	path := writeTempConfig(t, base)
 	cfg, err := LoadControl(path)
@@ -545,6 +593,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises the
+  # TLS off-state, not JWT.
+  jwt:
+    enabled: false
 tls:
   enabled: false
   cert_file: "certs/does-not-exist.crt"
@@ -882,6 +934,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises the
+  # audit.mysql block, not JWT.
+  jwt:
+    enabled: false
 audit:
   mysql:
     enabled: true
@@ -953,6 +1009,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises the
+  # audit.mysql env override, not JWT.
+  jwt:
+    enabled: false
 `)
 	cfg, err := LoadControl(path)
 	if err != nil {
@@ -1229,6 +1289,11 @@ http:
 auth:
   username: admin
   password: secret
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    secret: "s3cret"
 valkey:
   mode: direct
   addr: "127.0.0.1:6379"
@@ -1278,6 +1343,11 @@ http:
 auth:
   username: admin
   password: ""
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    secret: "s3cret"
 `)
 		_, err := LoadControl(path)
 		if err == nil {
@@ -1308,6 +1378,11 @@ api:
 auth:
   username: admin
   password: secret
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    secret: "s3cret"
 `)
 		_, err := LoadControl(path)
 		if err == nil {
@@ -1327,6 +1402,11 @@ api:
 auth:
   username: admin
   password: secret
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    secret: "s3cret"
 `)
 		_, err := LoadControl(path)
 		if err == nil {
@@ -1348,6 +1428,10 @@ http:
 auth:
   username: admin
   password: secret
+  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises
+  # session-token defaults, not JWT.
+  jwt:
+    enabled: false
 `)
 	cfg, err := LoadControl(ctlPath)
 	if err != nil {
@@ -1379,9 +1463,11 @@ listen:
 	}
 }
 
-// TestAuthUsersParsing (Task 9.13): the optional auth.users list parses,
-// ${VAR} password placeholders resolve from the environment, and an empty
-// password in ANY listed user fails fast (never a silently empty credential).
+// TestAuthUsersParsing (Task 9.13 + JWT Task 2): the optional auth.users
+// list parses, ${VAR} password placeholders resolve from the environment,
+// and an empty password in ANY listed user fails fast (never a silently
+// empty credential). Each entry carries its own role ("maker"|"checker"),
+// required when auth.jwt.login_enabled is true.
 func TestAuthUsersParsing(t *testing.T) {
 	path := writeTempConfig(t, `
 http:
@@ -1389,9 +1475,15 @@ http:
 auth:
   username: admin
   password: secret
+  role: "maker"
   users:
     - username: "checker"
       password: "${ZT_AUTH_CHECKER_PASSWORD}"
+      role: "checker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    secret: "s3cret"
 `)
 	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "checker-pw")
 	cfg, err := LoadControl(path)
@@ -1401,9 +1493,15 @@ auth:
 	if len(cfg.AuthUsers) != 1 || cfg.AuthUsers[0].Username != "checker" || cfg.AuthUsers[0].Password != "checker-pw" {
 		t.Fatalf("AuthUsers = %+v, want [checker/checker-pw]", cfg.AuthUsers)
 	}
+	if got := cfg.AuthUsers[0].Role; got != "checker" {
+		t.Errorf("AuthUsers[0].Role = %q, want %q", got, "checker")
+	}
 	// The primary pair is untouched by the list.
 	if cfg.AuthUser != "admin" || cfg.AuthPassword != "secret" {
 		t.Fatalf("primary auth = %q/%q, want admin/secret", cfg.AuthUser, cfg.AuthPassword)
+	}
+	if got := cfg.AuthRole; got != "maker" {
+		t.Errorf("AuthRole = %q, want %q", got, "maker")
 	}
 
 	// Missing env for a listed user → load error, never an empty password.
@@ -1418,4 +1516,272 @@ auth:
 	if _, err := LoadControl(path); err == nil {
 		t.Fatal("LoadControl with unset checker password succeeded, want fail-fast")
 	}
+}
+
+// TestJWTRolesValidation (JWT conversion Task 2) guards the new auth
+// shape: the auth.jwt.* block, per-principal roles and allow_maker_watch.
+// Rules under test:
+//   - jwt.enabled ABSENT = true (JWT is the mode); an explicit false is
+//     allowed and skips every new check (legacy cookie mode).
+//   - login_enabled=true: jwt.secret REQUIRED (${VAR}-expandable),
+//     username/password required (unchanged), EVERY principal (primary +
+//     each auth.users entry) MUST declare role "maker"|"checker" — no
+//     silent default (an un-role'd account would be a superuser).
+//   - login_enabled=false (external-only): username/password + secret NOT
+//     required; declared role VALUES are still validated.
+func TestJWTRolesValidation(t *testing.T) {
+	// header + primary are shared by every login-on case below; body
+	// varies per case (the full yaml is assembled per entry).
+	const header = `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+`
+	secret := `    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"`
+	users := `  users:
+    - username: "checker"
+      password: "checker-pw"
+      role: "checker"
+`
+	jwtOn := func(inner string) string {
+		return "  jwt:\n    enabled: true\n    login_enabled: true\n" + inner + "\n"
+	}
+
+	tests := []struct {
+		name    string
+		yaml    string
+		env     map[string]string
+		wantErr string // substring the error must name; "" = must load
+	}{
+		{
+			name: "login on: secret + roles load (maker/checker)",
+			yaml: header + users + jwtOn(secret),
+		},
+		{
+			name: "login on: ${ZT_JWT_SECRET} expands from env",
+			yaml: header + users + jwtOn(`    secret: "${ZT_JWT_SECRET}"`),
+			env:  map[string]string{"ZT_JWT_SECRET": "env-jwt-secret-0123456789abcdefghijklmnopqrstuv"},
+		},
+		{
+			name:    "login on: secret placeholder with UNSET env fails fast",
+			yaml:    header + users + jwtOn(`    secret: "${ZT_JWT_SECRET}"`),
+			wantErr: "ZT_JWT_SECRET",
+		},
+		{
+			name:    "login on: empty secret refuses to start",
+			yaml:    header + users + jwtOn(`    secret: ""`),
+			wantErr: "auth.jwt.secret",
+		},
+		{
+			name:    "login on: missing secret key refuses to start",
+			yaml:    header + users + jwtOn(""),
+			wantErr: "auth.jwt.secret",
+		},
+		{
+			name: "login on: primary role missing → error names auth.role",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+` + users + jwtOn(secret),
+			wantErr: "auth.role",
+		},
+		{
+			name: "login on: primary role bad value → error names auth.role",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "superuser"
+` + users + jwtOn(secret),
+			wantErr: "auth.role",
+		},
+		{
+			name: "login on: users entry role missing → error names the entry",
+			yaml: header + `  users:
+    - username: "checker"
+      password: "checker-pw"
+` + jwtOn(secret),
+			wantErr: "auth.users[0].role (checker)",
+		},
+		{
+			name: "login on: users entry role bad value → error names the entry",
+			yaml: header + `  users:
+    - username: "checker"
+      password: "checker-pw"
+      role: "boss"
+` + jwtOn(secret),
+			wantErr: "auth.users[0].role (checker)",
+		},
+		{
+			name: "login off: external-only without secret/username/password/roles loads",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  jwt:
+    enabled: true
+    login_enabled: false
+`,
+		},
+		{
+			name: "login off: declared bad primary role still rejected",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  role: "root"
+  jwt:
+    enabled: true
+    login_enabled: false
+`,
+			wantErr: "auth.role",
+		},
+		{
+			name: "login off: declared bad users role still rejected",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  users:
+    - username: "checker"
+      password: "checker-pw"
+      role: "root"
+  jwt:
+    enabled: true
+    login_enabled: false
+`,
+			wantErr: "auth.users[0].role (checker)",
+		},
+		{
+			name: "login off: declared valid roles load",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  role: "maker"
+  users:
+    - username: "checker"
+      password: "checker-pw"
+      role: "checker"
+  jwt:
+    enabled: true
+    login_enabled: false
+`,
+		},
+		{
+			name: "legacy: jwt.enabled false skips roles/secret (creds still required)",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  jwt:
+    enabled: false
+`,
+		},
+		{
+			name: "legacy: jwt.enabled false still requires the primary password",
+			yaml: `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: ""
+  jwt:
+    enabled: false
+`,
+			wantErr: "auth.password",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			path := writeTempConfig(t, tc.yaml)
+			cfg, err := LoadControl(path)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("LoadControl succeeded, want error naming %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error %q does not name %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadControl error: %v", err)
+			}
+			// Spot-check the parsed shape on login-on happy paths.
+			if cfg.JWT.Enabled && cfg.JWT.LoginEnabled && cfg.AuthUser != "" {
+				if cfg.AuthRole != "maker" {
+					t.Errorf("AuthRole = %q, want maker", cfg.AuthRole)
+				}
+				if len(cfg.AuthUsers) == 1 && cfg.AuthUsers[0].Role != "checker" {
+					t.Errorf("AuthUsers[0].Role = %q, want checker", cfg.AuthUsers[0].Role)
+				}
+			}
+		})
+	}
+}
+
+// TestJWTRolesDefaults (JWT conversion Task 2): with a jwt block present
+// but enabled/ttl_seconds omitted, jwt.enabled defaults TRUE and
+// jwt.ttl_seconds defaults 28800 (the new auth expiry). An entirely
+// ABSENT jwt block also means JWT mode ON (login on by default) — an
+// unmigrated config therefore fails fast demanding the secret instead of
+// silently booting with the old cookie semantics.
+func TestJWTRolesDefaults(t *testing.T) {
+	t.Run("jwt block without enabled/ttl defaults to on + 28800", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    login_enabled: true
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
+`)
+		cfg, err := LoadControl(path)
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		if !cfg.JWT.Enabled {
+			t.Error("JWT.Enabled = false, want true (absent defaults to true)")
+		}
+		if !cfg.JWT.LoginEnabled {
+			t.Error("JWT.LoginEnabled = false, want true (absent defaults to true)")
+		}
+		if got := cfg.JWT.TTLSeconds; got != 28800 {
+			t.Errorf("JWT.TTLSeconds = %d, want 28800 (default)", got)
+		}
+	})
+
+	t.Run("absent jwt block = JWT mode on → unmigrated config fails fast", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl: want error for an unmigrated config (no jwt block), got nil")
+		}
+		if !strings.Contains(err.Error(), "auth.jwt.secret") {
+			t.Errorf("error %q missing the auth.jwt.secret hint", err.Error())
+		}
+	})
 }

@@ -104,14 +104,33 @@ type ControlConfig struct {
 	DataPlanePort   string
 	AuthUser        string
 	AuthPassword    string
+	// AuthRole (yaml auth.role, env ZT_AUTH_ROLE; JWT conversion Task 2) is
+	// the PRIMARY account's role: "maker" or "checker". REQUIRED whenever
+	// auth.jwt.login_enabled is true — explicit over default, no silent
+	// default (an un-role'd account would be an accidental superuser).
+	AuthRole string
+	// AllowMakerWatch (yaml auth.allow_maker_watch, env
+	// ZT_AUTH_ALLOW_MAKER_WATCH; JWT conversion Task 2) gates the
+	// checker-only endpoints (watch / kill / sessions): false (default)
+	// keeps SoD — only checker-role principals may watch/kill; true lets
+	// maker-role principals watch and kill too.
+	AllowMakerWatch bool
 	// AuthUsers (Task 9.13, SoD testing) are OPTIONAL additional UI
 	// users beyond the primary auth.username/password pair — e.g. a
 	// dedicated checker account so maker and checker roles use different
 	// identities (the SoD watch rejects checker == maker). Passwords are
 	// ${VAR} placeholders resolved from the environment (same fail-fast
 	// rule as the primary pair: an empty password refuses to start).
-	AuthUsers  []AuthUserConfig
-	SessionTTL int // hours
+	// Each entry carries its own role: "maker"|"checker" (Task 2).
+	AuthUsers []AuthUserConfig
+	// JWT (yaml auth.jwt.*, env ZT_AUTH_JWT_*; JWT conversion Task 2) is
+	// the bearer-JWT auth block. jwt.ttl_seconds supersedes SessionTTL as
+	// the auth expiry (default 28800 = 8h, mirroring the old session TTL).
+	JWT JWTConfig
+	// SessionTTL is the LEGACY cookie-session TTL in hours (default 8).
+	// Superseded by JWT.TTLSeconds — kept until Task 6 removes the
+	// cookie-session machinery (internal/api/auth.go still reads it).
+	SessionTTL int
 	DBPresets  []DBPreset
 	TLS        *CertConfig
 	Valkey     ValkeyConfig
@@ -122,6 +141,35 @@ type ControlConfig struct {
 type AuthUserConfig struct {
 	Username string `mapstructure:"username"`
 	Password string `mapstructure:"password"`
+	// Role (JWT conversion Task 2): this user's role — "maker" or
+	// "checker". REQUIRED per entry when auth.jwt.login_enabled is true
+	// (explicit over default: an un-role'd entry would silently become a
+	// maker superuser). Declared role values are validated whenever JWT
+	// mode is on, regardless of the login flag.
+	Role string `mapstructure:"role"`
+}
+
+// JWTConfig is the bearer-JWT auth block (yaml auth.jwt.*, env
+// ZT_AUTH_JWT_*; JWT conversion Task 2). Enabled is the master switch:
+// ABSENT defaults to TRUE — JWT is the mode going forward, so an
+// unmigrated config fails fast demanding roles + secret instead of
+// booting with the old semantics. An EXPLICIT auth.jwt.enabled: false is
+// allowed (pre-JWT cookie-session mode) and skips every new validation —
+// only the classic auth.username/auth.password requirement applies.
+// LoginEnabled registers /api/login + /api/logout and self-issues HS256
+// JWTs; when false the plane may run external-JWT-only: auth.username /
+// auth.password and the secret are then NOT required.
+type JWTConfig struct {
+	Enabled      bool   `mapstructure:"enabled"`
+	LoginEnabled bool   `mapstructure:"login_enabled"`
+	Issuer       string `mapstructure:"issuer"`
+	Audience     string `mapstructure:"audience"`
+	TTLSeconds   int    `mapstructure:"ttl_seconds"`
+	// Secret is the HS256 signing secret — REQUIRED when login_enabled is
+	// true. ${VAR}-expandable from the environment (same fail-fast rule as
+	// the auth.users passwords: unset/empty = the plane refuses to start;
+	// never a silent empty key).
+	Secret string `mapstructure:"secret"`
 }
 
 // MySQLAuditConfig is the optional session-audit MySQL block (Task 9.7,
@@ -271,6 +319,17 @@ func LoadControl(path string) (*ControlConfig, error) {
 		// Task 9.13 session tokens: default issue mode single-use; session
 		// TTL 0 = infinite (revocation is explicit, never timer-based).
 		"api.token_mode": "single-use", "api.session_token_ttl_seconds": 0,
+		// JWT conversion (Task 2): the bearer-JWT block defaults ON —
+		// auth.jwt.enabled ABSENT = true (JWT is the mode going forward; an
+		// explicit false keeps the legacy cookie-session mode), and
+		// login_enabled ABSENT = true (today's behavior: the plane
+		// authenticates UI users with username/password). jwt.ttl_seconds
+		// (28800 = 8h) is the new auth expiry — it supersedes
+		// auth.session_ttl_hours, which stays parsed (default 8) until
+		// Task 6 removes the cookie-session machinery.
+		"auth.jwt.enabled":       true,
+		"auth.jwt.login_enabled": true,
+		"auth.jwt.ttl_seconds":   28800,
 		"auth.session_ttl_hours": 8, "valkey.addr": "127.0.0.1:6379",
 		"valkey.mode": "direct",
 		// Task 9.7 session audit: OFF by default (no DB dependency unless
@@ -304,20 +363,73 @@ func LoadControl(path string) (*ControlConfig, error) {
 		DataPlanePort:   v.GetString("api.data_plane_port"),
 		AuthUser:        v.GetString("auth.username"),
 		AuthPassword:    v.GetString("auth.password"),
-		SessionTTL:      v.GetInt("auth.session_ttl_hours"),
-		TLS:             tlsCfg,
-		Audit:           auditCfg,
+		AuthRole:        v.GetString("auth.role"),
+		AllowMakerWatch: v.GetBool("auth.allow_maker_watch"),
+		JWT: JWTConfig{
+			Enabled:      v.GetBool("auth.jwt.enabled"),
+			LoginEnabled: v.GetBool("auth.jwt.login_enabled"),
+			Issuer:       v.GetString("auth.jwt.issuer"),
+			Audience:     v.GetString("auth.jwt.audience"),
+			TTLSeconds:   v.GetInt("auth.jwt.ttl_seconds"),
+			Secret:       v.GetString("auth.jwt.secret"),
+		},
+		SessionTTL: v.GetInt("auth.session_ttl_hours"),
+		TLS:        tlsCfg,
+		Audit:      auditCfg,
 	}
-	// Review round 3: auth fail-fast — AutomaticEnv is set, so an empty env
-	// override (e.g. ZT_AUTH_PASSWORD="") silently overrides the defaults map
-	// and would produce a control plane with an empty password. An empty
-	// username/password or a non-positive token TTL is a load error naming
-	// the field; a plane with unguessable-empty credentials must never start.
-	if cfg.AuthUser == "" {
-		return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
-	}
-	if cfg.AuthPassword == "" {
-		return nil, fmt.Errorf("auth.password is required (set ZT_AUTH_PASSWORD in .env — see .env.example)")
+	// --- Auth validation (JWT conversion Task 2) ---
+	// Review round 3 fail-fast retained: AutomaticEnv is set, so an empty
+	// env override (e.g. ZT_AUTH_PASSWORD="") silently overrides the
+	// defaults map and would produce a plane with an empty credential; a
+	// plane with unguessable-empty credentials must never start. The
+	// username/password requirement is now mode-dependent:
+	//   - legacy cookie mode (auth.jwt.enabled: false): required, unchanged.
+	//   - JWT mode + login_enabled: required, unchanged.
+	//   - JWT mode external-only (login_enabled: false): NOT required —
+	//     the plane may run external-JWT-only (no UI login).
+	// The signing secret follows the auth.users ${VAR}-expansion pattern:
+	// a config placeholder resolves from the environment and an unset/
+	// empty secret refuses to start — never a silent empty HS256 key.
+	if cfg.JWT.Enabled {
+		if cfg.JWT.LoginEnabled {
+			secret, err := expandEnv(cfg.JWT.Secret)
+			if err != nil {
+				return nil, fmt.Errorf("auth.jwt.secret: %w", err)
+			}
+			if secret == "" {
+				return nil, fmt.Errorf("auth.jwt.login_enabled=true requires auth.jwt.secret (set ZT_JWT_SECRET in .env — see .env.example)")
+			}
+			cfg.JWT.Secret = secret
+			if cfg.AuthUser == "" {
+				return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
+			}
+			if cfg.AuthPassword == "" {
+				return nil, fmt.Errorf("auth.password is required (set ZT_AUTH_PASSWORD in .env — see .env.example)")
+			}
+			// Every principal role is EXPLICIT — no silent default (an
+			// un-role'd account would be an accidental superuser).
+			if cfg.AuthRole != "maker" && cfg.AuthRole != "checker" {
+				if cfg.AuthRole == "" {
+					return nil, fmt.Errorf("auth.role is required when auth.jwt.login_enabled=true (\"maker\" or \"checker\")")
+				}
+				return nil, fmt.Errorf("auth.role must be \"maker\" or \"checker\", got %q", cfg.AuthRole)
+			}
+		} else {
+			// External-only: username/password + secret are NOT required,
+			// but a role that IS declared must still be valid (role values
+			// are validated for every principal regardless of login flag).
+			if cfg.AuthRole != "" && cfg.AuthRole != "maker" && cfg.AuthRole != "checker" {
+				return nil, fmt.Errorf("auth.role must be \"maker\" or \"checker\", got %q", cfg.AuthRole)
+			}
+		}
+	} else {
+		// Legacy pre-JWT cookie mode: the classic requirement is unchanged.
+		if cfg.AuthUser == "" {
+			return nil, fmt.Errorf("auth.username is required (set auth.username or ZT_AUTH_USERNAME)")
+		}
+		if cfg.AuthPassword == "" {
+			return nil, fmt.Errorf("auth.password is required (set ZT_AUTH_PASSWORD in .env — see .env.example)")
+		}
 	}
 	// Task 9.13: extra users — ${VAR} password placeholders resolved from
 	// the environment; empty username/password in ANY user is a load
@@ -338,6 +450,24 @@ func LoadControl(path string) (*ControlConfig, error) {
 			return nil, fmt.Errorf("auth.users[%d].password (%s) is required (set ZT_AUTH_<USER>_PASSWORD in .env — see .env.example)", i, u.Username)
 		}
 		u.Password = pw
+	}
+	// Task 2: role validation for the OPTIONAL users — every entry must
+	// declare "maker"|"checker" when login_enabled (explicit over default:
+	// an un-role'd entry would be an accidental superuser); in external-only
+	// mode a declared role must still be valid. Legacy cookie mode
+	// (jwt.enabled: false) has no roles and skips this entirely.
+	if cfg.JWT.Enabled {
+		for i := range cfg.AuthUsers {
+			u := &cfg.AuthUsers[i]
+			if u.Role != "maker" && u.Role != "checker" {
+				if cfg.JWT.LoginEnabled && u.Role == "" {
+					return nil, fmt.Errorf("auth.users[%d].role (%s) is required when auth.jwt.login_enabled=true (\"maker\" or \"checker\")", i, u.Username)
+				}
+				if u.Role != "" {
+					return nil, fmt.Errorf("auth.users[%d].role (%s) must be \"maker\" or \"checker\", got %q", i, u.Username, u.Role)
+				}
+			}
+		}
 	}
 	if cfg.TokenTTL <= 0 {
 		return nil, fmt.Errorf("api.token_ttl_seconds must be > 0, got %d", cfg.TokenTTL)

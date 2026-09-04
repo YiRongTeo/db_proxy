@@ -2,7 +2,7 @@ http:
   addr: ":8080"
   static_dir: "./web/dist/web/browser"
 api:
-  api_key: ""                 # empty → external /api/token disabled; set via ZT_API_API_KEY (viper maps api.api_key → ZT_API_API_KEY, NOT ZT_API_KEY)
+  api_key: ""                 # DEPRECATED (JWT conversion): retired in Task 7 — control-plane mint auth becomes bearer-JWT only. Keep empty; do NOT set ZT_API_API_KEY going forward.
   token_ttl_seconds: 300
   # token_mode (Task 9.13; env ZT_API_TOKEN_MODE): the DEFAULT token flavor
   # when a mint request carries no mode and the target preset declares none.
@@ -30,13 +30,37 @@ api:
 auth:
   username: "admin"
   password: ""                # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUTH_PASSWORD in .env (see .env.example); empty = plane refuses to start
+  # role (JWT conversion): the PRIMARY account's role — "maker" or
+  # "checker". REQUIRED when auth.jwt.login_enabled is true; no silent
+  # default (an un-role'd account would be an accidental superuser).
+  role: "maker"
+  # allow_maker_watch (JWT conversion): false (default) = only checker-role
+  # principals may watch/kill sessions (SoD); true lets makers watch too.
+  allow_maker_watch: false
   # users (Task 9.13): OPTIONAL extra UI accounts beyond the primary pair —
   # e.g. a dedicated CHECKER so maker and checker roles use different
   # identities (the SoD watch rejects checker == maker). Passwords are
   # ${VAR} placeholders from the environment; empty = plane refuses to start.
+  # Each entry declares its own role (required when login_enabled).
   users:
     - username: "checker"
       password: "${ZT_AUTH_CHECKER_PASSWORD}"
+      role: "checker"
+  # jwt (JWT conversion): the bearer-JWT auth block. enabled ABSENT = true
+  # (JWT is the mode); an explicit false keeps the legacy cookie mode.
+  # login_enabled registers /api/login + /api/logout (self-issued HS256
+  # JWTs); false = external-JWT-only (username/password then NOT required).
+  # ttl_seconds (28800 = 8h) replaces session_ttl_hours as the auth expiry.
+  jwt:
+    enabled: true
+    login_enabled: true
+    issuer: "zerotrust-proxy"
+    audience: "zt-api"
+    ttl_seconds: 28800
+    secret: "${ZT_JWT_SECRET}"  # NO SECRETS IN COMMITTED CONFIGS — set ZT_JWT_SECRET in .env (see .env.example); REQUIRED when login_enabled; empty = plane refuses to start
+  # session_ttl_hours (LEGACY cookie-session TTL — KEPT for now: internal/
+  # api/auth.go still reads it; removal owned by JWT Task 6, superseded by
+  # jwt.ttl_seconds above):
   session_ttl_hours: 8
 db_presets:
   - name: "MySQL read-only"
