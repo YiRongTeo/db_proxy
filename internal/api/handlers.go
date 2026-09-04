@@ -165,9 +165,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// session and watch itself, bypassing the data plane's SoD write gate
 	// (Task 8.6: a write session's queries are blocked unless a checker
 	// WATCHES it, and the checker can never watch its own session). No
-	// matching preset → access "" — the data plane treats absent access as
-	// read (no gate), so ad-hoc checker mints stay available, matching the
-	// plan's access semantics.
+	// matching preset → access "" — UNGATED, NOT read: the data plane
+	// gates only on literal access=="write", so "" rides the resolved
+	// backend account's real privilege and ad-hoc checker mints on
+	// read-only accounts stay available (the plan's access semantics).
+	// Effective read-only-ness for write-capable accounts is therefore a
+	// config-hygiene property: every credentials key backed by rw creds
+	// MUST pair with an access:write preset (RUN.md §2.3) — otherwise a
+	// checker could mint "" over those creds and run gate-free.
 	if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && access == "write" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker role limited to read-only tokens"})
 		return

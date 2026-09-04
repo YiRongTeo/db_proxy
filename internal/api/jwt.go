@@ -61,8 +61,8 @@ func newJTI() (string, error) {
 // signJWT mints a self-issued HS256 token for username with the given role
 // (maker|checker), bound to cfg's issuer/audience/secret. ttl bounds exp;
 // now is injected so callers (and tests) control time. This is the sign
-// side of the self-issuer — Task 6's handleLogin is its first production
-// caller; today only the test helper mintJWT uses it.
+// side of the self-issuer: Task 6's handleLogin mints every login JWT
+// through it, and the test helper mintJWT shares the same path.
 func signJWT(cfg *config.ControlConfig, username, role string, ttl time.Duration, now time.Time) (string, error) {
 	jti, err := newJTI()
 	if err != nil {

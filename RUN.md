@@ -411,6 +411,15 @@ caching, no disk writes, no log field. Non-200 vault responses surface as status
 errors; the response body is never read into an error or log line. Keys in the credential
 list are plaintext in the committed file (as before); `api` mode removes even that.
 
+**Pairing rule (checker read-only gate — config hygiene).** The checker mint gate (403
+on `access == "write"`, §3) resolves access from the `db_presets` entry in
+`configs/control.yaml`, NOT from this credentials list. Every `credentials` key backed
+by WRITE-capable backend creds MUST have a matching preset with `access: "write"` — a
+write account with no matching preset resolves `access ""` (ungated, §5.1), so a
+checker could mint a token over those creds that runs gate-free. The shipped configs
+pair every rw key 1:1 (e.g. `mysql:rw_user@…` ↔ "MySQL read-write"); keep the pairing
+when adding accounts.
+
 Quick check (vault stub with `python`):
 
 ```bash

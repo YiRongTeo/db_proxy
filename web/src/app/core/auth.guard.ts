@@ -3,8 +3,8 @@ import { CanActivateFn, Router } from '@angular/router';
 import { AuthService } from './auth.service';
 
 /**
- * Route guard for the Maker portal and Checker dashboard: requires a UI
- * session.
+ * Route guard for the Maker portal and Checker dashboard: requires an
+ * authenticated JWT principal.
  *
  * On a cold boot the stored JWT (TokenStore, re-hydrated from sessionStorage)
  * is only validated by AuthService.restoreSession() (GET /api/me); if the

@@ -260,8 +260,8 @@ func TestRequireJWTMissingOrMalformedHeader(t *testing.T) {
 // a correctly signed token is rejected because no JWT trust is configured.
 // (Route tests run with jwt.enabled=true; this pins the fail-closed branch.)
 func TestRequireJWTRejectsWhenJWTDisabled(t *testing.T) {
-	legacy := &config.ControlConfig{JWT: config.JWTConfig{Enabled: false, LoginEnabled: true}}
-	a := &authMiddleware{cfg: legacy}
+	disabled := &config.ControlConfig{JWT: config.JWTConfig{Enabled: false, LoginEnabled: true}}
+	a := &authMiddleware{cfg: disabled}
 	tok := mintJWT(t, testJWTFixture().cfg, "alice", "maker")
 
 	if _, status := requireJWTCapture(t, a, bearerReq(authHeader(tok))); status != http.StatusUnauthorized {

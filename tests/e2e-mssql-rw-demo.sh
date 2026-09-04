@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2E MSSQL READ/WRITE session demo — maker admin (JWT login), checker account (WS watch)
-# Steps: issue rw token -> attach checker within 60s -> rw SQL flows -> kill query -> kill conn
+# Steps: issue rw token (maker) -> attach checker watcher -> rw SQL flows -> verify checker feed events
 # JWT-era auth (2026-09-05 conversion): the MAKER account (admin) mints DB
 # tokens; the CHECKER account watches/lists/kills (strict SoD — control.yaml
 # auth.allow_maker_watch: false, so the maker cannot touch the checker surface).
