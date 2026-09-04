@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -31,7 +30,7 @@ import (
 // in (mysql-test, throwaway database) AND the RunAuditLifecycle consumer
 // started (the production wiring). Returns the server, client, store and a
 // raw *sql.DB for row assertions.
-func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *sql.DB) {
+func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *sql.DB, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -39,8 +38,10 @@ func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          testJWTBlock(),
 		SessionTTL:   8,
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
@@ -75,11 +76,7 @@ func newAuditTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store
 	t.Cleanup(cancel)
 	go a.RunAuditLifecycle(ctx)
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return srv, &http.Client{Jar: jar}, vs, assertDB
+	return srv, newJarClient(t), vs, assertDB, cfg
 }
 
 // auditDSN builds the DSN for the throwaway audit database (root dev creds).
@@ -201,13 +198,17 @@ func issueAuditToken(t *testing.T, client *http.Client, srv *httptest.Server, vs
 // upsert is synchronous inside handleToken, so the row is readable as soon
 // as the issue returns 200.
 func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
-	srv, client, vs, db := newAuditTestAPIServer(t)
+	srv, client, vs, db, cfg := newAuditTestAPIServer(t)
 
 	user := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
 	// Review 9.9a: the token is issued for the SESSION user — the maker
-	// under test needs its own session (the login endpoint only knows admin).
+	// under test needs its own session (the login endpoint only knows
+	// admin). /api/token's session leg still runs on the legacy cookie
+	// (Task 7 migrates it); GET /api/sessions is requireJWT-guarded, so the
+	// same client carries a bearer token too.
 	sessionAs(t, client, srv.URL, vs, user)
-	sid := issueAuditToken(t, client, srv, vs, user, "ro_user", "T-9-7")
+	authed := withBearer(client, mintJWT(t, cfg, user, "maker"))
+	sid := issueAuditToken(t, authed, srv, vs, user, "ro_user", "T-9-7")
 
 	r := fetchAuditRow(t, db, sid)
 	if r.status != "pending" {
@@ -241,12 +242,13 @@ func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 // started → status active + started_at + refreshed db fields; ended →
 // status ended + ended_at.
 func TestAuditLifecycleConsumer(t *testing.T) {
-	srv, client, vs, db := newAuditTestAPIServer(t)
+	srv, client, vs, db, cfg := newAuditTestAPIServer(t)
 
 	user := fmt.Sprintf("audit-lc-%d", time.Now().UnixNano())
 	// Review 9.9a: the token is issued for the SESSION user.
-	sessionAs(t, client, srv.URL, vs, user)
-	sid := issueAuditToken(t, client, srv, vs, user, "rw_user", "T-LC")
+	sessionAs(t, client, srv.URL, vs, user) // legacy cookie leg for /api/token
+	authed := withBearer(client, mintJWT(t, cfg, user, "maker"))
+	sid := issueAuditToken(t, authed, srv, vs, user, "rw_user", "T-LC")
 
 	started := time.Now().UTC()
 	ev := models.QueryEvent{Kind: "session", Action: "started", Ts: started,
@@ -285,18 +287,19 @@ func TestAuditLifecycleConsumer(t *testing.T) {
 // session's maker — a maker watching their own session is rejected with a
 // 1008 close and never reaches the audit attach.
 func TestWSCheckerAuditAttachDetach(t *testing.T) {
-	srv, client, vs, db := newAuditTestAPIServer(t)
+	srv, client, vs, db, cfg := newAuditTestAPIServer(t)
 
 	maker := fmt.Sprintf("audit-maker-%d", time.Now().UnixNano())
 	checker := fmt.Sprintf("audit-checker-%d", time.Now().UnixNano())
 	// Review 9.9a: the token is issued for the SESSION user (the maker).
-	sessionAs(t, client, srv.URL, vs, maker)
-	sid := issueAuditToken(t, client, srv, vs, maker, "ro_user", "T-WS")
+	sessionAs(t, client, srv.URL, vs, maker) // legacy cookie leg for /api/token
+	authed := withBearer(client, mintJWT(t, cfg, maker, "maker"))
+	sid := issueAuditToken(t, authed, srv, vs, maker, "ro_user", "T-WS")
 
-	// Switch identity: the checker is a different user than the maker.
-	sessionAs(t, client, srv.URL, vs, checker)
-	cookie := wsSessionCookie(t, srv, client)
-	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	// Switch identity: the checker is a different user than the maker. The
+	// WS upgrade is bearer-authed (requireJWT), so the dial presents the
+	// checker's own minted token.
+	c := dialWSChecker(t, srv, mintJWT(t, cfg, checker, "checker"), "sess:"+sid)
 
 	waitAudit(t, db, sid, "checker attach",
 		func(r auditRow) bool { return r.checker.Valid && r.checker.String == checker }, nil)

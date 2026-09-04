@@ -66,10 +66,10 @@ func clearLiveDirectory(t *testing.T, vs *store.ValkeyStore) {
 	}
 }
 
-// TestSessionsRequiresSession: GET /api/sessions without a zt_session
-// cookie → 401.
-func TestSessionsRequiresSession(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+// TestSessionsRequiresJWT: GET /api/sessions without an Authorization
+// bearer → 401.
+func TestSessionsRequiresJWT(t *testing.T) {
+	srv, client, _ := newTestAPIServer(t)
 
 	resp, err := client.Get(srv.URL + "/api/sessions")
 	if err != nil {
@@ -77,7 +77,7 @@ func TestSessionsRequiresSession(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("GET /api/sessions without cookie: status %d, want 401", resp.StatusCode)
+		t.Errorf("GET /api/sessions without bearer: status %d, want 401", resp.StatusCode)
 	}
 }
 
@@ -86,8 +86,8 @@ func TestSessionsRequiresSession(t *testing.T) {
 // records carry the checker-facing snake_case fields — and thread_id is
 // NOT exposed.
 func TestSessionsListsLiveDirectory(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -171,8 +171,8 @@ func TestSessionsListsLiveDirectory(t *testing.T) {
 // and when the directory happens to be truly empty at the final read,
 // assert the [] encoding (also pinned by the store suite).
 func TestSessionsEmptyIsEmptyArray(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -264,8 +264,8 @@ func subscribeTo(t *testing.T, vs *store.ValkeyStore, channel string) (<-chan []
 // {"session_id":..., "mode":"connection"} on ctl:kill — the data plane's
 // two-level kill dispatches on exactly this channel.
 func TestKillPublishesCtlKillModeDefault(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -307,8 +307,8 @@ func TestKillPublishesCtlKillModeDefault(t *testing.T) {
 // TestKillPublishesCtlKillModeQuery is the live proof of mode=query
 // passthrough: the subscriber receives {"session_id":..., "mode":"query"}.
 func TestKillPublishesCtlKillModeQuery(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -350,8 +350,8 @@ func TestKillPublishesCtlKillModeQuery(t *testing.T) {
 // TestKillInvalidMode: any mode other than "query"/"connection" is rejected
 // with 400 {"error":"invalid mode"} — nothing is published.
 func TestKillInvalidMode(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	for name, body := range map[string]string{
 		"garbage mode": `{"session_id":"sid-x","mode":"garbage"}`,

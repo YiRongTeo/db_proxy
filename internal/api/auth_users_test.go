@@ -3,14 +3,16 @@ package api
 // Task 9.13 — optional extra UI users (auth.users): a dedicated checker
 // account so maker and checker roles can use different identities (the SoD
 // watch rejects checker == maker). The primary admin pair stays the
-// primary; extra users authenticate through the same /api/login endpoint.
+// primary; extra users authenticate through the same /api/login endpoint
+// (which still issues the legacy cookie until Task 6, when it switches to
+// returning a JWT — /api/me already demands the bearer, so the guarded-route
+// leg below presents a minted checker token).
 
 import (
 	"context"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -38,10 +40,12 @@ func TestExtraUserLogin(t *testing.T) {
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          testJWTBlock(),
 		AuthUsers: []config.AuthUserConfig{
-			{Username: "checker", Password: "checker-pw"},
+			{Username: "checker", Password: "checker-pw", Role: "checker"},
 		},
 		SessionTTL: 8,
 		TokenTTL:   60,
@@ -51,17 +55,14 @@ func TestExtraUserLogin(t *testing.T) {
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	client := &http.Client{Jar: jar}
+	client := newJarClient(t)
 
 	if got := loginAs(t, client, srv.URL, "checker", "checker-pw"); got != http.StatusOK {
 		t.Fatalf("checker login status %d, want 200", got)
 	}
-	// The session must be bound to the checker username.
-	resp, err := client.Get(srv.URL + "/api/me")
+	// /api/me is bearer-guarded: present a token for the checker identity.
+	authed := withBearer(client, mintJWT(t, cfg, "checker", "checker"))
+	resp, err := authed.Get(srv.URL + "/api/me")
 	if err != nil {
 		t.Fatalf("GET /api/me: %v", err)
 	}

@@ -14,9 +14,9 @@ import (
 
 // --- POST /api/kill (Task 6.5, spec amendment 9e) ---
 
-// TestKillRequiresSession: POST /api/kill without a zt_session cookie → 401.
-func TestKillRequiresSession(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+// TestKillRequiresJWT: POST /api/kill without an Authorization bearer → 401.
+func TestKillRequiresJWT(t *testing.T) {
+	srv, client, _ := newTestAPIServer(t)
 
 	resp, err := client.Post(srv.URL+"/api/kill", "application/json",
 		strings.NewReader(`{"session_id":"sid-x"}`))
@@ -25,15 +25,15 @@ func TestKillRequiresSession(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("POST /api/kill without cookie: status %d, want 401", resp.StatusCode)
+		t.Errorf("POST /api/kill without bearer: status %d, want 401", resp.StatusCode)
 	}
 }
 
-// TestKillBadRequest: with a valid session, missing/empty/malformed
+// TestKillBadRequest: with a valid bearer token, missing/empty/malformed
 // session_id must all yield 400 {"error":"session_id required"}.
 func TestKillBadRequest(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	for name, body := range map[string]string{
 		"empty session_id":   `{"session_id":""}`,
@@ -69,8 +69,8 @@ func TestKillBadRequest(t *testing.T) {
 // subscriber must receive exactly {"session_id":"sid-x","mode":"connection"}
 // — the mode field defaults to "connection" (Task 8.4).
 func TestKillPublishesCtlKill(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,11 +129,12 @@ func TestKillPublishesCtlKill(t *testing.T) {
 
 // --- POST /api/token ticket requirement (Task 6.5, spec amendment 9b) ---
 
-// TestTokenRequiresTicketID: with a valid UI session, a token request
+// TestTokenRequiresTicketID: with a valid legacy UI session (the /api/token
+// bare route still resolves sessions from the cookie until Task 7), a token request
 // WITHOUT ticket_id → 400 {"error":"ticket_id required"}; WITH ticket_id →
 // 200 and the issued tok:<token> key exists in Valkey with the ticket.
 func TestTokenRequiresTicketID(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
 	noTicket := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3306","db_type":"mysql"}`

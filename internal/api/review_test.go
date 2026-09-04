@@ -57,7 +57,7 @@ func TestSecureEqualConstantTime(t *testing.T) {
 // TestLoginRateLimit429: after loginMaxFailures failed attempts the key is
 // blocked — even CORRECT credentials answer 429 until the window rolls over.
 func TestLoginRateLimit429(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 
 	for i := 0; i < loginMaxFailures; i++ {
 		resp, err := client.Post(srv.URL+"/api/login", "application/json",
@@ -85,7 +85,7 @@ func TestLoginRateLimit429(t *testing.T) {
 // TestLoginSuccessClearsFailures: a successful login resets the failure
 // counter — the key is not blocked by earlier typos.
 func TestLoginSuccessClearsFailures(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 
 	for i := 0; i < loginMaxFailures-1; i++ {
 		resp, err := client.Post(srv.URL+"/api/login", "application/json",
@@ -119,7 +119,9 @@ func tokenBody(username string) string {
 // session-authenticated requester may send a body username that MATCHES the
 // session — the token is issued for the session username.
 func TestTokenUsernameBindingAccept(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
+	// /api/token's session leg still resolves the legacy cookie session
+	// (the bare route is migrated to JWT in Task 7) — loginViaAPI supplies it.
 	loginViaAPI(t, client, srv.URL)
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
@@ -137,7 +139,7 @@ func TestTokenUsernameBindingAccept(t *testing.T) {
 // authenticated as admin sending a body username for ANOTHER user is
 // rejected — the body cannot forge a different maker identity.
 func TestTokenUsernameBindingMismatch(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
 	resp, err := client.Post(srv.URL+"/api/token", "application/json",
@@ -162,7 +164,7 @@ func TestTokenUsernameBindingMismatch(t *testing.T) {
 // requester may OMIT the body username — the token is then issued for the
 // SESSION username (the body is never trusted).
 func TestTokenUsernameEmptyBindsSession(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
 	// Strip the username field entirely.
@@ -181,8 +183,8 @@ func TestTokenUsernameEmptyBindsSession(t *testing.T) {
 // unknown field is a client bug — decodeJSON rejects the request instead of
 // silently ignoring the field.
 func TestDecodeJSONRejectsUnknownFields(t *testing.T) {
-	srv, client := newTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, cfg := newTestAPIServer(t)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "checker"))
 
 	body := `{"session_id":"sid-x","mode":"connection","bogus_field":true}`
 	resp, err := client.Post(srv.URL+"/api/kill", "application/json", strings.NewReader(body))
@@ -199,7 +201,7 @@ func TestDecodeJSONRejectsUnknownFields(t *testing.T) {
 // maxBodyBytes trips MaxBytesReader — the server answers 413 (the handler's
 // 400 is superseded by the too-large response) and never decodes it.
 func TestDecodeJSONRejectsOversize(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 
 	pad := strings.Repeat("a", maxBodyBytes) // valid JSON, oversized
 	body := `{"username":"admin","password":"s3cret","pad":"` + pad + `"}`
@@ -215,7 +217,7 @@ func TestDecodeJSONRejectsOversize(t *testing.T) {
 
 // newIssueRateLimitedAPI builds an api with a tiny issuance throttle so a
 // burst of token issues trips it (review 9.9 MINOR: issuance throttle).
-func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client) {
+func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -223,8 +225,10 @@ func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client) {
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          testJWTBlock(),
 		APIKey:       "dev-key",
 		SessionTTL:   8,
 		TokenTTL:     60,
@@ -235,13 +239,13 @@ func newIssueRateLimitedAPI(t *testing.T) (*httptest.Server, *http.Client) {
 	a.issueLimiter = newRateLimiter(time.Minute, 2)
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	return srv, &http.Client{}
+	return srv, &http.Client{}, cfg
 }
 
 // TestTokenIssuanceThrottle (review 9.9 MINOR): token minting is bounded per
 // user — after the (shortened) quota the next issue answers 429.
 func TestTokenIssuanceThrottle(t *testing.T) {
-	srv, client := newIssueRateLimitedAPI(t)
+	srv, client, _ := newIssueRateLimitedAPI(t)
 
 	// API-key path (no session): keyed by client IP. The request body is a
 	// one-shot reader — reuse would hit "ContentLength with Body length 0"

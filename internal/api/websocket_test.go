@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -24,7 +23,7 @@ import (
 // parameters (2s lease, 200ms heartbeat instead of 30s/10s) so the heartbeat
 // refresh is observable quickly. Returns the store too — tests inspect the
 // watch keys it maintains.
-func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore) {
+func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -32,8 +31,10 @@ func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.Va
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "checker", // admin is the checker in the watch tests (SoD: maker ≠ checker)
+		JWT:          testJWTBlock(),
 		SessionTTL:   8,
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
@@ -44,38 +45,19 @@ func newWatchTestServer(t *testing.T) (*httptest.Server, *http.Client, *store.Va
 	a.watchHeartbeat = 200 * time.Millisecond
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return srv, &http.Client{Jar: jar}, vs
-}
-
-// wsSessionCookie extracts the zt_session cookie header value after login
-// (the WS dial must carry it — /ws/checker is session-required).
-func wsSessionCookie(t *testing.T, srv *httptest.Server, client *http.Client) string {
-	t.Helper()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse server url: %v", err)
-	}
-	for _, c := range client.Jar.Cookies(u) {
-		if c.Name == sessionCookie {
-			return c.Name + "=" + c.Value
-		}
-	}
-	t.Fatal("zt_session cookie not found after login")
-	return ""
+	return srv, newJarClient(t), vs, cfg
 }
 
 // dialWSChecker opens a checker WebSocket with the given channel param.
-func dialWSChecker(t *testing.T, srv *httptest.Server, cookie, channel string) *websocket.Conn {
+// /ws/checker is requireJWT-guarded since Task 5: the dial presents the
+// bearer token in the upgrade request's Authorization header.
+func dialWSChecker(t *testing.T, srv *httptest.Server, token, channel string) *websocket.Conn {
 	t.Helper()
 	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/checker?channel=" + url.QueryEscape(channel)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, u, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Cookie": []string{cookie}},
+		HTTPHeader: http.Header{"Authorization": []string{authHeader(token)}},
 	})
 	if err != nil {
 		t.Fatalf("ws dial %s: %v", u, err)
@@ -107,9 +89,9 @@ func pollWatch(t *testing.T, vs *store.ValkeyStore, sid string, want bool) {
 // with channel=sess:<sid> sets watch:<sid> with a presence lease; closing
 // the connection deletes it.
 func TestWSCheckerWatchPresenceOnSubscribe(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	// admin = the checker (maker is the seeded session owner)
+	tok := mintJWT(t, cfg, testJWTUser, "checker")
 
 	sid := "sid-ws-presence"
 	_ = vs.DelWatch(context.Background(), sid)
@@ -118,7 +100,7 @@ func TestWSCheckerWatchPresenceOnSubscribe(t *testing.T) {
 	// real session whose maker differs from the checker (admin here).
 	seedSessionRecord(t, vs, sid, "alice")
 
-	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	c := dialWSChecker(t, srv, tok, "sess:"+sid)
 	pollWatch(t, vs, sid, true) // subscribe → lease exists (gate probe sees the watch)
 
 	// Lease TTL semantics are covered at the store level (watchLeaseTTL in
@@ -139,16 +121,16 @@ func TestWSCheckerWatchPresenceOnSubscribe(t *testing.T) {
 // store level — watchLeaseTTL in valkey_store_test.go; this test proves the
 // hub's refresh loop actually runs.)
 func TestWSCheckerWatchHeartbeatRefreshesTTL(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	// admin = the checker (maker is the seeded session owner)
+	tok := mintJWT(t, cfg, testJWTUser, "checker")
 
 	sid := "sid-ws-heartbeat"
 	_ = vs.DelWatch(context.Background(), sid)
 	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
 	seedSessionRecord(t, vs, sid, "alice") // maker ≠ checker (admin)
 
-	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	c := dialWSChecker(t, srv, tok, "sess:"+sid)
 	pollWatch(t, vs, sid, true)
 
 	time.Sleep(2500 * time.Millisecond) // ~12 heartbeat ticks, past the 2s lease TTL
@@ -170,9 +152,9 @@ func TestWSCheckerWatchHeartbeatRefreshesTTL(t *testing.T) {
 // connection's disconnect clears exactly the key it held. A channel=*
 // connection holds no key at all.
 func TestWSCheckerWatchChannelSwitchAway(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	// admin = the checker (maker is the seeded session owner)
+	tok := mintJWT(t, cfg, testJWTUser, "checker")
 
 	sidA := "sid-ws-switch-a"
 	_ = vs.DelWatch(context.Background(), sidA)
@@ -180,12 +162,12 @@ func TestWSCheckerWatchChannelSwitchAway(t *testing.T) {
 	seedSessionRecord(t, vs, sidA, "alice") // maker ≠ checker (admin)
 
 	// Checker watches session A.
-	connA := dialWSChecker(t, srv, cookie, "sess:"+sidA)
+	connA := dialWSChecker(t, srv, tok, "sess:"+sidA)
 	pollWatch(t, vs, sidA, true)
 
 	// "Switch away": a NEW connection on the live-all channel while the old
 	// one closes. The new connection holds no key.
-	connB := dialWSChecker(t, srv, cookie, "*")
+	connB := dialWSChecker(t, srv, tok, "*")
 	_ = connA.Close(websocket.StatusNormalClosure, "")
 	pollWatch(t, vs, sidA, false) // old key cleared
 	time.Sleep(300 * time.Millisecond)
@@ -203,13 +185,13 @@ func TestWSCheckerWatchChannelSwitchAway(t *testing.T) {
 // session channel (empty sid) sets NO watch key; a non-session channel
 // (live-all / user / ticket) neither.
 func TestWSCheckerWatchMalformedChannelHoldsNoKey(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	// admin = the checker (maker is the seeded session owner)
+	tok := mintJWT(t, cfg, testJWTUser, "checker")
 
-	conn1 := dialWSChecker(t, srv, cookie, "sess:") // empty sid — malformed
-	conn2 := dialWSChecker(t, srv, cookie, "*")     // live-all — not a session
-	conn3 := dialWSChecker(t, srv, cookie, "alice") // user channel — not a session
+	conn1 := dialWSChecker(t, srv, tok, "sess:") // empty sid — malformed
+	conn2 := dialWSChecker(t, srv, tok, "*")     // live-all — not a session
+	conn3 := dialWSChecker(t, srv, tok, "alice") // user channel — not a session
 
 	time.Sleep(300 * time.Millisecond) // give a (wrong) set time to land
 	for _, sid := range []string{"", "sid-ws-malformed", "sid-"} {
@@ -233,9 +215,9 @@ func TestWSCheckerWatchMalformedChannelHoldsNoKey(t *testing.T) {
 // (The store-level lease math is covered by TestWatchPresenceRefcounted;
 // this test proves the hub's SetWatchConn/WatchRemoveConn wiring end to end.)
 func TestWSCheckerWatchRefcountDisconnectSafety(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	// admin = the checker (maker is the seeded session owner)
+	tok := mintJWT(t, cfg, testJWTUser, "checker")
 
 	sid := "sid-ws-refcount"
 	_ = vs.DelWatch(context.Background(), sid)
@@ -243,8 +225,8 @@ func TestWSCheckerWatchRefcountDisconnectSafety(t *testing.T) {
 	seedSessionRecord(t, vs, sid, "alice") // maker ≠ checker (admin)
 
 	// Two checkers attach to the same session.
-	connA := dialWSChecker(t, srv, cookie, "sess:"+sid)
-	connB := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	connA := dialWSChecker(t, srv, tok, "sess:"+sid)
+	connB := dialWSChecker(t, srv, tok, "sess:"+sid)
 	pollWatch(t, vs, sid, true)
 
 	// FIRST disconnect: the gate must stay OPEN (connB still watches).

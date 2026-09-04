@@ -1,28 +1,30 @@
 package api
 
+// Task 5: GET /api/me is guarded by requireJWT — the bearer token the SPA
+// will receive from /api/login (Task 6) replaces the zt_session cookie on
+// this route. The legacy cookie login still exists (until Task 6/4) and is
+// exercised where it still governs: /api/login itself and the /api/token
+// session leg.
+
 import (
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
-	"net/url"
-	"strings"
 	"testing"
-	"time"
 
 	"zerotrust-proxy/internal/config"
-	"zerotrust-proxy/internal/models"
 	"zerotrust-proxy/internal/store"
 )
 
 // newTestAPIServer builds the real Control Plane mux against the LIVE Valkey
-// (127.0.0.1:6379, same as internal/store integration tests) with a throwaway
-// config, and returns a client whose cookie jar carries zt_session across
-// requests exactly like a browser would.
-func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
+// (127.0.0.1:6379, same as internal/store integration tests) with a
+// throwaway config whose JWT block is enabled (jwt.enabled + login_enabled +
+// fixed test secret) so requireJWT and mintJWT work. Returns the config so
+// callers can mint bearer tokens for the identity under test.
+func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -30,8 +32,10 @@ func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          testJWTBlock(),
 		SessionTTL:   8,
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
@@ -39,53 +43,12 @@ func newTestAPIServer(t *testing.T) (*httptest.Server, *http.Client) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return srv, &http.Client{Jar: jar}
+	return srv, newJarClient(t), cfg
 }
 
-// loginViaAPI logs in through the real POST /api/login endpoint, letting the
-// cookie jar capture the zt_session cookie.
-func loginViaAPI(t *testing.T, client *http.Client, base string) {
-	t.Helper()
-	resp, err := client.Post(base+"/api/login", "application/json",
-		strings.NewReader(`{"username":"admin","password":"s3cret"}`))
-	if err != nil {
-		t.Fatalf("POST /api/login: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /api/login: status %d, want 200", resp.StatusCode)
-	}
-}
-
-// sessionAs creates a UI session for user directly in Valkey and installs
-// the zt_session cookie on the client — the browser-equivalent of logging
-// in as that user. Used by tests that issue tokens for a NON-admin maker:
-// review 9.9a binds the token-request body username to the session (the
-// body must match or be rejected), while the login endpoint only ever
-// authenticates the configured admin — so a token for "audit-maker-…"
-// requires a session created for that user.
-func sessionAs(t *testing.T, client *http.Client, base string, vs *store.ValkeyStore, user string) {
-	t.Helper()
-	id, err := vs.CreateSession(context.Background(), models.Session{Username: user}, 8*time.Hour)
-	if err != nil {
-		t.Fatalf("CreateSession(%q): %v", user, err)
-	}
-	u, err := url.Parse(base)
-	if err != nil {
-		t.Fatalf("parse base %q: %v", base, err)
-	}
-	client.Jar.SetCookies(u, []*http.Cookie{{
-		Name: sessionCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
-	}})
-}
-
-// TestMeRequiresSession: GET /api/me without a zt_session cookie → 401.
-func TestMeRequiresSession(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+// TestMeRequiresJWT: GET /api/me without an Authorization header → 401.
+func TestMeRequiresJWT(t *testing.T) {
+	srv, client, _ := newTestAPIServer(t)
 
 	resp, err := client.Get(srv.URL + "/api/me")
 	if err != nil {
@@ -93,15 +56,17 @@ func TestMeRequiresSession(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("GET /api/me without cookie: status %d, want 401", resp.StatusCode)
+		t.Errorf("GET /api/me without bearer: status %d, want 401", resp.StatusCode)
 	}
 }
 
-// TestMeAfterLogin: login via the real endpoint, then GET /api/me → 200 with
-// the session's username.
+// TestMeAfterLogin: log in through the real endpoint (still cookie-based
+// until Task 6) and present a bearer token for the logged-in principal —
+// GET /api/me → 200 with the session's username.
 func TestMeAfterLogin(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, cfg := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
+	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
 
 	resp, err := client.Get(srv.URL + "/api/me")
 	if err != nil {
@@ -115,15 +80,19 @@ func TestMeAfterLogin(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode /api/me body: %v", err)
 	}
-	if got["username"] != "admin" {
-		t.Errorf("GET /api/me username = %q, want %q", got["username"], "admin")
+	if got["username"] != testJWTUser {
+		t.Errorf("GET /api/me username = %q, want %q", got["username"], testJWTUser)
 	}
 }
 
-// TestMeAfterLogout: the cookie jar drops zt_session on logout, so the same
-// client is rejected afterwards → 401.
+// TestMeAfterLogout: POST /api/logout still clears the legacy zt_session
+// cookie (200). Bearer revocation is NOT wired yet — the jti denylist lands
+// in Task 6 — so this test asserts the transitional contract: after logout
+// the cookie is gone and a client with no bearer (and no cookie) is
+// rejected by /api/me. Task 6 rewrites logout to denylist the presented
+// token and adds the token-revocation assertions.
 func TestMeAfterLogout(t *testing.T) {
-	srv, client := newTestAPIServer(t)
+	srv, client, _ := newTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 
 	resp, err := client.Post(srv.URL+"/api/logout", "application/json", nil)
@@ -141,6 +110,6 @@ func TestMeAfterLogout(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("GET /api/me after logout: status %d, want 401", resp.StatusCode)
+		t.Errorf("GET /api/me after logout (no bearer, no cookie): status %d, want 401", resp.StatusCode)
 	}
 }

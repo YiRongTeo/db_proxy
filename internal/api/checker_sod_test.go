@@ -28,9 +28,9 @@ func seedSessionRecord(t *testing.T, vs *store.ValkeyStore, sid, maker string) {
 // closed by the server with a policy-violation close (1008) — the
 // separation-of-duties rejection. The dial itself succeeds (HTTP 101
 // upgrade); the rejection arrives as the first read's CloseError.
-func dialWSCheckerExpectRejected(t *testing.T, srv *httptest.Server, cookie, channel string) {
+func dialWSCheckerExpectRejected(t *testing.T, srv *httptest.Server, token, channel string) {
 	t.Helper()
-	c := dialWSChecker(t, srv, cookie, channel)
+	c := dialWSChecker(t, srv, token, channel)
 	t.Cleanup(func() { _ = c.Close(websocket.StatusNormalClosure, "") })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -64,14 +64,13 @@ func assertNoWatch(t *testing.T, vs *store.ValkeyStore, sid string) {
 // close and NO watch lease is ever created — the maker can never
 // self-approve their own writes.
 func TestWSCheckerCannotWatchOwnSession(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL) // admin = the checker
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	tok := mintJWT(t, cfg, testJWTUser, "checker") // admin = the checker
 
 	sid := "sid-sod-self"
 	seedSessionRecord(t, vs, sid, "admin") // maker = admin = the checker
 
-	dialWSCheckerExpectRejected(t, srv, cookie, "sess:"+sid)
+	dialWSCheckerExpectRejected(t, srv, tok, "sess:"+sid)
 	assertNoWatch(t, vs, sid)
 }
 
@@ -79,14 +78,13 @@ func TestWSCheckerCannotWatchOwnSession(t *testing.T) {
 // may watch the session — the lease is armed, the gate opens, and the
 // disconnect clears it again.
 func TestWSCheckerDifferentCheckerCanWatch(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL) // admin = checker
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	tok := mintJWT(t, cfg, testJWTUser, "checker") // admin = the checker
 
 	sid := "sid-sod-other"
 	seedSessionRecord(t, vs, sid, "alice") // maker = alice ≠ admin
 
-	c := dialWSChecker(t, srv, cookie, "sess:"+sid)
+	c := dialWSChecker(t, srv, tok, "sess:"+sid)
 	pollWatch(t, vs, sid, true) // the gate probe sees the watch
 	_ = c.Close(websocket.StatusNormalClosure, "")
 	pollWatch(t, vs, sid, false)
@@ -97,14 +95,13 @@ func TestWSCheckerDifferentCheckerCanWatch(t *testing.T) {
 // exist for a real session whose maker is known, so a ghost sid can never
 // open a gate.
 func TestWSCheckerUnknownSessionFailClosed(t *testing.T) {
-	srv, client, vs := newWatchTestServer(t)
-	loginViaAPI(t, client, srv.URL)
-	cookie := wsSessionCookie(t, srv, client)
+	srv, _, vs, cfg := newWatchTestServer(t)
+	tok := mintJWT(t, cfg, testJWTUser, "checker") // admin = the checker
 
 	sid := "sid-sod-ghost"
 	_ = vs.DelSessionLive(context.Background(), sid)
 	t.Cleanup(func() { _ = vs.DelSessionLive(context.Background(), sid) })
 
-	dialWSCheckerExpectRejected(t, srv, cookie, "sess:"+sid)
+	dialWSCheckerExpectRejected(t, srv, tok, "sess:"+sid)
 	assertNoWatch(t, vs, sid)
 }

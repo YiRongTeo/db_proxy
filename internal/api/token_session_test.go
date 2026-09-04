@@ -202,7 +202,7 @@ func assertIssuedEvent(t *testing.T, ev models.QueryEvent, user, dbUser, dbType,
 // queries:sess:<sid>, and (c) stamps the SAME sid into the stored token
 // payload — the data plane adopts it when the maker connects.
 func TestTokenIssueListsPendingSession(t *testing.T) {
-	srv, client, vs := newPresetTestAPIServer(t)
+	srv, client, vs, cfg := newPresetTestAPIServer(t)
 	ctx := context.Background()
 	// Review 9.9a: the token is issued for the SESSION user — each case
 	// creates a session for its maker instead of the shared admin login.
@@ -218,14 +218,18 @@ func TestTokenIssueListsPendingSession(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The /api/token leg still runs on the legacy cookie session
+			// (bare route, migrated in Task 7); GET /api/sessions below is
+			// requireJWT-guarded, so the same client carries a bearer too.
 			sessionAs(t, client, srv.URL, vs, tc.user)
+			authed := withBearer(client, mintJWT(t, cfg, tc.user, "maker"))
 			userCh := subscribeAPI(t, vs, "queries:"+tc.user)
 			body := fmt.Sprintf(`{"username":%q,"db_user":%q,"db_ip":"127.0.0.1","db_port":"3307","db_type":%q,"ticket_id":"T-8-11"}`,
 				tc.user, tc.dbUser, tc.dbType)
-			token := issueToken(t, client, srv.URL, body)
+			token := issueToken(t, authed, srv.URL, body)
 
-			// (a) pending listing BEFORE any connect.
-			sid := assertPendingListed(t, client, srv.URL, tc.user, tc.dbUser, tc.dbType)
+			// (a) pending listing BEFORE any connect (bearer-guarded route).
+			sid := assertPendingListed(t, authed, srv.URL, tc.user, tc.dbUser, tc.dbType)
 
 			// (c) the stored payload carries the same sid.
 			p, err := vs.GetDeleteToken(ctx, token)

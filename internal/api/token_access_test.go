@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -19,7 +18,7 @@ import (
 
 // newPresetTestAPIServer is newTestAPIServer with the committed db_presets
 // wired into the config, so handleToken can resolve access levels.
-func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore) {
+func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *store.ValkeyStore, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -27,8 +26,10 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:     "admin",
-		AuthPassword: "s3cret",
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          testJWTBlock(),
 		SessionTTL:   8,
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
@@ -45,11 +46,7 @@ func newPresetTestAPIServer(t *testing.T) (*httptest.Server, *http.Client, *stor
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return srv, &http.Client{Jar: jar}, vs
+	return srv, newJarClient(t), vs, cfg
 }
 
 // issueToken posts a token request through the real endpoint and returns the
@@ -81,7 +78,7 @@ func issueToken(t *testing.T, client *http.Client, base, body string) string {
 // preset, read for the read-only presets, "" for targets no preset matches
 // (the data plane treats absent access as read).
 func TestTokenAccessFromPreset(t *testing.T) {
-	srv, client, vs := newPresetTestAPIServer(t)
+	srv, client, vs, _ := newPresetTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 	ctx := context.Background()
 
@@ -118,7 +115,7 @@ func TestTokenAccessFromPreset(t *testing.T) {
 // the full target fields (db_user/db_ip/db_port), the preset's access level
 // and the issue-time session id + ticket.
 func TestTokenAccessMSSQLPresets(t *testing.T) {
-	srv, client, vs := newPresetTestAPIServer(t)
+	srv, client, vs, _ := newPresetTestAPIServer(t)
 	loginViaAPI(t, client, srv.URL)
 	ctx := context.Background()
 
@@ -158,8 +155,8 @@ func TestTokenAccessMSSQLPresets(t *testing.T) {
 // loosened the rejection — a db_type outside {mysql, postgres, mssql,
 // oracle} still gets 422 with the canonical message.
 func TestTokenRejectsInvalidDBType(t *testing.T) {
-	srv, client, _ := newPresetTestAPIServer(t)
-	loginViaAPI(t, client, srv.URL)
+	srv, client, _, _ := newPresetTestAPIServer(t)
+	loginViaAPI(t, client, srv.URL) // legacy cookie session for the /api/token leg (until Task 7)
 
 	body := `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mongodb","ticket_id":"T-9-3"}`
 	resp, err := client.Post(srv.URL+"/api/token", "application/json", strings.NewReader(body))

@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -26,7 +25,7 @@ import (
 // newModeTestAPIServer is newTestAPIServer with the Task 9.13 knobs wired
 // into the config (token_mode + session_token_ttl_seconds + one session-
 // mode preset).
-func newModeTestAPIServer(t *testing.T, tokenMode string, sessionTTL int) (*httptest.Server, *http.Client, *store.ValkeyStore) {
+func newModeTestAPIServer(t *testing.T, tokenMode string, sessionTTL int) (*httptest.Server, *http.Client, *store.ValkeyStore, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
 	if err != nil {
@@ -34,8 +33,10 @@ func newModeTestAPIServer(t *testing.T, tokenMode string, sessionTTL int) (*http
 	}
 	t.Cleanup(vs.Close)
 	cfg := &config.ControlConfig{
-		AuthUser:        "admin",
-		AuthPassword:    "s3cret",
+		AuthUser:        testJWTUser,
+		AuthPassword:    testJWTPassword,
+		AuthRole:        "maker",
+		JWT:             testJWTBlock(),
 		SessionTTL:      8,
 		TokenTTL:        60,
 		TokenMaxUses:    1,
@@ -50,11 +51,7 @@ func newModeTestAPIServer(t *testing.T, tokenMode string, sessionTTL int) (*http
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
 	t.Cleanup(srv.Close)
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
-	}
-	return srv, &http.Client{Jar: jar}, vs
+	return srv, newJarClient(t), vs, cfg
 }
 
 // issueTokenFull posts a token request (session-authenticated) and returns
@@ -96,7 +93,7 @@ func fetchPayload(t *testing.T, vs *store.ValkeyStore, token string) map[string]
 }
 
 func TestTokenIssueSessionMode(t *testing.T) {
-	srv, client, vs := newModeTestAPIServer(t, "single-use", 0)
+	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
 	sessionAs(t, client, srv.URL, vs, "alice")
 	token, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"session"}`)
@@ -122,7 +119,7 @@ func TestTokenIssueSessionMode(t *testing.T) {
 }
 
 func TestTokenIssueSessionModeFiniteTTL(t *testing.T) {
-	srv, client, vs := newModeTestAPIServer(t, "single-use", 300)
+	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 300)
 	sessionAs(t, client, srv.URL, vs, "alice")
 	_, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"session"}`)
@@ -135,7 +132,7 @@ func TestTokenIssueSessionModeFiniteTTL(t *testing.T) {
 }
 
 func TestTokenIssueInvalidMode(t *testing.T) {
-	srv, client, vs := newModeTestAPIServer(t, "single-use", 0)
+	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
 	sessionAs(t, client, srv.URL, vs, "alice")
 	_, _, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13","mode":"bogus"}`)
@@ -145,7 +142,7 @@ func TestTokenIssueInvalidMode(t *testing.T) {
 }
 
 func TestTokenIssuePresetTokenMode(t *testing.T) {
-	srv, client, vs := newModeTestAPIServer(t, "single-use", 0)
+	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
 	sessionAs(t, client, srv.URL, vs, "alice")
 
 	// The rw_user preset declares token_mode: session → no request mode
@@ -177,7 +174,7 @@ func TestTokenIssuePresetTokenMode(t *testing.T) {
 
 func TestTokenIssueConfigDefaultSession(t *testing.T) {
 	// api.token_mode: session as the global default (GUI deployment).
-	srv, client, vs := newModeTestAPIServer(t, "session", 0)
+	srv, client, vs, _ := newModeTestAPIServer(t, "session", 0)
 	sessionAs(t, client, srv.URL, vs, "alice")
 	token, expiresIn, status := issueTokenFull(t, client, srv.URL,
 		`{"username":"alice","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-13"}`)
@@ -193,7 +190,7 @@ func TestTokenIssueConfigDefaultSession(t *testing.T) {
 }
 
 func TestTokenIssueIdleOverride(t *testing.T) {
-	srv, client, vs := newModeTestAPIServer(t, "single-use", 0)
+	srv, client, vs, _ := newModeTestAPIServer(t, "single-use", 0)
 	sessionAs(t, client, srv.URL, vs, "alice")
 
 	// Per-token idle override lands in the stored payload (any mode).
