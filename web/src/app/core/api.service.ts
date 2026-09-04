@@ -1,6 +1,7 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpContext } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 import { Observable } from 'rxjs';
+import { AUTH_SKIP } from './auth.interceptor';
 
 /**
  * Wire contract shared with the Control Plane (internal/models, internal/config).
@@ -34,9 +35,22 @@ export interface TokenRequest {
   ticket_id?: string;
 }
 
-/** Response of POST /api/login. */
+/**
+ * Response of POST /api/login (Task 6/10): the JWT the SPA must attach as
+ * `Authorization: Bearer <token>` on every subsequent call, plus the
+ * server-confirmed identity (username may be normalized by the server).
+ */
 export interface LoginResponse {
+  token: string;
   username: string;
+  role: string;
+  expires_in?: number; // seconds (auth.jwt.ttl_seconds)
+}
+
+/** Response of GET /api/me (Task 5.7 route; role added Task 6). */
+export interface MeResponse {
+  username: string;
+  role: string;
 }
 
 /**
@@ -87,41 +101,49 @@ export interface QueryEvent {
 
 /**
  * Thin typed wrapper over the Control Plane REST API.
- * Session is carried by the HttpOnly `zt_session` cookie (SameSite=Lax,
- * same-origin), so all calls use relative URLs with credentials included.
+ * Auth (Task 10): every request carries `Authorization: Bearer <jwt>` via the
+ * registered authInterceptor (TokenStore-backed), so no per-call options are
+ * needed. POST /api/login is the one exception — it EXCHANGES credentials for
+ * the token, so it opts out of the header via the AUTH_SKIP request context.
+ * The cookie era (`zt_session` / withCredentials) is gone.
  */
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   constructor(private http: HttpClient) {}
 
+  /** POST /api/login — credentials for a JWT. No auth header (AUTH_SKIP). */
   login(username: string, password: string): Observable<LoginResponse> {
     return this.http.post<LoginResponse>(
       '/api/login',
       { username, password },
-      { withCredentials: true },
+      { context: new HttpContext().set(AUTH_SKIP, true) },
     );
   }
 
+  /**
+   * POST /api/logout — the bearer IS required here: the backend denylists the
+   * presented token's jti (Task 6), so the interceptor attaches it normally.
+   */
   logout(): Observable<unknown> {
-    return this.http.post('/api/logout', null, { withCredentials: true });
+    return this.http.post('/api/logout', null);
   }
 
-  /** GET /api/me — validates the session cookie and returns the session user (Task 5.7). */
-  me(): Observable<LoginResponse> {
-    return this.http.get<LoginResponse>('/api/me', { withCredentials: true });
+  /** GET /api/me — validates the bearer token and returns {username, role} (Task 5.7/6). */
+  me(): Observable<MeResponse> {
+    return this.http.get<MeResponse>('/api/me');
   }
 
   dbPresets(): Observable<DbPreset[]> {
-    return this.http.get<DbPreset[]>('/api/db-presets', { withCredentials: true });
+    return this.http.get<DbPreset[]>('/api/db-presets');
   }
 
   requestToken(payload: TokenRequest): Observable<TokenResponse> {
-    return this.http.post<TokenResponse>('/api/token', payload, { withCredentials: true });
+    return this.http.post<TokenResponse>('/api/token', payload);
   }
 
   /** GET /api/sessions — live data-plane session directory (Task 8.4). */
   sessions(): Observable<SessionInfo[]> {
-    return this.http.get<SessionInfo[]>('/api/sessions', { withCredentials: true });
+    return this.http.get<SessionInfo[]>('/api/sessions');
   }
 
   /**
@@ -131,10 +153,6 @@ export class ApiService {
    * body is unused by the UI (Task 9.11: no KillResponse type needed).
    */
   killSession(sessionId: string, mode: 'query' | 'connection'): Observable<unknown> {
-    return this.http.post(
-      '/api/kill',
-      { session_id: sessionId, mode },
-      { withCredentials: true },
-    );
+    return this.http.post('/api/kill', { session_id: sessionId, mode });
   }
 }

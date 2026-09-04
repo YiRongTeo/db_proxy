@@ -13,9 +13,10 @@ export class App implements OnInit {
   private readonly router = inject(Router);
 
   ngOnInit(): void {
-    // Boot-time session restore: validate the zt_session cookie via GET /api/me
-    // so guarded routes survive full page loads (Task 5.7). The authGuard also
-    // awaits this, so it is safe even if a navigation fires before ngOnInit.
+    // Boot-time session restore: validate the stored bearer JWT (TokenStore)
+    // via GET /api/me so guarded routes survive full page loads (Task 5.7,
+    // token-based since Task 10). The authGuard also awaits this, so it is
+    // safe even if a navigation fires before ngOnInit.
     void this.auth.restoreSession();
   }
 

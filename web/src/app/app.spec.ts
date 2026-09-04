@@ -4,6 +4,7 @@ import { of, throwError } from 'rxjs';
 import { App } from './app';
 import { ApiService } from './core/api.service';
 import { AuthService } from './core/auth.service';
+import { TokenStore } from './core/token-store.service';
 
 describe('App', () => {
   let api: {
@@ -14,14 +15,22 @@ describe('App', () => {
 
   beforeEach(async () => {
     api = {
-      me: vi.fn(() => of({ username: 'admin' })),
-      login: vi.fn(() => of({ username: 'admin' })),
+      me: vi.fn(() => of({ username: 'admin', role: 'maker' })),
+      login: vi.fn(() =>
+        of({ token: 'jwt-admin', username: 'admin', role: 'maker', expires_in: 28800 }),
+      ),
       logout: vi.fn(() => of(null)),
     };
     await TestBed.configureTestingModule({
       imports: [App],
       providers: [provideRouter([]), { provide: ApiService, useValue: api }],
     }).compileComponents();
+    // A stored JWT (sessionStorage re-hydrated by TokenStore): the boot-time
+    // restore validates it against /api/me, exactly like a page reload with a
+    // live session (Task 10).
+    const tokens = TestBed.inject(TokenStore);
+    tokens.clear();
+    tokens.set('boot-jwt');
   });
 
   it('should create the app', () => {
@@ -37,7 +46,7 @@ describe('App', () => {
     expect(compiled.querySelector('router-outlet')).not.toBeNull();
   });
 
-  it('kicks off the boot-time session restore and flips restored', async () => {
+  it('kicks off the boot-time token restore and flips restored', async () => {
     const auth = TestBed.inject(AuthService);
     expect(auth.restored()).toBe(false);
 
@@ -47,6 +56,9 @@ describe('App', () => {
 
     expect(api.me).toHaveBeenCalled();
     expect(auth.restored()).toBe(true);
+    // The restore mirrors the server-confirmed identity, role included (Task 6).
+    expect(auth.user()).toBe('admin');
+    expect(auth.role()).toBe('maker');
   });
 
   it('shows the top nav with Maker/Checker links, username and Logout when logged in', async () => {
@@ -68,7 +80,7 @@ describe('App', () => {
     expect(el.querySelector('.topnav-logout')).not.toBeNull();
   });
 
-  it('hides the top nav when logged out', async () => {
+  it('hides the top nav when logged out (stored token rejected)', async () => {
     api.me.mockReturnValue(throwError(() => ({ status: 401 })));
 
     const fixture = TestBed.createComponent(App);
@@ -77,6 +89,8 @@ describe('App', () => {
     fixture.detectChanges();
 
     expect(fixture.nativeElement.querySelector('header.topnav')).toBeNull();
+    // The 401 killed the dead token — nothing rides a rejected bearer.
+    expect(TestBed.inject(TokenStore).get()).toBeNull();
   });
 
   it('logout clears the session and navigates to /login', async () => {
@@ -94,6 +108,7 @@ describe('App', () => {
 
     expect(api.logout).toHaveBeenCalled();
     expect(auth.isLoggedIn()).toBe(false);
+    expect(TestBed.inject(TokenStore).get()).toBeNull(); // JWT cleared too
     expect(nav).toHaveBeenCalledWith(['/login']);
   });
 });

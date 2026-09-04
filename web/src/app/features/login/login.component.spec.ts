@@ -19,7 +19,9 @@ describe('LoginComponent', () => {
 
   beforeEach(() => {
     api = {
-      login: vi.fn(() => of({ username: 'alice' })),
+      login: vi.fn(() =>
+        of({ token: 'jwt-login', username: 'alice', role: 'maker', expires_in: 28800 }),
+      ),
       logout: vi.fn(() => of(null)),
     };
     TestBed.configureTestingModule({
