@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -187,6 +188,50 @@ type JWTConfig struct {
 	// ZT_AUTH_JWT_ALLOWED_ORIGINS (comma-separated) if set; set the list
 	// in control.yaml for clarity.
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
+	// ExternalIssuers (Phase 2 Task 1; yaml auth.jwt.external_issuers) is
+	// the list of TRUSTED THIRD-PARTY HS256 issuers: JWTs minted by OTHER
+	// apps verify against an entry here (its shared secret + optional
+	// claims mapping) instead of against the local Secret. Each entry's
+	// audience OPTIONALLY overrides the top-level Audience (empty inherits
+	// the top-level value — resolved at validation time). Absent/empty
+	// list = no external trust (local login still works while
+	// login_enabled; external-only mode REQUIRES >=1 entry). Parsed via
+	// UnmarshalKey like auth.users (env override not expressible for a
+	// list of objects).
+	ExternalIssuers []ExternalIssuerConfig `mapstructure:"external_issuers"`
+}
+
+// ExternalIssuerConfig is one trusted third-party HS256 issuer
+// (yaml auth.jwt.external_issuers[].*, Phase 2 Task 1). The secret is the
+// issuer's shared signing key — ${VAR}-expandable from the environment
+// (same fail-fast rule as the local auth.jwt.secret: unset/empty refuses to
+// start). require_jti is a *bool so an ABSENT field (nil) is
+// distinguishable from an EXPLICIT false: absent defaults to TRUE (external
+// tokens must be deniable — the denylist needs a jti to revoke), explicit
+// false is allowed for issuers that cannot mint jti claims. Claims (zero =
+// defaults: subject "sub", role "role", identity aliases) adapts
+// verification to the issuer's JWT shape without code changes.
+type ExternalIssuerConfig struct {
+	Name       string             `mapstructure:"name"`
+	Iss        string             `mapstructure:"iss"`
+	Audience   string             `mapstructure:"audience"`
+	Secret     string             `mapstructure:"secret"`
+	RequireJTI *bool              `mapstructure:"require_jti"`
+	Claims     ClaimMappingConfig `mapstructure:"claims"`
+}
+
+// ClaimMappingConfig maps an external issuer's JWT claims onto the local
+// principal model (username + maker|checker role). ZERO VALUES mean the
+// defaults and are left zero by validation — downstream consumers apply
+// them: Subject "" = the "sub" claim, Role "" = the "role" claim,
+// RoleAliases nil = identity translation. RoleAliases translates raw
+// role-claim VALUES to canonical roles ("some-svc-admin": "checker") —
+// every declared VALUE must be "maker" or "checker" (validated at load);
+// KEYS must be non-empty.
+type ClaimMappingConfig struct {
+	Subject     string            `mapstructure:"subject"`
+	Role        string            `mapstructure:"role"`
+	RoleAliases map[string]string `mapstructure:"role_aliases"`
 }
 
 // MySQLAuditConfig is the optional session-audit MySQL block (Task 9.7,
@@ -475,6 +520,13 @@ func LoadControl(path string) (*ControlConfig, error) {
 		}
 		u.Password = pw
 	}
+	// Phase 2 Task 1: external issuers parse through UnmarshalKey on the
+	// SAME viper instance (like auth.users/db_presets) — individual
+	// Get* calls cannot read a list of objects. An ABSENT key leaves the
+	// slice nil (no external trust).
+	if err := v.UnmarshalKey("auth.jwt.external_issuers", &cfg.JWT.ExternalIssuers); err != nil {
+		return nil, fmt.Errorf("unmarshal auth.jwt.external_issuers: %w", err)
+	}
 	// Task 2: role validation for the OPTIONAL users — every entry must
 	// declare "maker"|"checker" when login_enabled (explicit over default:
 	// an un-role'd entry would be an accidental superuser); in external-only
@@ -489,6 +541,82 @@ func LoadControl(path string) (*ControlConfig, error) {
 				}
 				if u.Role != "" {
 					return nil, fmt.Errorf("auth.users[%d].role (%s) must be \"maker\" or \"checker\", got %q", i, u.Username, u.Role)
+				}
+			}
+		}
+	}
+	// Phase 2 Task 1: external-issuer validation (fail-fast, naming the
+	// entry). Skipped entirely when JWT is disabled — like the role checks
+	// above, an explicit auth.jwt.enabled:false means no JWT machinery
+	// runs, so a declared external_issuers list is inert.
+	if cfg.JWT.Enabled {
+		// External-only mode with NO issuer configured can never
+		// authenticate anyone — fail fast instead of booting a plane
+		// whose guarded routes 401 everything forever.
+		if !cfg.JWT.LoginEnabled && len(cfg.JWT.ExternalIssuers) == 0 {
+			return nil, fmt.Errorf("auth.jwt.login_enabled=false requires at least one auth.jwt.external_issuers entry (nothing can authenticate otherwise)")
+		}
+		seen := make(map[string]int, len(cfg.JWT.ExternalIssuers))
+		for i := range cfg.JWT.ExternalIssuers {
+			e := &cfg.JWT.ExternalIssuers[i]
+			// name: required + unique (a later task's issuer lookup is by
+			// name — duplicates would be ambiguous).
+			if e.Name == "" {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].name is required", i)
+			}
+			if j, dup := seen[e.Name]; dup {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].name %q duplicates external_issuers[%d]", i, e.Name, j)
+			}
+			seen[e.Name] = i
+			// iss: required and must not claim the LOCAL issuer — an
+			// external entry for auth.jwt.issuer would shadow the
+			// self-issued login tokens (ambiguous trust).
+			if e.Iss == "" {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss (%s) is required", i, e.Name)
+			}
+			if e.Iss == cfg.JWT.Issuer {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q must not equal the local auth.jwt.issuer (an external issuer claiming the local iss would shadow self-issued tokens)", i, e.Iss)
+			}
+			// audience: optional per issuer — empty inherits the
+			// TOP-LEVEL audience, resolved HERE at validation time (not
+			// load time), so a later auth.jwt.audience edit re-defaults
+			// every issuer that did not pin its own.
+			if e.Audience == "" {
+				e.Audience = cfg.JWT.Audience
+			}
+			// secret: ${VAR}-expandable, same fail-fast rule as the local
+			// auth.jwt.secret and the auth.users passwords.
+			secret, err := expandEnv(e.Secret)
+			if err != nil {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].secret (%s): %w", i, e.Name, err)
+			}
+			if secret == "" {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].secret (%s) is required (set the issuer's env secret — see .env.example)", i, e.Name)
+			}
+			e.Secret = secret
+			// require_jti ABSENT (nil) defaults to TRUE — external tokens
+			// must be deniable (the logout denylist keys on jti). Only an
+			// EXPLICIT require_jti: false disables the demand.
+			if e.RequireJTI == nil {
+				t := true
+				e.RequireJTI = &t
+			}
+			// claims.role_aliases: every VALUE must be a canonical role;
+			// KEYS (the raw values found in the issuer's tokens) must be
+			// non-empty. subject/role claim names are NOT validated —
+			// empty = the downstream "sub"/"role" defaults.
+			aliases := make([]string, 0, len(e.Claims.RoleAliases))
+			for a := range e.Claims.RoleAliases {
+				aliases = append(aliases, a)
+			}
+			sort.Strings(aliases)
+			for _, a := range aliases {
+				if a == "" {
+					return nil, fmt.Errorf("auth.jwt.external_issuers[%d].claims.role_aliases has an empty key", i)
+				}
+				v := e.Claims.RoleAliases[a]
+				if v != "maker" && v != "checker" {
+					return nil, fmt.Errorf("auth.jwt.external_issuers[%d].claims.role_aliases[%q] must be \"maker\" or \"checker\", got %q", i, a, v)
 				}
 			}
 		}

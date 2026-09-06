@@ -83,6 +83,29 @@ auth:
     # binding — AutomaticEnv still maps ZT_AUTH_JWT_ALLOWED_ORIGINS
     # (comma-separated) if set; set the list here in yaml for clarity.
     allowed_origins: []
+    # external_issuers (Phase 2 Task 1): trusted THIRD-PARTY HS256 issuers —
+    # JWTs minted by OTHER apps verify against an entry here (its shared
+    # secret + OPTIONAL claims mapping) instead of against auth.jwt.secret.
+    # COMMENTED OUT — no ACTIVE entry until the other app's issuer is live
+    # (no entry = no external trust; local login is unaffected while
+    # login_enabled). Per-entry validation is fail-fast at startup: name
+    # required+unique, iss required (must NOT equal the local issuer),
+    # secret required (${VAR} from the env — never committed), audience
+    # OPTIONAL (empty inherits the top-level auth.jwt.audience above),
+    # require_jti ABSENT = true (external tokens must be deniable; only an
+    # explicit false relaxes that), role_aliases VALUES maker|checker only.
+    # external_issuers:
+    #   - name: "other-app"
+    #     iss: "https://other-app.example"        # MUST match the JWT iss claim
+    #     audience: "zt-api"                       # optional; default = top-level audience
+    #     secret: "${ZT_OTHERAPP_JWT_SECRET}"      # HS256 shared secret (set in .env)
+    #     require_jti: true                        # token without jti -> 401 (default true)
+    #     claims:                                  # OPTIONAL claim mapping (zero = defaults)
+    #       subject: "sub"                         # claim carrying the username (default "sub")
+    #       role: "role"                           # claim carrying the role (default "role")
+    #       role_aliases:                          # raw value -> maker|checker (default: identity)
+    #         maker: maker
+    #         checker: checker
   # session_ttl_hours is INERT LEGACY RESIDUE of the cookie-session era: it
   # is still parsed (default 8) into an UNUSED ControlConfig.SessionTTL
   # field for backward compatibility, but NOTHING consumes it — the live

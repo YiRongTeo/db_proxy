@@ -1636,6 +1636,12 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    # Phase 2 (Task 1): external-only mode REQUIRES >=1 external issuer
+    # (else nothing can authenticate) — the fixture carries a valid one.
+    external_issuers:
+      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
 `,
 		},
 		{
@@ -1648,6 +1654,10 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    external_issuers:
+      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
 `,
 			wantErr: "auth.role",
 		},
@@ -1664,6 +1674,10 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    external_issuers:
+      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
 `,
 			wantErr: "auth.users[0].role (checker)",
 		},
@@ -1681,6 +1695,10 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    external_issuers:
+      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
 `,
 		},
 		{
@@ -1849,6 +1867,302 @@ auth:
 		}
 		if len(cfg.JWT.AllowedOrigins) != 0 {
 			t.Errorf("JWT.AllowedOrigins = %v, want empty (same-origin only)", cfg.JWT.AllowedOrigins)
+		}
+	})
+}
+
+// TestJWTExternalIssuers (Phase 2 Task 1) guards the new
+// auth.jwt.external_issuers schema: trusted THIRD-PARTY HS256 issuers, each
+// with its own shared secret and an OPTIONAL claims mapping (subject/role
+// claim names + role-value aliases). Rules under test:
+//   - name non-empty + unique; iss non-empty; secret REQUIRED and
+//     ${VAR}-expandable (unset env = load error, never an empty key).
+//   - iss must NOT equal the LOCAL auth.jwt.issuer (shadowing).
+//   - audience OPTIONAL per issuer — empty inherits the top-level
+//     auth.jwt.audience at VALIDATION time.
+//   - require_jti ABSENT (nil) defaults TRUE; explicit false stays false.
+//   - role_aliases VALUES must be "maker"|"checker"; keys non-empty.
+//   - login_enabled=false (external-only) now REQUIRES >=1 external issuer
+//     (with zero issuers NOTHING can authenticate).
+//   - claims.subject/role zero values are LEFT zero (downstream applies the
+//     "sub"/"role"/identity defaults) — only role_aliases are validated here.
+func TestJWTExternalIssuers(t *testing.T) {
+	// header: login-ON control config — local secret literal (no env
+	// needed). Issuer-list blocks are spliced on below the jwt block.
+	const header = `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    issuer: "zerotrust-proxy"
+    audience: "zt-api"
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
+`
+	// loginOffBase: external-only control config (no creds/secret needed).
+	const loginOffBase = `
+http:
+  addr: ":8080"
+auth:
+  jwt:
+    enabled: true
+    login_enabled: false
+    issuer: "zerotrust-proxy"
+    audience: "zt-api"
+`
+	// ext wraps an entry list at the jwt-child indent (4 spaces).
+	const ext = "\n    external_issuers:\n"
+
+	one := `      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	full := `      - name: "other-app"
+        iss: "https://other-app.example"
+        audience: "zt-other"
+        secret: "${ZT_OTHERAPP_JWT_SECRET}"
+        require_jti: false
+        claims:
+          subject: "preferred_username"
+          role: "permission"
+          role_aliases:
+            "svc_maker": "maker"
+            "svc_checker": "checker"
+`
+	two := `      - name: "app-a"
+        iss: "https://app-a.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+      - name: "app-b"
+        iss: "https://app-b.example"
+        audience: "zt-b"
+        secret: "b-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	dupNames := `      - name: "other-app"
+        iss: "https://app-a.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+      - name: "other-app"
+        iss: "https://app-b.example"
+        secret: "b-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	emptyName := `      - name: ""
+        iss: "https://app-a.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	emptyIss := `      - name: "other-app"
+        iss: ""
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	missingSecret := `      - name: "other-app"
+        iss: "https://other-app.example"
+`
+	envSecret := `      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "${ZT_OTHERAPP_JWT_SECRET}"
+`
+	shadowIss := `      - name: "other-app"
+        iss: "zerotrust-proxy"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+`
+	aliasBadValue := `      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+        claims:
+          role_aliases:
+            "admin": "root"
+`
+	aliasEmptyKey := `      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+        claims:
+          role_aliases:
+            "": "maker"
+`
+
+	tests := []struct {
+		name    string
+		yaml    string
+		env     map[string]string
+		unset   string // env var to REMOVE before loading
+		wantErr string // substring the error must name; "" = must load
+	}{
+		{
+			name: "valid single external issuer (minimal) loads",
+			yaml: header + ext + one,
+		},
+		{
+			name: "valid single external issuer (full claims mapping) loads",
+			yaml: header + ext + full,
+			env:  map[string]string{"ZT_OTHERAPP_JWT_SECRET": "other-app-secret-0123456789abcdefghijklmnopqrstuv"},
+		},
+		{
+			name: "two external issuers load",
+			yaml: header + ext + two,
+		},
+		{
+			name:    "empty name fails fast",
+			yaml:    header + ext + emptyName,
+			wantErr: "external_issuers[0].name",
+		},
+		{
+			name:    "duplicate name fails fast naming both entries",
+			yaml:    header + ext + dupNames,
+			wantErr: "external_issuers[1].name",
+		},
+		{
+			name:    "empty iss fails fast",
+			yaml:    header + ext + emptyIss,
+			wantErr: "external_issuers[0].iss",
+		},
+		{
+			name:    "missing secret fails fast",
+			yaml:    header + ext + missingSecret,
+			wantErr: "external_issuers[0].secret",
+		},
+		{
+			name:    "iss shadowing the local issuer fails fast",
+			yaml:    header + ext + shadowIss,
+			wantErr: "shadow",
+		},
+		{
+			name:    "role alias to an invalid role fails fast",
+			yaml:    header + ext + aliasBadValue,
+			wantErr: `role_aliases["admin"]`,
+		},
+		{
+			name:    "role alias with an empty key fails fast",
+			yaml:    header + ext + aliasEmptyKey,
+			wantErr: "empty key",
+		},
+		{
+			name:    "secret placeholder with UNSET env fails fast",
+			yaml:    header + ext + envSecret,
+			unset:   "ZT_OTHERAPP_JWT_SECRET",
+			wantErr: "ZT_OTHERAPP_JWT_SECRET",
+		},
+		{
+			name:    "login off: ZERO external issuers fails fast",
+			yaml:    loginOffBase,
+			wantErr: "external_issuers",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if tc.unset != "" {
+				if err := os.Unsetenv(tc.unset); err != nil {
+					t.Fatalf("unsetenv %s: %v", tc.unset, err)
+				}
+			}
+			_, err := LoadControl(writeTempConfig(t, tc.yaml))
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("LoadControl succeeded, want error naming %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error %q does not name %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadControl error: %v", err)
+			}
+		})
+	}
+
+	// Structural assertions on the RESOLVED config (defaults applied at
+	// validation time, mutation on the loaded struct).
+	t.Run("resolved: audience inherits top-level, require_jti defaults true, claims zero", func(t *testing.T) {
+		cfg, err := LoadControl(writeTempConfig(t, header+ext+one))
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		issuers := cfg.JWT.ExternalIssuers
+		if len(issuers) != 1 {
+			t.Fatalf("len(ExternalIssuers) = %d, want 1", len(issuers))
+		}
+		e := issuers[0]
+		if e.Name != "other-app" || e.Iss != "https://other-app.example" {
+			t.Errorf("Name/Iss = %q/%q, want other-app/https://other-app.example", e.Name, e.Iss)
+		}
+		if e.Audience != "zt-api" {
+			t.Errorf("Audience = %q, want top-level \"zt-api\" (inherited)", e.Audience)
+		}
+		if e.Secret != "ext-secret-0123456789abcdefghijklmnopqrstuv" {
+			t.Errorf("Secret = %q, want the literal secret (no placeholder to expand)", e.Secret)
+		}
+		if e.RequireJTI == nil {
+			t.Error("RequireJTI = nil, want default true (absent field)")
+		} else if !*e.RequireJTI {
+			t.Error("RequireJTI = false, want default true when the field is absent")
+		}
+		if e.Claims.Subject != "" || e.Claims.Role != "" || len(e.Claims.RoleAliases) != 0 {
+			t.Errorf("Claims = %+v, want zero values (downstream applies sub/role/identity defaults)", e.Claims)
+		}
+	})
+
+	t.Run("resolved: explicit audience kept, require_jti false stays false, claims land", func(t *testing.T) {
+		t.Setenv("ZT_OTHERAPP_JWT_SECRET", "other-app-secret-0123456789abcdefghijklmnopqrstuv")
+		cfg, err := LoadControl(writeTempConfig(t, header+ext+full))
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		e := cfg.JWT.ExternalIssuers[0]
+		if e.Audience != "zt-other" {
+			t.Errorf("Audience = %q, want explicit \"zt-other\" (not the top-level default)", e.Audience)
+		}
+		if e.RequireJTI == nil {
+			t.Error("RequireJTI = nil, want explicit false")
+		} else if *e.RequireJTI {
+			t.Error("RequireJTI = true, want explicit false preserved")
+		}
+		if e.Secret != "other-app-secret-0123456789abcdefghijklmnopqrstuv" {
+			t.Errorf("Secret = %q, want the expanded ZT_OTHERAPP_JWT_SECRET", e.Secret)
+		}
+		if e.Claims.Subject != "preferred_username" || e.Claims.Role != "permission" {
+			t.Errorf("Claims.Subject/Role = %q/%q, want preferred_username/permission", e.Claims.Subject, e.Claims.Role)
+		}
+		if len(e.Claims.RoleAliases) != 2 || e.Claims.RoleAliases["svc_maker"] != "maker" || e.Claims.RoleAliases["svc_checker"] != "checker" {
+			t.Errorf("RoleAliases = %v, want {svc_maker:maker svc_checker:checker}", e.Claims.RoleAliases)
+		}
+	})
+
+	t.Run("resolved: login off + one external issuer loads (external-only)", func(t *testing.T) {
+		cfg, err := LoadControl(writeTempConfig(t, loginOffBase+ext+one))
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		if cfg.JWT.LoginEnabled {
+			t.Error("JWT.LoginEnabled = true, want false (external-only fixture)")
+		}
+		if len(cfg.JWT.ExternalIssuers) != 1 {
+			t.Errorf("len(ExternalIssuers) = %d, want 1", len(cfg.JWT.ExternalIssuers))
+		}
+	})
+
+	t.Run("resolved: two issuers keep declaration order and independent audiences", func(t *testing.T) {
+		cfg, err := LoadControl(writeTempConfig(t, header+ext+two))
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		issuers := cfg.JWT.ExternalIssuers
+		if len(issuers) != 2 {
+			t.Fatalf("len(ExternalIssuers) = %d, want 2", len(issuers))
+		}
+		if issuers[0].Name != "app-a" || issuers[1].Name != "app-b" {
+			t.Errorf("names = [%q %q], want [app-a app-b] (declaration order)", issuers[0].Name, issuers[1].Name)
+		}
+		// Issuer A omits audience → inherits top-level; issuer B declares one.
+		if issuers[0].Audience != "zt-api" {
+			t.Errorf("issuers[0].Audience = %q, want inherited \"zt-api\"", issuers[0].Audience)
+		}
+		if issuers[1].Audience != "zt-b" {
+			t.Errorf("issuers[1].Audience = %q, want explicit \"zt-b\"", issuers[1].Audience)
 		}
 	})
 }
