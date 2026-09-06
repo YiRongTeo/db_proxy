@@ -6,8 +6,12 @@ package api
 // credential; nothing is stored server-side. The issued token drives the
 // requireJWT-guarded routes. POST /api/logout denylists the presented
 // token's jti in Valkey (TTL = remaining token life), so replaying the same
-// token on a guarded route → 401. login_enabled=false: neither route is
-// registered → 404 via the spaHandler /api guard.
+// token on a guarded route → 401. login_enabled=false (Phase 2 Task 4b):
+// POST /api/login is NOT registered → 404 via the spaHandler /api guard,
+// while POST /api/logout IS registered unconditionally — it is
+// self-authenticating (bearer → issuer-aware parse → jti denylist), so
+// external-only deployments keep a server-side HTTP deny path; an
+// unauthenticated logout answers 401, never 404.
 
 import (
 	"context"
@@ -33,8 +37,8 @@ type loginResponse struct {
 
 // newJWTLoginServer builds the Control Plane mux with the shared test JWT
 // block and optional extra auth.users. loginEnabled=false exercises the
-// conditional route registration (login/logout fall through to the /api
-// guard → 404).
+// conditional /api/login registration (login falls through to the /api
+// guard → 404) while /api/logout stays registered (Phase 2 Task 4b).
 func newJWTLoginServer(t *testing.T, loginEnabled bool, users []config.AuthUserConfig) (*httptest.Server, *http.Client, *config.ControlConfig) {
 	t.Helper()
 	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
@@ -197,12 +201,13 @@ func TestLoginRoleFromAuthUsers(t *testing.T) {
 	}
 }
 
-// TestLoginAndLogoutRoutesAbsentWhenDisabled: with login_enabled=false
-// neither POST /api/login nor POST /api/logout is registered — the
-// spaHandler /api guard answers 404 — while JWT-guarded routes still work
-// for externally-presented tokens (requireJWT is independent of the login
-// flag).
-func TestLoginAndLogoutRoutesAbsentWhenDisabled(t *testing.T) {
+// TestLoginRouteAbsentLogoutRegisteredWhenDisabled: with login_enabled=false
+// POST /api/login is NOT registered — the spaHandler /api guard answers 404
+// — while POST /api/logout IS (Phase 2 Task 4b: unconditional registration
+// so external tokens stay revocable over HTTP); a logout with no bearer
+// answers 401, never 404. JWT-guarded routes still work for presented
+// tokens (requireJWT is independent of the login flag).
+func TestLoginRouteAbsentLogoutRegisteredWhenDisabled(t *testing.T) {
 	srv, client, cfg := newJWTLoginServer(t, false, nil)
 
 	resp, _ := doLogin(t, client, srv.URL, testJWTUser, testJWTPassword)
@@ -213,6 +218,8 @@ func TestLoginAndLogoutRoutesAbsentWhenDisabled(t *testing.T) {
 		t.Fatal("login_enabled=false: login succeeded — route must not be registered")
 	}
 
+	// Logout IS registered: no bearer → 401 (self-authenticating endpoint),
+	// NOT 404 (the pre-Task-4b coupling bug).
 	logoutReq, err := http.NewRequest(http.MethodPost, srv.URL+"/api/logout", nil)
 	if err != nil {
 		t.Fatalf("new logout request: %v", err)
@@ -222,8 +229,8 @@ func TestLoginAndLogoutRoutesAbsentWhenDisabled(t *testing.T) {
 		t.Fatalf("POST /api/logout: %v", err)
 	}
 	logoutResp.Body.Close()
-	if logoutResp.StatusCode != http.StatusNotFound {
-		t.Errorf("POST /api/logout with login_enabled=false: status %d, want 404", logoutResp.StatusCode)
+	if logoutResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /api/logout with login_enabled=false: status %d, want 401 (route registered unconditionally; no bearer rejected)", logoutResp.StatusCode)
 	}
 
 	// Guarded routes remain JWT-authenticated (external tokens work).

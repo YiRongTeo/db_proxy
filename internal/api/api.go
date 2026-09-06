@@ -62,13 +62,20 @@ func NewAPI(log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, 
 func (a *api) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
-	// Task 6: /api/login + /api/logout exist ONLY when auth.jwt.login_enabled
-	// — with login disabled the plane may run external-JWT-only, and the
-	// paths fall through to the spaHandler /api guard (404), never HTML.
+	// Task 6 + Task 4b (Phase 2): POST /api/login exists ONLY when
+	// auth.jwt.login_enabled — with login disabled the plane may run
+	// external-JWT-only, and the path falls through to the spaHandler /api
+	// guard (404), never HTML. POST /api/logout is registered
+	// UNCONDITIONALLY: it is self-authenticating (verifies the presented
+	// bearer via the issuer-aware parseToken path, Task 2, and denylists
+	// its jti) with no dependency on the local login machinery, so
+	// external-only deployments keep a server-side HTTP deny path for
+	// external tokens (Task-4 E2E finding: the route used to 404, leaving
+	// the jti denylist unreachable). When login is enabled nothing changes.
 	if a.cfg.JWT.LoginEnabled {
 		mux.HandleFunc("POST /api/login", a.auth.handleLogin)
-		mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
 	}
+	mux.HandleFunc("POST /api/logout", a.auth.handleLogout)
 	mux.HandleFunc("GET /api/me", a.auth.requireJWT(a.auth.handleMe)) // Task 5.7: boot-time session restore (bearer JWT since Task 5)
 	mux.HandleFunc("GET /api/db-presets", a.auth.requireJWT(a.handleDBPresets))
 	mux.HandleFunc("POST /api/token", a.auth.requireJWT(a.handleToken))                             // Task 7: JWT-only mint (control-plane API key retired); requireJWT consults the jti denylist, so logged-out tokens cannot mint

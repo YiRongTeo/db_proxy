@@ -379,3 +379,118 @@ func TestExternalIssuerLogoutDenylists(t *testing.T) {
 		t.Errorf("GET /api/me with logged-out external token: status %d, want 401", me.StatusCode)
 	}
 }
+
+// --- Phase 2 Task 4b: /api/logout must exist in EXTERNAL-ONLY mode -------
+
+// newExtOnlyAPIServer builds the real Control Plane mux in EXTERNAL-ONLY
+// mode (auth.jwt.login_enabled=false): the local login machinery is gone —
+// primary-account credentials and the local signing secret are deliberately
+// unset, exactly as an external-only deployment loads (Task-1 validation:
+// login_enabled=false requires >=1 external issuer, and the local secret is
+// then NOT required). Configured external issuers are the ONLY trust roots.
+func newExtOnlyAPIServer(t *testing.T, exts ...config.ExternalIssuerConfig) (*httptest.Server, *http.Client, *config.ControlConfig) {
+	t.Helper()
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	jwt := config.JWTConfig{
+		Enabled:         true,
+		LoginEnabled:    false, // external-only: no self-issued tokens, no local login
+		Issuer:          testJWTIssuer,
+		Audience:        testJWTAudience,
+		TTLSeconds:      testJWTTTL,
+		ExternalIssuers: exts,
+		// Secret left EMPTY — the local self-issuer does not exist in this mode.
+	}
+	cfg := &config.ControlConfig{
+		JWT:       jwt,
+		SessionTTL: 8,
+		TokenTTL:   60,
+		StaticDir:  t.TempDir(),
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
+	t.Cleanup(srv.Close)
+	return srv, &http.Client{}, cfg
+}
+
+// TestExternalOnlyModeLogoutRegistered: Task 4b regression — with
+// login_enabled=false POST /api/logout must STILL be registered, so
+// external tokens are revocable server-side in the exact deployment Phase 2
+// exists for (the Task-4 E2E finding: the route used to 404 with login
+// disabled, leaving the jti denylist unreachable over HTTP). The endpoint
+// is self-authenticating — it verifies the presented bearer via the
+// issuer-aware parseToken path and denylists its jti — so it has no
+// dependency on the local login machinery. POST /api/login stays
+// conditional (404 here).
+func TestExternalOnlyModeLogoutRegistered(t *testing.T) {
+	srv, client, _ := newExtOnlyAPIServer(t, extIssuer("other-app", testExtIssuer, testExtSecret))
+	jti := randomJTI(t)
+	tok := mintExternalJWT(t, testExtSecret, testExtIssuer, testJWTAudience, "alice", "maker", jti)
+
+	// login stays conditional: POST /api/login → 404 in external-only mode.
+	if resp, _ := doLogin(t, client, srv.URL, testJWTUser, testJWTPassword); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /api/login with login_enabled=false: status %d, want 404 (route must stay conditional)", resp.StatusCode)
+	}
+
+	// The external token authenticates a guarded route pre-logout.
+	authed := withBearer(client, tok)
+	me, err := authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me before logout: %v", err)
+	}
+	me.Body.Close()
+	if me.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/me with external token (login disabled): status %d, want 200", me.StatusCode)
+	}
+
+	// Logout must be LIVE in external-only mode: 200 means the route is
+	// registered AND the external token verified + denylisted (a missing
+	// route would answer 404 — the E2E bug this test guards).
+	resp, body := logoutBearer(t, authed, srv.URL, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/logout with login_enabled=false: status %d, want 200 (route must be registered unconditionally; body %s)", resp.StatusCode, body)
+	}
+
+	// Replay → 401: the external jti sits on the denylist in external-only mode.
+	me, err = authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me after logout: %v", err)
+	}
+	me.Body.Close()
+	if me.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /api/me with logged-out external token (login disabled): status %d, want 401", me.StatusCode)
+	}
+}
+
+// TestExternalOnlyModeLogoutRejectsBadBearer: the unconditionally-registered
+// logout is self-authenticating — a missing or unverifiable bearer answers
+// 401 in external-only mode too (nothing to revoke, nothing leaked).
+func TestExternalOnlyModeLogoutRejectsBadBearer(t *testing.T) {
+	srv, client, _ := newExtOnlyAPIServer(t, extIssuer("other-app", testExtIssuer, testExtSecret))
+
+	cases := map[string]string{
+		"no bearer":    "",
+		"garbage":      "Bearer not-a-jwt",
+		"wrong secret": "Bearer " + mintExternalJWT(t, "not-the-shared-secret", testExtIssuer, testJWTAudience, "alice", "maker", "jti-wrong-secret"),
+	}
+	for name, hdr := range cases {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/logout", nil)
+		if err != nil {
+			t.Fatalf("%s: new logout request: %v", name, err)
+		}
+		if hdr != "" {
+			req.Header.Set("Authorization", hdr)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s: POST /api/logout: %v", name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s on logout (login disabled): status %d, want 401", name, resp.StatusCode)
+		}
+	}
+}
