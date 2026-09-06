@@ -40,7 +40,7 @@ sequenceDiagram
 | Item | Value |
 |---|---|
 | Endpoint | `POST /api/token` (HTTPS on `:8080`) |
-| Authentication | `Authorization: Bearer <jwt>` — a self-issued login JWT (`POST /api/login`) or an external JWT signed with the same `auth.jwt.secret` (the control-plane `X-Api-Key` was retired). See [Page 9 — JWT & Roles](jwt-auth-conversion.md) |
+| Authentication | `Authorization: Bearer <jwt>` — a self-issued login JWT (`POST /api/login`) or a JWT from a configured external issuer (`auth.jwt.external_issuers`, Phase 2 — verified against THAT issuer's own shared secret and claim map; see [Page 9 — JWT & Roles](jwt-auth-conversion.md)). The control-plane `X-Api-Key` was retired. |
 | Content-Type | `application/json` |
 
 ### Request body

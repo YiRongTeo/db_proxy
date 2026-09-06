@@ -160,9 +160,14 @@ type AuthUserConfig struct {
 // machinery was removed in the conversion), so the only validations that
 // still apply are the classic auth.username/auth.password requirement and
 // the auth.users shape. Keep the default true.
-// LoginEnabled registers /api/login + /api/logout and self-issues HS256
-// JWTs; when false the plane may run external-JWT-only: auth.username /
-// auth.password and the secret are then NOT required.
+// LoginEnabled gates ONLY /api/login (self-issued HS256 JWTs). /api/logout
+// is registered UNCONDITIONALLY (Phase 2 Task 4b): it verifies the
+// presented bearer through the same issuer-aware parseToken path and
+// denylists its jti, so external-only deployments keep an HTTP revocation
+// route for external tokens. When false the plane may run
+// external-JWT-only: auth.username / auth.password and the LOCAL secret are
+// then NOT required — but at least one auth.jwt.external_issuers entry IS
+// (validation refuses to boot a plane nothing can authenticate).
 type JWTConfig struct {
 	Enabled      bool   `mapstructure:"enabled"`
 	LoginEnabled bool   `mapstructure:"login_enabled"`

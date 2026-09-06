@@ -2,10 +2,13 @@
 
 > **What this page covers.** The Control Plane's authentication model changed on
 > 2026-09-05 from **cookie sessions + a control-plane API key** to **self-issued
-> HS256 bearer JWTs with maker/checker roles**. This page is the operator-facing
-> summary: the flows before/after, the role × capability matrix, the config keys,
-> and the end-to-end sequence (login → JWT → mint with role gate → checker WS
-> watch). It supersedes the auth statements in [Page 1](01-architecture-overview.md),
+> HS256 bearer JWTs with maker/checker roles**, and Phase 2 (same day) extended
+> that model from a single self-issuer to **local login + trusted external JWT
+> issuers** (`auth.jwt.external_issuers`, configurable claim mapping). This page
+> is the operator-facing summary: the flows before/after, the role × capability
+> matrix, the config keys, and the end-to-end sequences (login → JWT → mint with
+> role gate → checker WS watch; external-issuer flow in the Phase 2 section).
+> It supersedes the auth statements in [Page 1](01-architecture-overview.md),
 > [Page 2](02-creating-db-connections.md) and the spec's R6 / §9-3 / §9-7 rows.
 
 ## Why it changed
@@ -67,11 +70,12 @@ role other than `maker`/`checker` — is rejected 401 at verification.
 | Key (`configs/control.yaml`) | Env | Meaning / defaults |
 |---|---|---|
 | `auth.jwt.enabled` | — (`true` default; `false` disables verification) | ABSENT = true (JWT is the mode; an unmigrated config fails fast). **Explicit `false` disables JWT verification entirely — guarded routes answer 401 (fail closed). There is no legacy cookie fallback.** Keep `true`. |
-| `auth.jwt.login_enabled` | — (`true` default) | Registers `/api/login` + `/api/logout`. `false` = external-JWT-only: username/password and secret NOT required — mint JWTs yourself signed with the same `secret`. |
+| `auth.jwt.login_enabled` | — (`true` default) | Gates **only** `/api/login` (self-issued HS256 JWTs). `/api/logout` is registered **unconditionally** (Phase 2 Task 4b) — it verifies the presented bearer (issuer-aware) and denylists its `jti`, so external-only deployments keep a revocation route. `false` = external-JWT-only: local username/password + local secret NOT required, but **≥ 1 `external_issuers` entry is** (see the Phase 2 section). |
 | `auth.jwt.issuer` / `auth.jwt.audience` | `ZT_AUTH_JWT_ISSUER` / `ZT_AUTH_JWT_AUDIENCE` | `zerotrust-proxy` / `zt-api` — enforced on every token (wrong iss/aud → 401). |
 | `auth.jwt.ttl_seconds` | `ZT_AUTH_JWT_TTL_SECONDS` | `28800` (8 h) — the JWT life returned as `expires_in`; replaces `auth.session_ttl_hours` (now inert). |
-| `auth.jwt.secret` | `ZT_JWT_SECRET` (also `ZT_AUTH_JWT_SECRET`) | HS256 signing secret. REQUIRED when `login_enabled` — empty = the control plane refuses to start. Use a long random value (32+ bytes). |
-| `auth.jwt.allowed_origins` | no dedicated env binding — AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS` (comma-separated) if set | Cross-origin host allowlist for the checker WebSocket upgrade ONLY (`/ws/checker`). Empty = same-origin only (upgrade 403 before handshake). Patterns: `checker.example.com`, `*.example.com`; prefix the scheme to pin it. REST ignores the list (headers only). |
+| `auth.jwt.secret` | `ZT_JWT_SECRET` (also `ZT_AUTH_JWT_SECRET`) | The **local** issuer's HS256 signing secret (external issuers bring their own — Phase 2 section). REQUIRED when `login_enabled` — empty = the control plane refuses to start. Use a long random value (32+ bytes). |
+| `auth.jwt.allowed_origins` | no dedicated env binding — AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS` (comma-separated) if set | **One** cross-origin allowlist for BOTH browser surfaces (Phase 2 Task 3): REST CORS (browser-direct `Authorization: Bearer <jwt>` calls) **and** the checker WebSocket upgrade (`/ws/checker`). Empty = same-origin only (cross-origin 403 before auth). Entries are host globs (`checker.example.com`, `*.example.com`); prefix `https://` to pin the scheme; the **port is part of the matched host**, so a non-default port must appear in the entry (`https://checker.example.com:8443`). |
+| `auth.jwt.external_issuers` | per-entry secrets via `${VAR}` (e.g. `ZT_OTHERAPP_JWT_SECRET`) | Trusted third-party HS256 issuers (Phase 2 Task 1) — each with its own `iss`/`audience`/`secret`/`require_jti` and optional `claims` mapping. Absent = no external trust. Full table in the Phase 2 section. |
 | `auth.username` / `auth.password` | `ZT_AUTH_USERNAME` / `ZT_AUTH_PASSWORD` | Primary account (maker in the committed config). Password REQUIRED when `login_enabled`; empty = refuses to start. |
 | `auth.role` | `ZT_AUTH_ROLE` | Primary account's role: `maker` \| `checker` — REQUIRED when `login_enabled`. |
 | `auth.allow_maker_watch` | `ZT_AUTH_ALLOW_MAKER_WATCH` | `false` (default, strict SoD) — maker-role principals may watch/kill only when `true`. |
@@ -83,12 +87,24 @@ role other than `maker`/`checker` — is rejected 401 at verification.
 1. **Guard** — `requireJWT` (REST) or `requireJWTWS` (`/ws/checker`) extracts
    `Authorization: Bearer <jwt>` (header) — or, on the WS route only,
    `?access_token=` when the header is absent.
-2. **Verify** — signature (HS256, `auth.jwt.secret`), `exp`, `iss`, `aud`, then
-   `sub` non-empty and `role` ∈ {maker, checker}. Any failure → the same bare
-   401 (nothing leaks *why*). JWT disabled (`enabled: false`) or empty
-   secret/issuer/audience → fail closed, every request 401.
+2. **Verify — issuer-aware (Phase 2 Task 2)** — `parseToken` reads the
+   token's `iss` claim and resolves it to a trust root: the local issuer
+   (`auth.jwt.*`) or a configured `auth.jwt.external_issuers` entry.
+   Signature is verified against THAT root's HS256 secret (local
+   `auth.jwt.secret`, or the external issuer's own `secret`), with `exp`
+   and `aud` enforced (external: the entry's audience — inherited from the
+   top-level when empty), then the subject is mapped non-empty and the role
+   ∈ {maker, checker} (external tokens: the entry's `claims` mapping applies
+   first — claim-map table in the Phase 2 section). An `iss` with no trust
+   root → 401. Any failure → the same bare 401 (nothing leaks *why*). JWT
+   disabled (`enabled: false`) or empty local secret/issuer/audience → fail
+   closed, every request 401.
 3. **Denylist** — the token's `jti` is checked against `jwt:deny:<jti>`
-   (logout revocation). A denylist consult error fails closed (401).
+   (logout revocation). Self-issued tokens always carry a `jti`
+   (`signJWT`/`newJTI`); external tokens must too — `require_jti` (absent =
+   true) rejects jti-less external tokens, so no accepted token can bypass
+   the denylist (the Phase-1 gap is closed). A denylist consult error fails
+   closed (401).
 4. **Principal** — the verified `{username, role}` rides the request context;
    handlers see it via `sessionFrom(r)` (the same context contract as the old
    session middleware, so mint-binding, SoD, audit and kill consumers were
@@ -147,8 +163,10 @@ sequenceDiagram
   account).
 - **`configs/control.yaml`** — confirm `auth.role` on the primary account,
   `auth.users[].role` on every extra entry, and (if desired) flip
-  `auth.jwt.login_enabled` to `false` for external-JWT-only, or set
-  `auth.jwt.allowed_origins` for cross-origin checker dashboards.
+  `auth.jwt.login_enabled` to `false` for external-JWT-only — **Phase 2:
+  that mode requires ≥ 1 `auth.jwt.external_issuers` entry** (nothing else
+  can authenticate) — or set `auth.jwt.allowed_origins` for cross-origin
+  dashboards (REST CORS + checker WS share the one list, Phase 2 Task 3).
 - **Scripts / integrations** — replace `-H "X-Api-Key: …"` with a login
   (`POST /api/login`) then `-H "Authorization: Bearer $JWT"`; replace cookie
   jars (`curl -b/-c`, `Cookie: zt_session=…`) with the bearer header; for WS
@@ -156,6 +174,176 @@ sequenceDiagram
 - **Auth expiry** — the old `auth.session_ttl_hours` key can be deleted;
   `auth.jwt.ttl_seconds` is authoritative.
 - Full run recipes: **RUN.md §2–§5**.
+
+---
+
+## Phase 2 — external JWT issuers (`auth.jwt.external_issuers`)
+
+Phase 2 (tasks 1–4b, commits `11962e4`…`2a42dc9`, 2026-09-05) moved the
+trust model from **one self-issuer** to **local issuer + N trusted external
+issuers**: a JWT minted by ANOTHER app now verifies against that app's own
+entry — its shared HS256 secret, its audience, and an optional **claim
+mapping** that adapts the other app's token vocabulary to the local
+`{username, role ∈ maker|checker}` principal model **in config, never in
+code**. Local `/api/login` keeps working unchanged alongside.
+
+### Trust model — before vs after
+
+| Aspect | Phase 1 (single self-issuer) | Phase 2 (local + external issuers) |
+|---|---|---|
+| Trusted issuers | one: `auth.jwt.issuer` (self-issued login tokens) | local issuer PLUS every `auth.jwt.external_issuers[].iss` (absent list = no external trust) |
+| Trust root / key material | `auth.jwt.secret` (HS256) | per-issuer: local `auth.jwt.secret`; each external entry's OWN `secret` (its shared HS256 key with us) |
+| External JWT verification | an "external" JWT only verified if signed with the LOCAL secret (`iss` == local issuer) | verified against the matching entry's secret; `iss` must equal the entry's; **unknown `iss` → 401** |
+| `iss` collisions | n/a | an external entry claiming the local `iss` is a **config load error** (it would shadow self-issued tokens) |
+| Principal claims | `sub` = username, `role` = maker\|checker (required) | local unchanged; external: subject/role claim NAMES and role VALUES mapped via `claims` (defaults `sub`/`role`/identity) |
+| Role gates | maker/checker on every token | identical — the mapped principal is the same `{username, role}` model |
+| Revocation | jti denylist (self-issued tokens always carry a `jti`) | same denylist — `require_jti` (absent = **true**) forces external tokens to carry a `jti`, closing the Phase-1 "jti-less tokens bypass the denylist" gap for external tokens |
+| `/api/login` | gated by `login_enabled` | unchanged (still gated) |
+| `/api/logout` | (Phase 1 doc said "registered when `login_enabled`") | **registered UNCONDITIONALLY** (Task 4b): issuer-aware verify + jti denylist, so external-only deployments keep an HTTP revocation route |
+| Browser cross-origin | checker WS origin allowlist only | `allowed_origins` = ONE list for REST CORS **and** checker WS origins (Task 3) |
+
+### `external_issuers` config
+
+One entry per trusted third-party issuer (`configs/control.yaml`,
+`auth.jwt.external_issuers[]`; committed example is commented out until the
+other app is live). Fail-fast at load, naming the entry.
+
+| Key | Required? | Meaning / validation |
+|---|---|---|
+| `name` | ✅ | label for logs; required + unique across the list |
+| `iss` | ✅ | MUST equal the `iss` claim on their JWTs; must NOT equal the local `auth.jwt.issuer` (load error) |
+| `audience` | optional | empty inherits the top-level `auth.jwt.audience` (resolved at validation, so a later top-level edit re-defaults issuers that did not pin their own) |
+| `secret` | ✅ | their HS256 shared secret — `${VAR}` from the environment (e.g. `ZT_OTHERAPP_JWT_SECRET`), never committed; empty = plane refuses to start |
+| `require_jti` | optional | ABSENT = **true**: a token without a non-empty string `jti` → 401 (nothing the denylist could revoke). Explicit `false` opts out (issuer cannot mint jti) — those tokens are live until `exp` and logout refuses them (500: nothing to revoke) |
+| `claims.subject` | optional | claim carrying the username; empty = `"sub"` |
+| `claims.role` | optional | claim carrying the role; empty = `"role"` |
+| `claims.role_aliases` | optional | raw role-claim VALUE → canonical role; every VALUE must be `maker`\|`checker` (load error otherwise); empty = identity translation (their value must already be canonical) |
+
+Environment binding: per-entry secrets expand `${VAR}` like every other
+secret; the list itself has no dedicated env binding (UnmarshalKey — same
+as `auth.users`), so it lives in yaml.
+
+### Claim mapping — "their JWT differs" is a config edit, never code
+
+An external token is verified as-is (HS256 with the entry's secret, `iss`,
+`aud`, `exp` — same jwt/v5 parser options as the local path), then adapted:
+
+| Local concept | Default claim on their JWT | Map a different vocabulary with | Post-map rule |
+|---|---|---|---|
+| username | `sub` | `claims.subject: "<their-claim>"` (e.g. `user_name`) | non-empty, else 401 (no anonymous principals) |
+| role | `role` | `claims.role: "<their-claim>"` (e.g. `access_level`) | canonical ∈ {maker, checker}, else 401 |
+| role VALUE `maker`/`checker` | identity (their token already says `maker`/`checker`) | `claims.role_aliases: {<their-raw>: maker\|checker}` (e.g. `admin: checker`) | alias VALUES validated at config load; unaliased values translate identically |
+
+Example — their token puts the username in `user_name`, the role in
+`access_level`, and calls the checker role `admin`:
+
+```yaml
+claims:
+  subject: "user_name"
+  role: "access_level"
+  role_aliases:
+    admin: checker
+```
+
+Only `role_aliases` VALUES are validated at load (`maker`|`checker` only);
+the `subject`/`role` claim NAMES are free strings (empty = default), because
+only the operator knows the other app's vocabulary. Downstream, everything
+consumes the same `{username, role}` principal — the WS SoD check, the mint
+username-binding, the audit rows and the role gates never see the raw
+external claims.
+
+### Role × capability matrix — unchanged
+
+The Phase-1 matrix above applies **identically to external tokens**: after
+claim mapping the principal is a normal maker or checker, so checker-role
+external principals are read-only minters (403 on write-access mints), the
+checker surface (`/ws/checker`, `/api/kill`, `/api/sessions`) is
+checker-role-only (makers only with `allow_maker_watch: true`), and the SoD
+username check (watcher ≠ session maker) is enforced on the mapped
+username. Only the credential's ORIGIN differs — no capability row changed.
+
+### External flow — their UI → our mint + checker WS
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Other-app user
+    participant OUI as Other-app UI (browser)
+    participant O as Other-app backend (issuer)
+    participant C as Control Plane :8080
+    participant V as Valkey
+    participant D as Data Plane :3306
+
+    U->>OUI: log in to the other app
+    OUI->>O: their own login flow
+    O->>O: sign HS256 JWT: iss=https://other-app.example, sub, role, aud=zt-api, jti, exp — key: ZT_OTHERAPP_JWT_SECRET
+    O-->>OUI: their JWT
+
+    Note over OUI,C: Cross-origin REST (origin in auth.jwt.allowed_origins)
+    OUI->>C: OPTIONS /api/token (Origin: https://other-app.example) — browser preflight
+    C->>C: CORS: origin allow-listed -> 204 + Access-Control-Allow-Origin echo, Allow-Headers: Authorization
+    OUI->>C: POST /api/token (Authorization: Bearer <their-jwt>)
+    C->>C: CORS origin gate -> parseToken: iss resolves to the external_issuers entry
+    C->>C: verify HS256 (their secret) + iss + aud + exp; require_jti: jti present
+    C->>C: claim-map subject/role (+aliases) -> principal {username, role}
+    C->>C: jti denylist consult (jwt:deny:<jti>); mint-for-self: body username == mapped sub
+    C->>C: role gate: write mint needs maker (checker-role -> 403 here)
+    C->>V: SET tok:<id> (TTL / max-uses) + sess:live:<sid> (status=pending)
+    C-->>OUI: 200 {token: sess_..., host, port, expires_in}
+
+    Note over OUI,C: Checker watch over WS (same allow-listed origin)
+    OUI->>C: GET /ws/checker?access_token=<their-jwt>&channel=sess:<sid>
+    C->>C: requireJWTWS: header absent -> access_token; same issuer-aware verify
+    C->>C: requireChecker: role=checker -> allowed; SoD: checker username != session maker
+    C->>V: watch:<sid> lease (heartbeat-refreshed while connected)
+    C-->>OUI: live QueryEvents for sess:<sid> (writer unblocked)
+
+    Note over OUI,C: Revocation (optional)
+    OUI->>C: POST /api/logout (Authorization: Bearer <their-jwt>)
+    C->>V: SET jwt:deny:<jti> (TTL = remaining life) — replay of the same token -> 401
+```
+
+### Security notes
+
+- **Shared-secret trust root.** Each external `secret` IS that issuer's
+  trust root: whoever holds it can mint any `sub`/role for that `iss`.
+  Keep it in the environment (`.env`), never in committed yaml; keep the
+  `external_issuers` list minimal (absent entry = no trust); bound their
+  token lifetime (`exp`) short; rotate by a **coordinated secret swap**
+  (both sides change together, config reload/restart) — there is no
+  per-token escape from a leaked HS256 key.
+- **`iss` collisions are load errors.** An external entry cannot claim the
+  local `auth.jwt.issuer` — that would let its secret mint "local" tokens
+  (and shadow self-issued ones). Each issuer is a separate, named trust
+  root; verification picks the root by the token's `iss` claim and rejects
+  unknown `iss` values outright.
+- **Mint-for-self only.** `POST /api/token` binds every DB token to the
+  authenticated principal — the optional body `username` must equal the
+  JWT's (mapped) subject or be omitted (then the subject is used anyway).
+  There is no mint-for-others anywhere, so an external principal can never
+  mint a token under a different identity.
+- **`require_jti` — revocation needs a handle.** Logout and the denylist
+  key on `jti`. Self-issued tokens always carry one; `require_jti` (absent
+  = true) demands the same of external tokens, so every accepted token is
+  deniable. Only an explicit `false` accepts jti-less external tokens — and
+  those can never be revoked server-side (logout refuses them with 500
+  rather than pretending).
+- **CORS is not auth.** `allowed_origins` only decides whether a BROWSER
+  may send cross-origin requests and read responses (preflights and actual
+  requests 403 before auth when disallowed; responses never
+  `Access-Control-Allow-Origin: *` and never credentialed). The actual gate
+  is the bearer JWT — a curl client or server-to-server caller needs no
+  allowlisted origin at all (no Origin header = pass-through), so keep the
+  list restrictive: it narrows the browser surface, it is not the security
+  boundary.
+- **Logout is unconditional (Task 4b).** Because external-only deployments
+  must be able to revoke tokens, `/api/logout` no longer depends on
+  `login_enabled` — it verifies the presented bearer through the same
+  issuer-aware path and denylists its `jti`. Local deployments see no
+  change.
+
+Full operator recipe (secret → entry → restart → origin → `/api/me`
+verification): **RUN.md §2.1.1**.
 
 ---
 

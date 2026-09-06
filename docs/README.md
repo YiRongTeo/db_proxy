@@ -12,7 +12,7 @@
 | 6. Protocols, TLS & Security | [06-protocols-tls-security.md](06-protocols-tls-security.md) | MySQL/PG/MSSQL wire handling, TLS surfaces, audit & logging |
 | 7. Session Audit Persistence | [07-audit-persistence.md](07-audit-persistence.md) | Durable session/connection records in MySQL (maker + checker usernames) |
 | 8. OpenTelemetry Metrics | [08-otel-metrics.md](08-otel-metrics.md) | Data-plane metrics endpoint scraped by Prometheus |
-| 9. JWT & Roles Auth Conversion | [jwt-auth-conversion.md](jwt-auth-conversion.md) | Control-plane auth model: bearer-JWT flows before/after, role × capability matrix, config keys, Mermaid sequence (login → mint → checker WS) |
+| 9. JWT & Roles Auth Conversion | [jwt-auth-conversion.md](jwt-auth-conversion.md) | Control-plane auth model: bearer-JWT flows before/after, role × capability matrix, config keys, Mermaid sequences (login → mint → checker WS; Phase 2 external-issuer flow with claim mapping) |
 
 > **Maintenance note:** pages 2 and 5 describe the two API surfaces most likely to change. Their contracts (headers, keys, status codes, payload fields) are spelled out in tables so edits can be made without re-deriving the wire behaviour.
 

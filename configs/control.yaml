@@ -32,9 +32,11 @@ auth:
   # NOT re-add it; mint auth is bearer-JWT only. (The DATA plane's
   # credentials_api.api_key in data.yaml is a different key and still
   # exists for vault calls.) Operator switches: auth.jwt.login_enabled
-  # (true = UI login on; false = external-JWT-only), auth.jwt.allowed_origins
-  # (cross-origin checker WS allowlist; no dedicated env binding — AutomaticEnv
-  # maps ZT_AUTH_JWT_ALLOWED_ORIGINS, comma-separated), auth.role /
+  # (true = UI login on; false = external-JWT-only — see the external_issuers
+  # comment below), auth.jwt.allowed_origins (ONE cross-origin allowlist for
+  # BOTH browser surfaces since Phase 2 Task 3: REST CORS and the checker WS
+  # upgrade; no dedicated env binding — AutomaticEnv maps
+  # ZT_AUTH_JWT_ALLOWED_ORIGINS, comma-separated), auth.role /
   # auth.users[].role (maker|checker), auth.allow_maker_watch (false =
   # strict SoD).
   username: "admin"
@@ -60,9 +62,14 @@ auth:
   # secret). An explicit false DISABLES JWT verification — every guarded
   # route answers 401 (fail closed); there is NO legacy cookie mode anymore
   # (the cookie-session machinery was removed in the conversion), so keep
-  # the default true. login_enabled registers /api/login + /api/logout
-  # (self-issued HS256 JWTs); false = external-JWT-only (username/password
-  # then NOT required).
+  # the default true. login_enabled gates ONLY /api/login (self-issued HS256
+  # JWTs). /api/logout is registered UNCONDITIONALLY (Phase 2 Task 4b): it
+  # self-authenticates the presented bearer via the issuer-aware verify path
+  # and denylists its jti, so external-only deployments keep a server-side
+  # revocation route for external tokens. login_enabled false =
+  # external-JWT-only: local username/password + local secret then NOT
+  # required, but >=1 external_issuers entry IS (below) — nothing else can
+  # authenticate.
   # ttl_seconds (28800 = 8h) replaces session_ttl_hours as the auth expiry.
   jwt:
     enabled: true
@@ -71,16 +78,26 @@ auth:
     audience: "zt-api"
     ttl_seconds: 28800
     secret: "${ZT_JWT_SECRET}"  # NO SECRETS IN COMMITTED CONFIGS — set ZT_JWT_SECRET in .env (see .env.example); REQUIRED when login_enabled; empty = plane refuses to start
-    # allowed_origins (Task 9): cross-origin host allowlist for the CHECKER
-    # WebSocket upgrade ONLY (/ws/checker). Browsers cannot set headers on a
-    # WebSocket upgrade, so a checker SPA served from ANOTHER origin must be
-    # allow-listed here. EMPTY (default) = same-origin only (today's
-    # behavior): an upgrade whose Origin host differs from the control-plane
-    # host is rejected 403 before the handshake. Patterns are lowercase host
-    # globs — "checker.example.com", "*.example.com"; prefix the scheme
-    # ("https://checker.example.com") to pin it too. REST routes ignore this
-    # list (their JWTs ride the Authorization header only). No dedicated env
-    # binding — AutomaticEnv still maps ZT_AUTH_JWT_ALLOWED_ORIGINS
+    # allowed_origins (Phase 2 Task 3): ONE cross-origin allowlist governing
+    # BOTH browser surfaces — (1) REST CORS: the Routes() wrapper answers
+    # browser preflights and origin-pins every actual cross-origin request
+    # (the other app's UI calling /api/* with Authorization: Bearer <jwt>
+    # from another origin) and (2) the CHECKER WebSocket upgrade ONLY
+    # (/ws/checker websocket.Accept OriginPatterns — browsers cannot set
+    # headers on an upgrade, so a checker SPA from another origin must be
+    # allow-listed here too). Matching rule (byte-for-byte the WS vendor's):
+    # each entry is a case-insensitive glob over the Origin HOST, unless it
+    # carries an explicit scheme prefix ("https://checker.example.com"), in
+    # which case the glob runs over SCHEME://HOST — so "https://..." pins
+    # the scheme and a scheme-less entry is scheme-agnostic. The PORT is
+    # part of the matched host, so an origin on a non-default port must
+    # spell it in the entry (e.g. "https://checker.example.com:8443").
+    # EMPTY (default) = same-origin only on both surfaces: a request whose
+    # Origin host differs from the control-plane host is 403'd before auth
+    # (preflight 204 only from an allowed origin; responses never
+    # Access-Control-Allow-Origin: * and never Access-Control-Allow-
+    # Credentials — bearer auth is origin-pinned by design). No dedicated
+    # env binding — AutomaticEnv still maps ZT_AUTH_JWT_ALLOWED_ORIGINS
     # (comma-separated) if set; set the list here in yaml for clarity.
     allowed_origins: []
     # external_issuers (Phase 2 Task 1): trusted THIRD-PARTY HS256 issuers —
@@ -94,6 +111,9 @@ auth:
     # OPTIONAL (empty inherits the top-level auth.jwt.audience above),
     # require_jti ABSENT = true (external tokens must be deniable; only an
     # explicit false relaxes that), role_aliases VALUES maker|checker only.
+    # If the issuer's browser UI will call this plane directly, pair the
+    # entry with allowed_origins above: add their UI origin there
+    # (scheme-pin it with https:// and include any non-default port).
     # external_issuers:
     #   - name: "other-app"
     #     iss: "https://other-app.example"        # MUST match the JWT iss claim

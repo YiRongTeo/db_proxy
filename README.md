@@ -45,8 +45,9 @@ Checker dashboard (maker–checker principle).
   EXECUTE; PG SimpleQuery/Parse/Execute) publishes `QueryEvent`s to Valkey Pub/Sub → Checker WebSocket
   (R3). Checker is **monitor-only** in v1 (D3).
 - **No anonymous issuance** — `POST /api/token` requires a **bearer JWT**
-  (self-issued by `POST /api/login` with `auth.jwt.login_enabled`, or an external
-  issuer signed with the same `auth.jwt.secret`) (R6). The control-plane
+  (self-issued by `POST /api/login` with `auth.jwt.login_enabled`, or issued
+  by a configured external issuer trusted via `auth.jwt.external_issuers`
+  with its own shared secret — see [docs/jwt-auth-conversion.md](docs/jwt-auth-conversion.md)) (R6). The control-plane
   `X-Api-Key` / `ZT_API_API_KEY` was retired in the JWT conversion. UI tokens are
   restricted to the `db_presets` allowlist (D8).
 - **Role-scoped UI (maker/checker)** — every account carries a role from
