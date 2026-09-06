@@ -92,6 +92,8 @@ auth:
     # the scheme and a scheme-less entry is scheme-agnostic. The PORT is
     # part of the matched host, so an origin on a non-default port must
     # spell it in the entry (e.g. "https://checker.example.com:8443").
+    # Every entry must be a VALID glob — a malformed pattern is a
+    # config-load error (naming the entry), never a silent never-match.
     # EMPTY (default) = same-origin only on both surfaces: a request whose
     # Origin host differs from the control-plane host is 403'd before auth
     # (preflight 204 only from an allowed origin; responses never
@@ -106,11 +108,15 @@ auth:
     # COMMENTED OUT — no ACTIVE entry until the other app's issuer is live
     # (no entry = no external trust; local login is unaffected while
     # login_enabled). Per-entry validation is fail-fast at startup: name
-    # required+unique, iss required (must NOT equal the local issuer),
-    # secret required (${VAR} from the env — never committed), audience
-    # OPTIONAL (empty inherits the top-level auth.jwt.audience above),
-    # require_jti ABSENT = true (external tokens must be deniable; only an
-    # explicit false relaxes that), role_aliases VALUES maker|checker only.
+    # required+unique, iss required (must NOT equal the local issuer and
+    # must be UNIQUE across entries — a duplicate would resolve
+    # first-match and 401 the second issuer's tokens forever), secret
+    # required (${VAR} from the env — never committed), audience OPTIONAL
+    # (empty inherits the top-level auth.jwt.audience above; an entry
+    # that resolves EMPTY — no pin, no top-level audience — is a load
+    # error, nothing it mints could pass aud verification), require_jti
+    # ABSENT = true (external tokens must be deniable; only an explicit
+    # false relaxes that), role_aliases VALUES maker|checker only.
     # If the issuer's browser UI will call this plane directly, pair the
     # entry with allowed_origins above: add their UI origin there
     # (scheme-pin it with https:// and include any non-default port).
@@ -124,8 +130,8 @@ auth:
     #       subject: "sub"                         # claim carrying the username (default "sub")
     #       role: "role"                           # claim carrying the role (default "role")
     #       role_aliases:                          # raw value -> maker|checker (default: identity)
-    #         maker: maker
-    #         checker: checker
+    #         approver: checker                    # non-identity example; canonical maker/checker
+    #                                              # values need NO alias
   # session_ttl_hours is INERT LEGACY RESIDUE of the cookie-session era: it
   # is still parsed (default 8) into an UNUSED ControlConfig.SessionTTL
   # field for backward compatibility, but NOTHING consumes it — the live

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -193,7 +194,13 @@ type JWTConfig struct {
 	// ("checker.example.com", "*.example.com"); prefix the scheme
 	// ("https://checker.example.com") to pin it — matched verbatim like
 	// the websocket vendor's OriginPatterns (host, or scheme://host when
-	// the pattern carries "://"). No dedicated env binding — AutomaticEnv
+	// the pattern carries "://"). The PORT rides the HOST: an origin on a
+	// non-default port must spell the port in the entry
+	// ("https://checker.example.com:8443") — the port-less entry never
+	// matches it. Every entry must be a VALID glob — load rejects a
+	// malformed pattern (path.Match ErrBadPattern), so the REST wrapper
+	// and the WS vendor can never diverge over a bad entry. No dedicated
+	// env binding — AutomaticEnv
 	// still maps ZT_AUTH_JWT_ALLOWED_ORIGINS (comma-separated) if set;
 	// set the list in control.yaml for clarity.
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
@@ -554,6 +561,17 @@ func LoadControl(path string) (*ControlConfig, error) {
 			}
 		}
 	}
+	// Phase 2 Task 3: allowed_origins entries are path.Match GLOBS on
+	// BOTH browser surfaces (REST CORS + the checker-WS OriginPatterns).
+	// A malformed pattern fails HERE, unconditionally: cors() wraps the
+	// mux even when jwt.enabled=false (Routes()), and the two consumers
+	// DISAGREE on a bad glob — the REST wrapper swallows path.Match's
+	// ErrBadPattern (the entry then silently never matches) while the WS
+	// vendor 403s the whole request. Rejecting at load keeps them from
+	// ever diverging over an entry.
+	if err := validateAllowedOrigins(cfg.JWT.AllowedOrigins); err != nil {
+		return nil, err
+	}
 	// Phase 2 Task 1: external-issuer validation (fail-fast, naming the
 	// entry). Skipped entirely when JWT is disabled — like the role checks
 	// above, an explicit auth.jwt.enabled:false means no JWT machinery
@@ -566,6 +584,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 			return nil, fmt.Errorf("auth.jwt.login_enabled=false requires at least one auth.jwt.external_issuers entry (nothing can authenticate otherwise)")
 		}
 		seen := make(map[string]int, len(cfg.JWT.ExternalIssuers))
+		seenIss := make(map[string]int, len(cfg.JWT.ExternalIssuers))
 		for i := range cfg.JWT.ExternalIssuers {
 			e := &cfg.JWT.ExternalIssuers[i]
 			// name: required + unique (a later task's issuer lookup is by
@@ -586,12 +605,28 @@ func LoadControl(path string) (*ControlConfig, error) {
 			if e.Iss == cfg.JWT.Issuer {
 				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q must not equal the local auth.jwt.issuer (an external issuer claiming the local iss would shadow self-issued tokens)", i, e.Iss)
 			}
+			// iss: unique across entries — verification resolves a token
+			// to its entry BY iss, so two entries sharing one would
+			// resolve first-match-deterministically and the second
+			// issuer's tokens would 401 forever with zero log clue.
+			if j, dup := seenIss[e.Iss]; dup {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q duplicates external_issuers[%d]", i, e.Iss, j)
+			}
+			seenIss[e.Iss] = i
 			// audience: optional per issuer — empty inherits the
 			// TOP-LEVEL audience, resolved HERE at validation time (not
 			// load time), so a later auth.jwt.audience edit re-defaults
 			// every issuer that did not pin its own.
 			if e.Audience == "" {
 				e.Audience = cfg.JWT.Audience
+			}
+			// audience: an entry that resolves to EMPTY (no per-entry
+			// pin AND no top-level auth.jwt.audience) can never pass aud
+			// verification — every token from it 401s fail-closed at
+			// runtime (parseExternalJWT refuses an empty audience). Fail
+			// here instead of booting a trust root nothing can use.
+			if e.Audience == "" {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].audience (%s): empty and auth.jwt.audience is unset — external tokens from this issuer could never verify (set the entry's audience or the top-level auth.jwt.audience)", i, e.Name)
 			}
 			// secret: ${VAR}-expandable, same fail-fast rule as the local
 			// auth.jwt.secret and the auth.users passwords.
@@ -644,6 +679,22 @@ func LoadControl(path string) (*ControlConfig, error) {
 		return nil, fmt.Errorf("unmarshal db_presets: %w", err)
 	}
 	return cfg, nil
+}
+
+// validateAllowedOrigins (Phase 2 Task 3) fails fast on a malformed
+// auth.jwt.allowed_origins entry: each entry is a path.Match GLOB used by
+// BOTH browser surfaces (REST CORS and the checker-WS OriginPatterns), and
+// the two consumers disagree on a bad pattern — the REST wrapper swallows
+// path.Match's ErrBadPattern (the entry silently never matches) while the
+// WS vendor 403s the entire request. Rejecting malformed globs at load
+// (naming the entry) removes that divergence entirely.
+func validateAllowedOrigins(origins []string) error {
+	for i, o := range origins {
+		if _, err := path.Match(o, ""); err != nil {
+			return fmt.Errorf("auth.jwt.allowed_origins[%d]: invalid glob pattern %q (%v)", i, o, err)
+		}
+	}
+	return nil
 }
 
 // CredentialsAPIConfig is the optional vault block for api-mode credential

@@ -74,7 +74,7 @@ role other than `maker`/`checker` — is rejected 401 at verification.
 | `auth.jwt.issuer` / `auth.jwt.audience` | `ZT_AUTH_JWT_ISSUER` / `ZT_AUTH_JWT_AUDIENCE` | `zerotrust-proxy` / `zt-api` — enforced on every token (wrong iss/aud → 401). |
 | `auth.jwt.ttl_seconds` | `ZT_AUTH_JWT_TTL_SECONDS` | `28800` (8 h) — the JWT life returned as `expires_in`; replaces `auth.session_ttl_hours` (now inert). |
 | `auth.jwt.secret` | `ZT_JWT_SECRET` (also `ZT_AUTH_JWT_SECRET`) | The **local** issuer's HS256 signing secret (external issuers bring their own — Phase 2 section). REQUIRED when `login_enabled` — empty = the control plane refuses to start. Use a long random value (32+ bytes). |
-| `auth.jwt.allowed_origins` | no dedicated env binding — AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS` (comma-separated) if set | **One** cross-origin allowlist for BOTH browser surfaces (Phase 2 Task 3): REST CORS (browser-direct `Authorization: Bearer <jwt>` calls) **and** the checker WebSocket upgrade (`/ws/checker`). Empty = same-origin only (cross-origin 403 before auth). Entries are host globs (`checker.example.com`, `*.example.com`); prefix `https://` to pin the scheme; the **port is part of the matched host**, so a non-default port must appear in the entry (`https://checker.example.com:8443`). |
+| `auth.jwt.allowed_origins` | no dedicated env binding — AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS` (comma-separated) if set | **One** cross-origin allowlist for BOTH browser surfaces (Phase 2 Task 3): REST CORS (browser-direct `Authorization: Bearer <jwt>` calls) **and** the checker WebSocket upgrade (`/ws/checker`). Empty = same-origin only (cross-origin 403 before auth). Entries are host globs (`checker.example.com`, `*.example.com`); prefix `https://` to pin the scheme; the **port is part of the matched host**, so a non-default port must appear in the entry (`https://checker.example.com:8443`). Each entry must be a **valid glob** — a malformed pattern is a load error naming the entry (never a silent never-match). |
 | `auth.jwt.external_issuers` | per-entry secrets via `${VAR}` (e.g. `ZT_OTHERAPP_JWT_SECRET`) | Trusted third-party HS256 issuers (Phase 2 Task 1) — each with its own `iss`/`audience`/`secret`/`require_jti` and optional `claims` mapping. Absent = no external trust. Full table in the Phase 2 section. |
 | `auth.username` / `auth.password` | `ZT_AUTH_USERNAME` / `ZT_AUTH_PASSWORD` | Primary account (maker in the committed config). Password REQUIRED when `login_enabled`; empty = refuses to start. |
 | `auth.role` | `ZT_AUTH_ROLE` | Primary account's role: `maker` \| `checker` — REQUIRED when `login_enabled`. |
@@ -211,8 +211,8 @@ other app is live). Fail-fast at load, naming the entry.
 | Key | Required? | Meaning / validation |
 |---|---|---|
 | `name` | ✅ | label for logs; required + unique across the list |
-| `iss` | ✅ | MUST equal the `iss` claim on their JWTs; must NOT equal the local `auth.jwt.issuer` (load error) |
-| `audience` | optional | empty inherits the top-level `auth.jwt.audience` (resolved at validation, so a later top-level edit re-defaults issuers that did not pin their own) |
+| `iss` | ✅ | MUST equal the `iss` claim on their JWTs; must NOT equal the local `auth.jwt.issuer` (load error); UNIQUE across the list — two entries sharing an `iss` would resolve first-match and 401 the second issuer's tokens forever (load error) |
+| `audience` | optional | empty inherits the top-level `auth.jwt.audience` (resolved at validation, so a later top-level edit re-defaults issuers that did not pin their own); an entry that would resolve EMPTY (no pin AND no top-level audience) is a load error — nothing it mints could ever pass `aud` |
 | `secret` | ✅ | their HS256 shared secret — `${VAR}` from the environment (e.g. `ZT_OTHERAPP_JWT_SECRET`), never committed; empty = plane refuses to start |
 | `require_jti` | optional | ABSENT = **true**: a token without a non-empty string `jti` → 401 (nothing the denylist could revoke). Explicit `false` opts out (issuer cannot mint jti) — those tokens are live until `exp` and logout refuses them (500: nothing to revoke) |
 | `claims.subject` | optional | claim carrying the username; empty = `"sub"` |
@@ -316,7 +316,9 @@ sequenceDiagram
   local `auth.jwt.issuer` — that would let its secret mint "local" tokens
   (and shadow self-issued ones). Each issuer is a separate, named trust
   root; verification picks the root by the token's `iss` claim and rejects
-  unknown `iss` values outright.
+  unknown `iss` values outright. Duplicate `iss` values across entries are
+  likewise rejected at load — two entries for one `iss` would resolve
+  first-match, 401'ing the other issuer's tokens forever with no log clue.
 - **Mint-for-self only.** `POST /api/token` binds every DB token to the
   authenticated principal — the optional body `username` must equal the
   JWT's (mapped) subject or be omitted (then the subject is used anyway).

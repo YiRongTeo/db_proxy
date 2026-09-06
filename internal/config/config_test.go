@@ -1636,6 +1636,7 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    audience: "zt-api"
     # Phase 2 (Task 1): external-only mode REQUIRES >=1 external issuer
     # (else nothing can authenticate) — the fixture carries a valid one.
     external_issuers:
@@ -1654,6 +1655,7 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    audience: "zt-api"
     external_issuers:
       - name: "other-app"
         iss: "https://other-app.example"
@@ -1674,6 +1676,7 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    audience: "zt-api"
     external_issuers:
       - name: "other-app"
         iss: "https://other-app.example"
@@ -1695,6 +1698,7 @@ auth:
   jwt:
     enabled: true
     login_enabled: false
+    audience: "zt-api"
     external_issuers:
       - name: "other-app"
         iss: "https://other-app.example"
@@ -1816,7 +1820,11 @@ auth:
 // (websocket.Accept OriginPatterns). A yaml list must land on
 // cfg.JWT.AllowedOrigins verbatim; an ABSENT key must load as EMPTY — the
 // same-origin-only default (today's behavior), never nil-panicking
-// consumers (websocket.Accept treats a nil/empty list identically).
+// consumers (websocket.Accept treats a nil/empty list identically). Phase 2
+// Task 3 final review: every entry is a path.Match GLOB shared with REST
+// CORS, so a MALFORMED glob (which cors.go would swallow as a silent
+// never-match while the WS vendor 403s the request) is a load error naming
+// the entry.
 func TestJWTAllowedOriginsLoad(t *testing.T) {
 	t.Run("yaml list populates the allowlist", func(t *testing.T) {
 		path := writeTempConfig(t, `
@@ -1869,17 +1877,45 @@ auth:
 			t.Errorf("JWT.AllowedOrigins = %v, want empty (same-origin only)", cfg.JWT.AllowedOrigins)
 		}
 	})
+
+	t.Run("malformed glob entry fails fast naming the entry", func(t *testing.T) {
+		path := writeTempConfig(t, `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    login_enabled: true
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
+    allowed_origins:
+      - "https://checker.example.com"
+      - "https://[x"
+`)
+		_, err := LoadControl(path)
+		if err == nil {
+			t.Fatal("LoadControl succeeded, want an error for the malformed glob \"https://[x\"")
+		}
+		if !strings.Contains(err.Error(), "allowed_origins[1]") {
+			t.Errorf("error %q does not name allowed_origins[1]", err.Error())
+		}
+	})
 }
 
 // TestJWTExternalIssuers (Phase 2 Task 1) guards the new
 // auth.jwt.external_issuers schema: trusted THIRD-PARTY HS256 issuers, each
 // with its own shared secret and an OPTIONAL claims mapping (subject/role
 // claim names + role-value aliases). Rules under test:
-//   - name non-empty + unique; iss non-empty; secret REQUIRED and
-//     ${VAR}-expandable (unset env = load error, never an empty key).
-//   - iss must NOT equal the LOCAL auth.jwt.issuer (shadowing).
+//   - name non-empty + unique; iss non-empty + unique across the list (a
+//     duplicated iss would resolve first-match, 401'ing the second issuer's
+//     tokens forever) + must NOT equal the local auth.jwt.issuer
+//     (shadowing); secret REQUIRED and ${VAR}-expandable (unset env = load
+//     error, never an empty key).
 //   - audience OPTIONAL per issuer — empty inherits the top-level
-//     auth.jwt.audience at VALIDATION time.
+//     auth.jwt.audience at VALIDATION time; an entry that resolves EMPTY
+//     (no pin AND no top-level audience) is a load error — its tokens could
+//     never pass aud verification.
 //   - require_jti ABSENT (nil) defaults TRUE; explicit false stays false.
 //   - role_aliases VALUES must be "maker"|"checker"; keys non-empty.
 //   - login_enabled=false (external-only) now REQUIRES >=1 external issuer
@@ -1913,6 +1949,22 @@ auth:
     login_enabled: false
     issuer: "zerotrust-proxy"
     audience: "zt-api"
+`
+	// noTopAudBase: login-ON base WITHOUT the top-level auth.jwt.audience —
+	// an external entry that does not pin its own audience then resolves
+	// EMPTY (the M2 fail-fast case).
+	const noTopAudBase = `
+http:
+  addr: ":8080"
+auth:
+  username: admin
+  password: secret
+  role: "maker"
+  jwt:
+    enabled: true
+    login_enabled: true
+    issuer: "zerotrust-proxy"
+    secret: "s3cret-0123456789abcdefghijklmnopqrstuv"
 `
 	// ext wraps an entry list at the jwt-child indent (4 spaces).
 	const ext = "\n    external_issuers:\n"
@@ -1948,6 +2000,13 @@ auth:
         iss: "https://app-b.example"
         secret: "b-secret-0123456789abcdefghijklmnopqrstuv"
 `
+	dupIss := `      - name: "app-a"
+        iss: "https://same-iss.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+      - name: "app-b"
+        iss: "https://same-iss.example"
+        secret: "b-secret-0123456789abcdefghijklmnopqrstuv"
+`
 	emptyName := `      - name: ""
         iss: "https://app-a.example"
         secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
@@ -1981,6 +2040,11 @@ auth:
           role_aliases:
             "": "maker"
 `
+	pinnedAud := `      - name: "other-app"
+        iss: "https://other-app.example"
+        audience: "zt-other"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+`
 
 	tests := []struct {
 		name    string
@@ -2011,6 +2075,11 @@ auth:
 			name:    "duplicate name fails fast naming both entries",
 			yaml:    header + ext + dupNames,
 			wantErr: "external_issuers[1].name",
+		},
+		{
+			name:    "duplicate iss across entries fails fast naming the later entry",
+			yaml:    header + ext + dupIss,
+			wantErr: "external_issuers[1].iss",
 		},
 		{
 			name:    "empty iss fails fast",
@@ -2047,6 +2116,15 @@ auth:
 			name:    "login off: ZERO external issuers fails fast",
 			yaml:    loginOffBase,
 			wantErr: "external_issuers",
+		},
+		{
+			name:    "external issuer resolving to an EMPTY audience fails fast (no per-entry pin, no top-level audience)",
+			yaml:    noTopAudBase + ext + one,
+			wantErr: "external_issuers[0].audience",
+		},
+		{
+			name: "external issuer with NO top-level audience but its OWN audience pin loads",
+			yaml: noTopAudBase + ext + pinnedAud,
 		},
 	}
 	for _, tc := range tests {

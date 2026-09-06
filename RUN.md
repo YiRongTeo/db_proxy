@@ -395,12 +395,19 @@ jwt:
         subject: "sub"                   #   claim carrying the username (default "sub")
         role: "role"                     #   claim carrying the role (default "role")
         role_aliases:                    #   raw role-claim VALUES -> maker|checker
-          maker: maker                   #     (default: identity — no aliases)
-          checker: checker
+          approver: checker              #     non-identity example: their role claim says
+                                         #     "approver" where we say "checker". Canonical
+                                         #     "maker"/"checker" values need NO alias — the
+                                         #     default translation is identity.
 ```
 
 Every ACTIVE entry's secret is required at load (empty → the plane refuses
 to start); `iss` collisions with the local issuer are a load error.
+`iss` values must be UNIQUE across entries too — verification resolves a
+token to its entry BY `iss`, so a duplicate would make the second issuer's
+tokens 401 forever with no log clue — and an entry that resolves to an
+EMPTY audience (no per-entry `audience`, no top-level `auth.jwt.audience`)
+refuses to start: nothing it mints could ever pass `aud` verification.
 
 **Claim mapping — "their JWT differs" is a config edit, never code.** An
 external token is verified as-is (HS256 with their secret, `iss` == the
@@ -451,7 +458,9 @@ the Origin **host**, unless the entry carries an explicit scheme prefix —
 the scheme**, while a scheme-less entry (`"other-app.example"`) is
 scheme-agnostic. The **port is part of the matched host**, so an origin
 served on a non-default port must spell it in the entry
-(`"https://other-app.example:8443"`). Same-origin requests pass untouched;
+(`"https://other-app.example:8443"`). Each entry must be a **valid glob** —
+a malformed pattern is a config-load error (naming the entry), never a
+silent never-match. Same-origin requests pass untouched;
 a disallowed cross-origin Origin is 403'd BEFORE auth (preflight 204 only
 from allowed origins; responses never `Access-Control-Allow-Origin: *` and
 never `Access-Control-Allow-Credentials`). CORS is not the security
@@ -474,7 +483,8 @@ Roles come entirely from the mapped claims.
    their token shape, `claims` mapping if their claim names/values differ).
    Keep local `login_enabled: true` until the external path is proven.
 3. Restart the control plane — validation fail-fasts on a bad entry
-   (missing secret, duplicate name, `iss` == local issuer, bad alias value).
+   (missing secret, duplicate name/`iss`, `iss` == local issuer, an entry
+   that resolves to an empty audience, bad alias value).
 4. Add their UI's origin to `auth.jwt.allowed_origins` (scheme-pinned,
    non-default port included, §above) so their browser can call the REST
    APIs and the checker WS cross-origin.

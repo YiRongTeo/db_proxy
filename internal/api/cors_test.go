@@ -315,6 +315,48 @@ func TestCORSHostEntryAnyScheme(t *testing.T) {
 	}
 }
 
+// TestCORSOriginPortPartOfHost: the PORT rides the Origin HOST in the
+// matching rule (identical to the WS vendor's), so an allowlist entry
+// without the port must NOT match the same host on a non-default port —
+// "https://app.example.com" is a different origin than
+// "https://app.example.com:8443" and 403s until the entry spells the port
+// out. (Config-load glob validation guards malformed entries — see
+// internal/config TestJWTAllowedOriginsLoad — so only well-formed globs
+// reach this middleware.)
+func TestCORSOriginPortPartOfHost(t *testing.T) {
+	t.Run("port-less entry rejects the same host on :8443", func(t *testing.T) {
+		srv, client, _ := newCORSServer(t, "https://app.example.com")
+		resp := doCORSReq(t, client, http.MethodGet, srv.URL+"/api/health", "https://app.example.com:8443", "")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("GET /api/health from https://app.example.com:8443 (entry https://app.example.com): status %d, want 403", resp.StatusCode)
+		}
+		if v := resp.Header.Get("Access-Control-Allow-Origin"); v != "" {
+			t.Errorf("ACAO = %q on a 403; disallowed origins must not be echoed", v)
+		}
+		assertCORSHeaderAbsence(t, resp.Header)
+	})
+	t.Run("port-spelled entry allows the :8443 origin (ACAO echoes it)", func(t *testing.T) {
+		srv, client, _ := newCORSServer(t, "https://app.example.com:8443")
+		resp := doCORSReq(t, client, http.MethodGet, srv.URL+"/api/health", "https://app.example.com:8443", "")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /api/health from https://app.example.com:8443 (entry spells the port): status %d, want 200", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://app.example.com:8443" {
+			t.Errorf("ACAO = %q, want exact origin %q", got, "https://app.example.com:8443")
+		}
+	})
+	t.Run("port-spelled entry still rejects the port-less same host", func(t *testing.T) {
+		srv, client, _ := newCORSServer(t, "https://app.example.com:8443")
+		resp := doCORSReq(t, client, http.MethodGet, srv.URL+"/api/health", "https://app.example.com", "")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("GET /api/health from https://app.example.com (entry https://app.example.com:8443): status %d, want 403", resp.StatusCode)
+		}
+	})
+}
+
 // TestCORSEmptyAllowlistSameOriginOnly: with auth.jwt.allowed_origins EMPTY
 // (the committed default) NO cross-origin Origin is allowed — current
 // behavior preserved. No-Origin and same-origin requests keep working.
