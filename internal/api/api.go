@@ -80,7 +80,11 @@ func (a *api) Routes() http.Handler {
 		a.log.Warn("static dir missing; SPA will not be served", "static_dir", a.cfg.StaticDir)
 	}
 	mux.Handle("/", spaHandler{staticDir: a.cfg.StaticDir})
-	return mux
+	// Task 3 (Phase 2): the CORS policy wraps the WHOLE mux — every route,
+	// the SPA handler, and unknown paths alike — reusing
+	// auth.jwt.allowed_origins (same list as the checker WS upgrade gate).
+	// See cors.go for the matching rule and invariants.
+	return a.cors(mux)
 }
 
 // spaHandler serves the built Angular SPA from disk with a single-page-app

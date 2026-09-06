@@ -175,18 +175,22 @@ type JWTConfig struct {
 	// never a silent empty key).
 	Secret string `mapstructure:"secret"`
 	// AllowedOrigins (Task 9; yaml auth.jwt.allowed_origins) is the
-	// cross-origin host allowlist for the CHECKER WebSocket upgrade ONLY
-	// (/ws/checker websocket.Accept OriginPatterns). Browsers cannot set
-	// headers on a WebSocket upgrade, so a checker SPA served from another
-	// origin must be allow-listed here. EMPTY (default) = same-origin only
-	// — an upgrade whose Origin host differs from the control-plane host is
-	// rejected (the pre-Task-9 behavior). Patterns are lowercase host globs
+	// cross-origin allowlist for this control plane — ONE list governing
+	// BOTH browser surfaces (Phase 2 Task 3): (1) the CHECKER WebSocket
+	// upgrade (/ws/checker websocket.Accept OriginPatterns — browsers
+	// cannot set headers on an upgrade, so a checker SPA served from
+	// another origin must be allow-listed here) and (2) REST CORS (the
+	// Routes() wrapper answers browser preflights and origin-pins
+	// Authorization: Bearer calls from the other app's UI). EMPTY
+	// (default) = same-origin only on both surfaces — a request whose
+	// Origin host differs from the control-plane host is rejected (the
+	// pre-Task-9 behavior). Patterns are lowercase host globs
 	// ("checker.example.com", "*.example.com"); prefix the scheme
-	// ("https://checker.example.com") to pin it. REST routes never read
-	// this list — their JWTs ride the Authorization header only. No
-	// dedicated env binding — AutomaticEnv still maps
-	// ZT_AUTH_JWT_ALLOWED_ORIGINS (comma-separated) if set; set the list
-	// in control.yaml for clarity.
+	// ("https://checker.example.com") to pin it — matched verbatim like
+	// the websocket vendor's OriginPatterns (host, or scheme://host when
+	// the pattern carries "://"). No dedicated env binding — AutomaticEnv
+	// still maps ZT_AUTH_JWT_ALLOWED_ORIGINS (comma-separated) if set;
+	// set the list in control.yaml for clarity.
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
 	// ExternalIssuers (Phase 2 Task 1; yaml auth.jwt.external_issuers) is
 	// the list of TRUSTED THIRD-PARTY HS256 issuers: JWTs minted by OTHER
