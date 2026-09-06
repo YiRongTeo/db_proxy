@@ -1,20 +1,31 @@
 package api
 
-// JWT conversion (Task 5): self-issued HS256 bearer tokens are the Control
-// Plane's request credential. requireJWT guards the authenticated REST
-// routes (/api/me, /api/db-presets, /api/token since Task 7, /api/kill,
+// JWT conversion (Task 5): HS256 bearer tokens are the Control Plane's
+// request credential. requireJWT guards the authenticated REST routes
+// (/api/me, /api/db-presets, /api/token since Task 7, /api/kill,
 // /api/sessions), replacing the legacy UI-session middleware (removed in
 // Task 4); the Valkey jti denylist (Task 6) revokes tokens. /ws/checker is
 // guarded by requireJWTWS (Task 9) — the same verification, but the token
 // may ALSO arrive via ?access_token= because the browser WebSocket API
 // cannot set the Authorization header.
 //
-// The token carries the principal in the sub claim plus an explicit
-// maker|checker role claim. requireJWT verifies signature + exp + iss + aud
-// and materializes *models.Session{Username: sub, Role: role} under the
-// EXISTING sessionKey{} context key, so every downstream consumer
-// (sessionFrom(r), SoD checkerMayWatch, audit, mint username-binding) keeps
-// working unchanged.
+// Verification is ISSUER-AWARE (Phase 2 Task 2): parseToken resolves a
+// token's iss claim to a trust root — the LOCAL self-issued login tokens
+// (auth.jwt.*, parseJWT) or a configured auth.jwt.external_issuers entry
+// (parseExternalJWT, verified with the issuer's own HS256 shared secret +
+// audience and mapped through the issuer's configurable claim mapping) —
+// and unknown iss claims are rejected. The principal is always
+// materialized as *models.Session{Username, Role} (role ∈ {maker, checker}
+// enforced post-mapping) under the EXISTING sessionKey{} context key, so
+// every downstream consumer (sessionFrom(r), SoD checkerMayWatch, audit,
+// mint username-binding) keeps working unchanged.
+//
+// The token carries the principal in the sub claim (or the external
+// issuer's mapped subject claim) plus an explicit maker|checker role claim.
+// Local tokens always carry a jti (signJWT/newJTI); external tokens must
+// too (require_jti, Task-1 default true), so the Task 6 denylist applies to
+// every accepted token — logged-out external tokens replay as 401 like
+// logged-out local ones.
 
 import (
 	"context"
@@ -38,7 +49,10 @@ import (
 // role claim is rejected (an un-role'd principal would be an accidental
 // superuser). Role values are restricted to the two roles config validates
 // (config.go Task 2), so a token minted with a bogus role is rejected
-// rather than silently carried into SoD decisions.
+// rather than silently carried into SoD decisions. Phase 2 Task 2: external
+// tokens are verified via jwt.MapClaims (their claim NAMES are
+// configurable), then the mapped principal + jti/exp are carried back in
+// this same struct so the denylist and logout consumers stay unchanged.
 type jwtClaims struct {
 	Role string `json:"role"`
 	jwt.RegisteredClaims
@@ -93,14 +107,17 @@ func signJWT(cfg *config.ControlConfig, username, role string, ttl time.Duration
 // nothing about WHY a token was rejected.
 var errUnauthorizedJWT = errors.New("unauthorized")
 
-// parseJWT verifies a raw bearer token against the middleware's config and
-// returns the principal session plus the verified claims (the jti the
-// Task 6 denylist needs — requireJWT consults it, handleLogout denylists
-// it). Signature (HS256, cfg secret), exp, iss and aud are all enforced by
-// jwt/v5 parser options; sub and role are checked afterwards (role ABSENT →
-// reject, plan decision). When JWT auth is not configured (jwt.enabled=false
-// or an empty secret/issuer/audience) the middleware fails CLOSED: no token
-// can be trusted, so every request is rejected.
+// parseJWT verifies a raw bearer token against the LOCAL issuer (the
+// middleware's own auth.jwt.* config) and returns the principal session
+// plus the verified claims (the jti the Task 6 denylist needs — requireJWT
+// consults it, handleLogout denylists it). Signature (HS256, cfg secret),
+// exp, iss and aud are all enforced by jwt/v5 parser options; sub and role
+// are checked afterwards (role ABSENT → reject, plan decision). This is the
+// LOCAL-issuer path: parseToken resolves a token's iss claim and reaches
+// parseJWT ONLY for tokens claiming the local issuer, so self-issued login
+// tokens verify here exactly as before. When JWT auth is not configured
+// (jwt.enabled=false or an empty secret/issuer/audience) the middleware
+// fails CLOSED: no token can be trusted, so every request is rejected.
 func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error) {
 	j := a.cfg.JWT
 	if !j.Enabled || j.Secret == "" || j.Issuer == "" || j.Audience == "" {
@@ -133,9 +150,151 @@ func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error
 	return &models.Session{Username: claims.Subject, Role: claims.Role}, *claims, nil
 }
 
+// parseToken is the ISSUER-AWARE verification entry point (Phase 2 Task 2):
+// every bearer token — self-issued or minted by a configured external
+// issuer — is attributed to a trust root by its iss claim, verified against
+// THAT issuer's HS256 secret + audience (with the issuer's claim mapping
+// applied for external issuers), and materialized as
+// *models.Session{Username, Role}. It is the shared core of authorizeJWT
+// (requireJWT/requireJWTWS) and handleLogout, so external tokens are
+// first-class principals: they authenticate guarded routes AND can be
+// logged out (their jti denylisted — require_jti makes sure they carry
+// one). Fail-closed semantics are unchanged: any resolution, verification
+// or mapping failure → errUnauthorizedJWT → 401, never a different status
+// and never a pass.
+func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, error) {
+	j := a.cfg.JWT
+	// Master switch: jwt.enabled=false → no token is trusted (fail closed,
+	// exactly as parseJWT always did).
+	if !j.Enabled {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	// Phase 1 — read the iss claim WITHOUT verification so the token can be
+	// attributed to a trust root (local issuer vs external list). MapClaims
+	// is the probe because it tolerates any claim payload; only iss is
+	// read, and a malformed token (unparseable, or iss not a string) fails
+	// closed.
+	probe := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser(jwt.WithoutClaimsValidation()).ParseUnverified(raw, probe); err != nil {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	iss, err := probe.GetIssuer()
+	if err != nil {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	if iss == "" {
+		// No iss claim → the token names no trust root (the local parser
+		// below also requires iss via WithIssuer, so nothing is lost).
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	// Phase 2 — resolve the issuer and verify with ITS key material.
+	if iss == j.Issuer {
+		// Local issuer: the historical single path, byte-for-byte (parseJWT
+		// re-checks enabled/secret/issuer/audience and fails closed when the
+		// local secret is not configured, e.g. external-only mode).
+		return a.parseJWT(raw)
+	}
+	for i := range j.ExternalIssuers {
+		e := &j.ExternalIssuers[i]
+		if e.Iss == iss {
+			return parseExternalJWT(raw, e)
+		}
+	}
+	// Unknown iss: no configured trust root claims this token.
+	return nil, jwtClaims{}, errUnauthorizedJWT
+}
+
+// parseExternalJWT verifies a raw token against ONE external issuer entry
+// (Phase 2 Task 2): HS256 signature with the issuer's shared secret, iss ==
+// e.Iss, aud containing e.Audience (Task-1 validation materialized the
+// issuer-level audience — or the top-level inherit — into e.Audience at
+// load), exp present. It then applies the issuer's CLAIM MAPPING — subject
+// and role claim NAMES default to "sub"/"role" when zero, role_aliases
+// translate raw role VALUES onto maker|checker (identity when unaliased) —
+// and enforces the same post-verification rules as the local path: sub
+// non-empty, canonical role ∈ {maker, checker}. require_jti (absent config
+// field = TRUE, the Task-1 default; explicit false opts out) demands a
+// non-empty jti claim so external tokens are deniable via the Task 6
+// denylist. Any failure → errUnauthorizedJWT (fail closed).
+func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Session, jwtClaims, error) {
+	// Fail closed on a half-configured entry. config.Load guarantees
+	// iss/secret non-empty and audience materialized; a hand-built cfg (in
+	// tests, or a future caller) must not bypass the same bar.
+	if e == nil || e.Iss == "" || e.Secret == "" || e.Audience == "" {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	claims := jwt.MapClaims{}
+	tok, err := jwt.ParseWithClaims(raw, claims,
+		func(t *jwt.Token) (any, error) {
+			// Same method pin as the local path: never hand the shared
+			// secret to a non-HS256 token.
+			if t.Method != jwt.SigningMethodHS256 {
+				return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
+			}
+			return []byte(e.Secret), nil
+		},
+		jwt.WithIssuer(e.Iss),
+		jwt.WithAudience(e.Audience),
+		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
+	if err != nil || !tok.Valid {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	exp, err := claims.GetExpirationTime()
+	if err != nil || exp == nil {
+		return nil, jwtClaims{}, errUnauthorizedJWT // defensive — WithExpirationRequired passed above
+	}
+	// jti: read verbatim (string claim). A malformed (non-string) jti is
+	// treated as absent — with require_jti that is a rejection; without it
+	// the denylist consult is skipped downstream (claims.ID == "").
+	jti, jtiIsString := claims["jti"].(string)
+	requireJTI := e.RequireJTI == nil || *e.RequireJTI // nil = absent = TRUE (Task-1 default)
+	if requireJTI && (!jtiIsString || jti == "") {
+		return nil, jwtClaims{}, errUnauthorizedJWT // no jti → nothing the logout denylist could revoke
+	}
+	if !jtiIsString {
+		jti = ""
+	}
+	// Claim mapping: zero config values mean the defaults (sub/role claim
+	// names; identity role translation). The issuer's JWT shape is adapted
+	// HERE — a different claim vocabulary is a config edit, never code.
+	m := e.Claims
+	subName := m.Subject
+	if subName == "" {
+		subName = "sub"
+	}
+	roleName := m.Role
+	if roleName == "" {
+		roleName = "role"
+	}
+	username, _ := claims[subName].(string)
+	if username == "" {
+		return nil, jwtClaims{}, errUnauthorizedJWT // no anonymous principals
+	}
+	rawRole, _ := claims[roleName].(string)
+	role, aliased := m.RoleAliases[rawRole]
+	if !aliased {
+		role = rawRole // identity translation for values the operator did not alias
+	}
+	if role != "maker" && role != "checker" {
+		return nil, jwtClaims{}, errUnauthorizedJWT // role absent / unaliased non-canonical → reject (never a superuser)
+	}
+	return &models.Session{Username: username, Role: role}, jwtClaims{
+		Role: role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   username,
+			Issuer:    e.Iss,
+			ExpiresAt: exp,
+			ID:        jti,
+		},
+	}, nil
+}
+
 // authorizeJWT is the shared core of requireJWT and requireJWTWS: it
 // verifies a raw token — presence ("": errUnauthorizedJWT, no anonymous
-// access), parseJWT (signature + exp + iss + aud + role), the Valkey jti
+// access), parseToken (issuer-aware resolution + signature + exp + iss +
+// aud + role, claim-mapped for external issuers), the Valkey jti
 // denylist (Task 6: a logged-out token is rejected even though its
 // signature is fine) — and returns a request whose context carries the
 // principal session under sessionKey{} so sessionFrom(r) consumers keep
@@ -146,13 +305,15 @@ func (a *authMiddleware) authorizeJWT(r *http.Request, raw string) (*http.Reques
 	if raw == "" {
 		return nil, errUnauthorizedJWT
 	}
-	sess, claims, err := a.parseJWT(raw)
+	sess, claims, err := a.parseToken(raw)
 	if err != nil || sess == nil {
 		return nil, errUnauthorizedJWT
 	}
 	// Task 6: a token id on the denylist (handleLogout wrote it) is
 	// revoked — 401. Tokens without a jti are skipped (never deniable);
-	// self-issued tokens always carry one (signJWT/newJTI).
+	// self-issued tokens always carry one (signJWT/newJTI) and require_jti
+	// (Task 2) forces external tokens to carry one too, so the gap is
+	// closed.
 	if claims.ID != "" {
 		denied, err := a.vs.JWTDenied(r.Context(), claims.ID)
 		if err != nil {
@@ -166,9 +327,11 @@ func (a *authMiddleware) authorizeJWT(r *http.Request, raw string) (*http.Reques
 	return r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess)), nil
 }
 
-// requireJWT guards a route with a self-issued HS256 bearer token: it reads
-// "Authorization: Bearer ***" ONLY (bearerToken), verifies signature + exp
-// + iss + aud (parseJWT via authorizeJWT), and injects the principal
+// requireJWT guards a route with a bearer token — local (self-issued HS256)
+// or from a configured external issuer: it reads "Authorization: Bearer
+// ***" ONLY (bearerToken), verifies signature + exp + iss + aud
+// (issuer-aware parseToken via authorizeJWT, claim-mapped for external
+// issuers), and injects the principal
 // session under sessionKey{} so sessionFrom(r) consumers keep working
 // unchanged. Any failure answers 401 with the standard unauthorized body —
 // the same 401 these routes answered under the legacy UI-session
@@ -247,8 +410,8 @@ func (a *authMiddleware) requireChecker(next http.HandlerFunc) http.HandlerFunc 
 			}
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		default:
-			// parseJWT rejects unknown roles before this point; fail
-			// closed rather than guess.
+			// Token verification (parseToken — local or external) rejects
+			// unknown roles before this point; fail closed rather than guess.
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		}
 	}
@@ -256,8 +419,8 @@ func (a *authMiddleware) requireChecker(next http.HandlerFunc) http.HandlerFunc 
 
 // bearerToken extracts the raw token from "Authorization: Bearer ***"; ""
 // when the header is absent or uses any other scheme. The strict prefix
-// check keeps e.g. "Bearerish xyz" out — parseJWT must only ever see a real
-// bearer value (or "").
+// check keeps e.g. "Bearerish xyz" out — parseToken must only ever see a
+// real bearer value (or "").
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, bearerPrefix) {

@@ -224,7 +224,10 @@ func (a *authMiddleware) handleMe(w http.ResponseWriter, r *http.Request) {
 // token's jti is denylisted in Valkey for the token's remaining life
 // (exp - now, floored at 1s) — replaying the same token on a guarded route
 // then answers 401 until it would have expired anyway. No cookie, no
-// session delete: the jwt:deny:<jti> key IS the revocation. A missing or
+// session delete: the jwt:deny:<jti> key IS the revocation. The token is
+// parsed through the SAME issuer-aware path as requireJWT (parseToken,
+// Phase 2 Task 2) so an EXTERNAL-issuer token can be logged out too — its
+// jti lands on the same denylist requireJWT consults. A missing or
 // unverifiable bearer is rejected 401 (nothing to revoke, nothing leaked);
 // a denylist write failure answers 500 — silent logout would leave the
 // token live while the SPA believes it is gone.
@@ -234,7 +237,7 @@ func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-	sess, claims, err := a.parseJWT(raw)
+	sess, claims, err := a.parseToken(raw)
 	if err != nil || sess == nil {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return

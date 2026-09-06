@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+
 	"zerotrust-proxy/internal/config"
 )
 
@@ -66,6 +68,34 @@ func mintJWT(t *testing.T, cfg *config.ControlConfig, username, role string) str
 		t.Fatalf("mintJWT(%s, %s): %v", username, role, err)
 	}
 	return tok
+}
+
+// mintExternalJWT (Phase 2 Task 2) signs a token the way a THIRD-PARTY
+// issuer would: HS256 with the GIVEN shared secret, iss/aud/sub/role/jti
+// claims verbatim, exp 5 minutes out (jwt.MapClaims — the issuer's token
+// shape is verified against a claim MAPPING, so the standard claim names
+// are used here and custom-named claims are built inline by the
+// claim-mapping tests). jti == "" OMITS the jti claim entirely — the shape
+// of an issuer that cannot mint one (the require_jti rejection case).
+func mintExternalJWT(t *testing.T, secret, iss, aud, username, role, jti string) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"sub":  username,
+		"role": role,
+		"iss":  iss,
+		"aud":  aud,
+		"exp":  time.Now().Add(5 * time.Minute).Unix(),
+		"iat":  time.Now().Unix(),
+	}
+	if jti != "" {
+		claims["jti"] = jti
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("mintExternalJWT(%s): %v", iss, err)
+	}
+	return signed
 }
 
 // authHeader returns the Authorization header value for a token.
