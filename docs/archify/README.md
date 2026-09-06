@@ -19,6 +19,8 @@ renders better in your target tool; the source facts are identical.
 | 6 | [06-protocols-tls-security.html](06-protocols-tls-security.html) | architecture | One listener, three wire protocols, byte-exact relay, capture caps | [06-protocols-tls-security.md](../06-protocols-tls-security.md) |
 | 7 | [07-audit-persistence.html](07-audit-persistence.html) | dataflow | Lifecycle events → idempotent upserts in `zt_audit.sessions` | [07-audit-persistence.md](../07-audit-persistence.md) |
 | 8 | [08-otel-metrics.html](08-otel-metrics.html) | dataflow | Instruments → `:9464/metrics` → Prometheus → Grafana | [08-otel-metrics.md](../08-otel-metrics.md) |
+| 9 | [09-auth-login.html](09-auth-login.html) | sequence | Login & authentication: local `/api/login` self-issue, external pre-issued JWT, Bearer REST, mint-for-self, checker WS `?access_token=`, unconditional logout → jti denylist | [jwt-auth-conversion.md](../jwt-auth-conversion.md) |
+| 10 | [10-external-cutover.html](10-external-cutover.html) | architecture | Cutover runbook: standalone local login → external-issuer-only (issuer entry, origin allowlist, verify, `login_enabled: false`, retire SPA, `.env` cleanup) with rollback branch | [jwt-auth-conversion.md](../jwt-auth-conversion.md) + RUN.md §2.1.2 |
 
 ## Authoring notes (keep diagrams honest)
 
@@ -37,5 +39,7 @@ renders better in your target tool; the source facts are identical.
 ## Change-prone surfaces
 
 Pages 2 (token API) and 5 (credential API) describe the two wire contracts most likely
-to change. When editing them, update **both** the Mermaid page and the Archify candidate
-(see `candidates/02-*` and `candidates/05-*`), then re-deliver.
+to change, and Page 9 (auth, `jwt-auth-conversion.md`) now mirrors its login process
+and external-issuer cutover as diagrams 9–10. When editing them, update **both** the
+Mermaid page and the Archify candidate (see `candidates/02-*`, `candidates/05-*`,
+`candidates/09-*` and `candidates/10-*`), then re-deliver.

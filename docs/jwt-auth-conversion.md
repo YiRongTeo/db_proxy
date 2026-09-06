@@ -8,6 +8,8 @@
 > is the operator-facing summary: the flows before/after, the role × capability
 > matrix, the config keys, and the end-to-end sequences (login → JWT → mint with
 > role gate → checker WS watch; external-issuer flow in the Phase 2 section).
+> The exact current login contract ("Login process — current state") and the
+> cutover runbook from standalone login to external-issuer-only close the page.
 > It supersedes the auth statements in [Page 1](01-architecture-overview.md),
 > [Page 2](02-creating-db-connections.md) and the spec's R6 / §9-3 / §9-7 rows.
 
@@ -113,6 +115,27 @@ role other than `maker`/`checker` — is rejected 401 at verification.
    authentication: `checker` always allowed; `maker` only when
    `auth.allow_maker_watch: true`; else 403. The SoD username check
    (watcher ≠ session maker) lives in the WS handler, independent of roles.
+
+## Login process — current state
+
+The before/after table and the sequence below show the shape; this section
+pins the exact current contract (verified at HEAD `0307e6b`, Phases 1 + 2)
+so operators can script against it:
+
+| Aspect | Current behavior |
+|---|---|
+| Route registration | `POST /api/login` is registered **only while `auth.jwt.login_enabled: true`** (the default). `false` → the path falls through to the SPA `/api` guard and answers **404** (JSON, never HTML). |
+| Request | `POST /api/login` with `{"username", "password"}` — constant-time compares against `auth.username` / `auth.users[]`; the role comes from the config lookup (`auth.role` / the matching entry's `role`) and is **never silently defaulted** (an un-role'd login would be an accidental superuser). |
+| Success response | `200 {"token": <HS256 JWT>, "username": <name>, "role": <maker\|checker>, "expires_in": <ttl_seconds>}` — the JWT self-issued by the local issuer: `sub`, `role`, `iss` (`zerotrust-proxy`), `aud` (`zt-api`), `exp`/`iat`, `jti`. No cookie, no Valkey session — the token is the only credential handed to the caller. |
+| Failure responses | `401` invalid credentials — rate-limited per (IP, requested username); the key is blocked **429** after the window's failure budget, and a successful login clears the counter. |
+| Every call after that | `Authorization: Bearer <jwt>` on every guarded REST route (header-only by design); `GET /api/me` answers `200 {"username", "role"}` for the token's principal. The checker WebSocket is the one header-less surface: `/ws/checker` accepts the bearer header **or** `?access_token=<jwt>`. |
+| Logout semantics | `POST /api/logout` is registered **unconditionally** (Phase 2 Task 4b — never gated by `login_enabled`). It verifies the presented bearer through the issuer-aware path, writes `SET jwt:deny:<jti>` (TTL = the token's remaining life, floor 1 s) and answers `200 {"ok":"true"}` — replaying the same token on any guarded route → 401. A valid token without a `jti` is refused **500** (nothing to revoke), never silently "logged out". |
+| External-only mode | `login_enabled: false` removes only the login route: local secret + local credentials are not required, but **≥ 1 `external_issuers` entry is required at load** — a plane nothing can authenticate must not boot. Roles then come entirely from mapped external claims. |
+
+Everything else — the issuer-aware verification order, the jti denylist
+consult, mint-for-self binding and the role gates — applies identically
+whether the token came from `/api/login` or from an external issuer
+("How a request is authenticated" above, Phase 2 section below).
 
 ## End-to-end sequence
 
@@ -346,6 +369,71 @@ sequenceDiagram
 
 Full operator recipe (secret → entry → restart → origin → `/api/me`
 verification): **RUN.md §2.1.1**.
+
+---
+
+## Cutover runbook — standalone local login → external-issuer-only
+
+Phase 2's config keys make the cutover a **deployment change, never a code
+change**: the other app issues the JWTs (HS256 with the shared secret) and
+this plane consumes them. Six steps, in order — the same runbook with
+verification curls and the config snippet lives in **RUN.md §2.1.2**; this
+section is the Confluence summary with the decision structure. Run it only
+after the Phase 2 recipe above has proven their JWT on `/api/me` while local
+login is still on.
+
+1. **Add the other app as an external issuer** — one `auth.jwt.external_issuers[]`
+   entry (`name`, `iss`, `audience` optional → top-level, `secret` via
+   `${ZT_OTHERAPP_JWT_SECRET}`, `require_jti` — absent = true — and `claims`
+   only if their vocabulary differs). Requires **ONE shared HS256 secret**
+   known to both apps; never commit it.
+2. **Add their UI origin to `auth.jwt.allowed_origins`** — the one list
+   governs REST CORS **and** the checker WS upgrade; `https://` pins the
+   scheme, a non-default port must be spelled in the entry. Restart the
+   control plane (validation fail-fasts on a bad entry).
+3. **Verify while login is still enabled** — an external JWT must behave
+   exactly like a self-issued one before the local path is removed:
+   `GET /api/me` → `200 {username, role}`; `POST /api/token` mints for a
+   maker principal (a checker-role external principal is **403** on
+   write-access mints); `/ws/checker?channel=sess:<sid>&access_token=<their-jwt>`
+   from their origin upgrades and streams. Nothing here is irreversible.
+4. **Flip `auth.jwt.login_enabled: false`** — `/api/login` 404s (nothing
+   self-issues local tokens anymore) and `/api/logout` **stays registered**
+   (unconditional revocation). With login off, `auth.jwt.secret` /
+   `auth.username` / `auth.password` are not required, but **≥ 1
+   `external_issuers` entry IS** — an empty list refuses to start (nothing
+   could authenticate). A leftover token claiming the LOCAL `iss` still
+   verifies only while a local secret is configured (parseJWT fails closed
+   on an empty secret) — step 6's `ZT_JWT_SECRET` removal is what untrusts
+   the local issuer in practice.
+5. **Retire the Angular SPA** — stop serving the built UI (`http.static_dir`),
+   archive/delete the `web/` source. Local `auth.users[]` entries become
+   inert.
+6. **`.env` cleanup** — remove `ZT_AUTH_PASSWORD`, `ZT_AUTH_CHECKER_PASSWORD`
+   (if set) and `ZT_JWT_SECRET` (local-iss tokens then fail closed); keep
+   `ZT_OTHERAPP_JWT_SECRET`. Confirm:
+   `POST /api/login` → 404, and `POST /api/logout` with an external token →
+   `200 {"ok":"true"}` (replay of that token → 401).
+
+**Rollback.** Flip `login_enabled` back to `true` and restart — local login
+returns; both auth paths coexist until the SPA is actually retired, so the
+flip alone is a complete rollback at any point before step 5. After steps
+5–6, restoring standalone mode means restoring the SPA, the `auth.users[]`
+entries and the local `.env` secrets too.
+
+```mermaid
+flowchart TD
+    A["1 · Add external issuer<br/>external_issuers[] + shared secret"] --> B["2 · Allowlist UI origin<br/>auth.jwt.allowed_origins"]
+    B --> C["3 · Verify external JWT<br/>me 200 · mint 200/403 · checker WS"]
+    C -->|all checks green| D["4 · Flip login_enabled: false<br/>/api/login 404 · logout stays"]
+    D --> E["5 · Retire Angular SPA<br/>stop serving web/ statics"]
+    E --> F["6 · .env cleanup<br/>drop local login secrets"]
+    C -->|any check fails| R["Rollback — login_enabled: true + restart<br/>local login returns (both paths coexist)"]
+    D -->|local login still needed| R
+```
+
+Interactive versions: `docs/archify/09-auth-login.html` (login process) and
+`docs/archify/10-external-cutover.html` (this cutover, architecture view).
 
 ---
 

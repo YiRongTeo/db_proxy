@@ -334,7 +334,7 @@ secret behind every LOCALLY issued bearer JWT (config `auth.jwt.secret`, §3);
 (the default) — set `login_enabled: false` for an external-JWT-only plane, in
 which case the local password and secret are NOT required but at least one
 `auth.jwt.external_issuers` entry (each with its OWN `${VAR}` secret, e.g.
-`ZT_OTHERAPP_JWT_SECRET`) IS — see §2.1.1 and `docs/jwt-auth-conversion.md`.
+`ZT_OTHERAPP_JWT_SECRET`) IS — see §2.1.1, the §2.1.2 cutover runbook and `docs/jwt-auth-conversion.md`.
 `/api/logout` is registered regardless of `login_enabled` (Phase 2 Task 4b), so
 external-only deployments can still revoke tokens server-side.
 `ZT_CRED_*` entries feed the data plane's credentials list via `${VAR}`
@@ -499,6 +499,139 @@ whoever holds it can mint any `sub`/role for that issuer. It lives in the
 environment (`.env`), never in committed yaml; keep the list minimal
 (absent entry = no trust); rotate by a coordinated secret swap (config
 reload/restart) plus their token `exp` bounds.
+
+### 2.1.2 Cutover to an external JWT issuer (integrated deployment)
+
+Purpose: take the plane from **standalone** (its own `/api/login`, local
+accounts) to **integrated external-issuer-only** — the OTHER app generates
+the JWTs and this plane only CONSUMES them (the Phase 2 trust direction,
+§2.1.1). The cutover is a config + deployment change, never a code change:
+claim mapping, role vocabulary and trust all live in `configs/control.yaml`
+and `.env`. Run it only after the §2.1.1 recipe's verification passed (their
+JWT already answers `200` on `/api/me` while local login is still on).
+
+```yaml
+# configs/control.yaml — auth.jwt block, integrated (external-only) state
+jwt:
+  ...
+  allowed_origins:
+    - "https://other-app.example"   # their UI origin — ONE list for REST CORS +
+                                    # checker WS; "https://" pins the scheme; a
+                                    # non-default port must be spelled out
+  external_issuers:
+    - name: "other-app"             # §2.1.1 for the full key table
+      iss: "https://other-app.example"
+      # audience: "zt-api"          # optional — empty inherits auth.jwt.audience
+      secret: "${ZT_OTHERAPP_JWT_SECRET}"   # the ONE shared HS256 secret
+      # require_jti: true           # ABSENT = true
+      # claims: { subject: "...", role: "...", role_aliases: {...} }  # only if
+                                    # their claim names/role VALUES differ
+```
+
+1. **Add the other app as an external issuer.** Set `ZT_OTHERAPP_JWT_SECRET`
+   in `.env` to the shared secret (32+ random bytes, agreed with the other
+   app — the SAME value on both sides; rotate only by a coordinated swap)
+   and add the `external_issuers` entry above. Their JWTs then verify against
+   THEIR secret, not `auth.jwt.secret`.
+2. **Add the other app's UI origin to `auth.jwt.allowed_origins`.** Their
+   browser must be allowed to call this plane's REST APIs AND upgrade the
+   checker WebSocket cross-origin (one list, §2.1.1). Scheme-pin the entry
+   (`https://`) and spell any non-default port. Then **restart the control
+   plane** — validation fail-fasts on a bad entry (missing secret, duplicate
+   name/`iss`, `iss` == local issuer, empty-resolving audience, bad alias).
+3. **Verify while login is still enabled.** An external JWT must behave
+   exactly like a self-issued one before the local path is removed:
+   - identity — `curl -H "Authorization: Bearer <their-jwt>"
+     http://127.0.0.1:8080/api/me` → `200 {"username":"<their-sub>",
+     "role":"maker|checker"}` (401 = re-check `iss`/`audience`/`secret`/
+     `require_jti`/claim names on the entry);
+   - mint — `POST /api/token` with their JWT: maker principal → `200`
+     (read AND write presets); checker principal → `200` on read-access
+     mints, **403** on write-access mints (read-only, §3);
+   - checker WS — from their origin: `ws://<host>:8080/ws/checker?channel=
+     sess:<sid>&access_token=<their-jwt>` upgrades and streams QueryEvents.
+4. **Flip `auth.jwt.login_enabled: false`.** `/api/login` is then NOT
+   registered — the path falls through to the `/api` guard and answers 404
+   (JSON, never HTML) — so nothing self-issues local tokens anymore. With
+   login off, `auth.jwt.secret`, `auth.username/password` and `auth.users[]`
+   are NOT required — but **at least one `external_issuers` entry IS** (an
+   empty list is a load error: nothing could authenticate). Note the trust
+   mechanism: a token claiming the LOCAL `iss` only verifies while a local
+   secret is still configured (parseJWT fails closed on an empty secret) —
+   removing `ZT_JWT_SECRET` (step 6) is what makes the local issuer
+   untrusted in practice. `POST /api/logout` STAYS registered (Phase 2
+   Task 4b): external-only deployments keep an HTTP jti-revocation route.
+5. **Retire the Angular SPA.** Stop serving the built UI (drop/redirect
+   `http.static_dir` in `configs/control.yaml`, then archive or delete the
+   `web/` Angular source and its build output). The local `auth.users[]`
+   entries become inert — nothing accepts local credentials anymore.
+6. **`.env` cleanup.** Remove `ZT_AUTH_PASSWORD` (and
+   `ZT_AUTH_CHECKER_PASSWORD` if set) and `ZT_JWT_SECRET` — with the local
+   secret gone, any leftover token claiming the local `iss` fails closed —
+   `ZT_OTHERAPP_JWT_SECRET` is now the only auth secret the plane reads.
+   Confirm the end state:
+
+   ```bash
+   # /api/login is gone → 404
+   curl -s -o /dev/null -w "%{http_code}" -X POST \
+     http://127.0.0.1:8080/api/login -d '{"username":"x","password":"y"}'
+   # logout still revokes an external token → 200 {"ok":"true"}, replay → 401
+   curl -X POST -H "Authorization: Bearer <their-jwt>" \
+     http://127.0.0.1:8080/api/logout
+   ```
+
+**Rollback.** Local login comes back by flipping `auth.jwt.login_enabled`
+back to `true` (plus restoring the local secrets to `.env` if step 6 already
+removed them) and restarting — the local and external paths coexist until
+the SPA is actually retired, so the flip alone is a complete rollback at any
+point before step 5. After the SPA and `.env` cleanup are done, restoring
+standalone mode means restoring those pieces too (`auth.users[]` etc.).
+See also the interactive cutover diagram: `docs/archify/10-external-cutover.html`.
+
+### 2.1.3 Login & authentication — current model
+
+Since the JWT conversion (Phase 1, 2026-09-05) a **bearer JWT is the only
+credential** this plane accepts — no cookie, no server-side UI session.
+
+- **Local login** — `POST /api/login` is registered only while
+  `auth.jwt.login_enabled: true` (the default). It validates
+  `{username, password}` against the config accounts (`auth.username` +
+  `auth.users[]`, constant-time compares, roles required — never silently
+  defaulted) with a per-(IP, username) rate limiter, and answers
+  `200 {token, username, role, expires_in}` — `token` is a self-issued HS256
+  JWT (`iss zerotrust-proxy`, `aud zt-api`, claims `sub`/`role`/`exp`/`jti`,
+  signed with `auth.jwt.secret` / `ZT_JWT_SECRET`, life
+  `auth.jwt.ttl_seconds`, default 28800 s).
+- **Every authenticated call** sends `Authorization: Bearer <jwt>` — REST
+  only, tokens never ride URLs. `GET /api/me` → `200 {username, role}` of the
+  token. The checker WebSocket is the one exception: browsers cannot set WS
+  headers, so `GET /ws/checker?channel=<ch>&access_token=<jwt>`.
+- **Minting** (`POST /api/token`) is mint-for-self: the optional body
+  `username` must equal the JWT's `sub` (or be omitted → the subject is used);
+  there is no mint-for-others. Checker-role principals are read-only —
+  write-access mints → 403.
+- **Logout is always available.** `POST /api/logout` is registered
+  **unconditionally** (not gated by `login_enabled`): it verifies the
+  presented bearer through the issuer-aware path and denylists its `jti`
+  (`jwt:deny:<jti>` in Valkey) for the token's remaining life — replaying
+  the same token anywhere → 401. A valid token without a `jti`
+  (`require_jti: false` issuers) is refused at logout (500 — nothing to
+  revoke).
+- **External path (Phase 2)** — the other app signs the JWT (sub = their
+  user id, role `maker`|`checker`, their `iss`, `aud` = `zt-api` or the
+  entry's, `exp`, `jti` required by default) with the SHARED secret
+  (`auth.jwt.external_issuers[].secret`, §2.1.1). This plane verifies it
+  against that entry and maps claims onto the same
+  `{username, role ∈ maker|checker}` principal — vocabulary differences are
+  a config edit, never code. This plane never mints for others.
+- `login_enabled: false` removes **only** `/api/login`; the local secret and
+  credentials become optional, but ≥ 1 external issuer is required (else the
+  plane refuses to start). Full cutover procedure: §2.1.2.
+
+See also the interactive login-process diagram:
+`docs/archify/09-auth-login.html`, and Page 9
+(`docs/jwt-auth-conversion.md`) for the full role × capability matrix and
+config key table.
 
 Readiness (second terminal):
 

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Cutover — Standalone Local Login to External-Issuer-Only",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1180, 560],
+    "views": [
+      { "id": "stage-in", "label": "Stage in (login stays on)", "focus": ["s1", "s2", "s3"], "note": "Add the other app as a trusted external issuer and prove its JWTs while /api/login still works." },
+      { "id": "cut-over", "label": "Cut over + retire", "focus": ["s4", "s5", "s6"], "note": "Flip login_enabled to false, retire the SPA, and drop the local login secrets." },
+      { "id": "rollback", "label": "Rollback branch", "focus": ["s3", "s4", "rollback"], "note": "Any failed check rolls back by re-enabling local login — both paths coexist until the SPA is gone." }
+    ]
+  },
+  "components": [
+    { "id": "s1", "type": "security", "label": "1 · Add external issuer", "sublabel": "auth.jwt.external_issuers[] entry", "tag": "shared HS256 secret: ZT_OTHERAPP_JWT_SECRET", "pos": [40, 110], "size": [220, 84] },
+    { "id": "s2", "type": "frontend", "label": "2 · Allowlist their UI origin", "sublabel": "auth.jwt.allowed_origins — their UI origin", "pos": [300, 110], "size": [220, 84] },
+    { "id": "s3", "type": "security", "label": "3 · Verify external JWT", "sublabel": "me 200 · mint 200/403 · checker WS", "pos": [560, 110], "size": [220, 84] },
+    { "id": "s4", "type": "backend", "label": "4 · Flip login_enabled: false", "sublabel": "/api/login → 404 · logout stays · ≥1 issuer", "pos": [560, 330], "size": [220, 84] },
+    { "id": "s5", "type": "frontend", "label": "5 · Retire Angular SPA", "sublabel": "stop serving web/ statics — auth.users inert", "pos": [300, 330], "size": [220, 84] },
+    { "id": "s6", "type": "cloud", "label": "6 · .env cleanup", "sublabel": "drop ZT_AUTH_PASSWORD · ZT_JWT_SECRET", "tag": "keep ZT_OTHERAPP_JWT_SECRET", "pos": [40, 330], "size": [220, 84] },
+    { "id": "rollback", "type": "backend", "label": "Rollback", "sublabel": "login_enabled: true → restart — local login returns", "pos": [850, 200], "size": [280, 100] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Stage in — local login stays on (login_enabled: true)", "wraps": ["s1", "s2", "s3"], "pad": 12 },
+    { "kind": "region", "label": "Cut over — external-issuer-only", "wraps": ["s4", "s5", "s6"], "pad": 12 },
+    { "kind": "security-group", "label": "Rollback — flip login_enabled back + restart", "wraps": ["rollback"], "pad": 12 }
+  ],
+  "connections": [
+    { "id": "c12", "from": "s1", "to": "s2" },
+    { "id": "c23", "from": "s2", "to": "s3" },
+    { "id": "c34", "from": "s3", "to": "s4", "label": "all checks green", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "labelDy": 24 },
+    { "id": "c45", "from": "s4", "to": "s5" },
+    { "id": "c56", "from": "s5", "to": "s6" },
+    { "id": "rb1", "from": "s3", "to": "rollback", "variant": "security", "fromSide": "right", "toSide": "left" },
+    { "id": "rb2", "from": "s4", "to": "rollback", "variant": "security", "fromSide": "right", "toSide": "left" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Stage in while login stays on", "items": ["One shared HS256 secret, coordinated with the other app, lives in .env — never in committed yaml", "Their UI origin joins auth.jwt.allowed_origins (REST CORS + checker WS share the one list)", "Prove the external JWT end-to-end: /api/me 200, mint works (maker) / 403 write (checker), checker WS connects"] },
+    { "dot": "cyan", "title": "External-only end state", "items": ["login_enabled: false → /api/login 404s; the local issuer is no longer trusted", "/api/logout stays registered — unconditional jti revocation for external tokens", "With login off, ≥ 1 external_issuers entry is required or the plane refuses to start"] },
+    { "dot": "rose", "title": "Rollback is one config flip", "items": ["Set login_enabled back to true and restart — local login returns", "Both auth paths coexist until the SPA is retired and the local .env secrets are deleted", "Retire the SPA and clean .env only after the external path has proven itself"] }
+  ]
+}

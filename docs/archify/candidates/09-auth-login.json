@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Login & Authentication — Local Login + External JWT Paths",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 1140],
+    "views": [
+      { "id": "local-login", "label": "Local login self-issues", "focus": ["user", "ui", "cp"], "note": "POST /api/login validates credentials and signs an HS256 JWT with the local issuer." },
+      { "id": "external-path", "label": "External JWT arrives", "focus": ["other", "ui", "cp"], "note": "The other app's JWT verifies against its external_issuers entry — same principal model after claim mapping." },
+      { "id": "revocation", "label": "Logout — jti denylist", "focus": ["ui", "cp", "vk"], "note": "/api/logout is registered unconditionally: the presented token's jti is denied for its remaining life." }
+    ]
+  },
+  "participants": [
+    { "id": "user", "type": "external", "label": "User", "sublabel": "operator" },
+    { "id": "ui", "type": "frontend", "label": "App UI", "sublabel": "SPA / other-app UI" },
+    { "id": "other", "type": "external", "label": "Other app", "sublabel": "JWT issuer" },
+    { "id": "cp", "type": "backend", "label": "Control Plane", "sublabel": ":8080" },
+    { "id": "vk", "type": "database", "label": "Valkey", "sublabel": "jti denylist" }
+  ],
+  "segments": [
+    { "from": 150, "to": 295, "label": "1 · Local login — the plane self-issues (login_enabled: true)" },
+    { "from": 322, "to": 435, "label": "2 · External path — a pre-issued JWT (Phase 2)" },
+    { "from": 465, "to": 795, "label": "3 · REST calls — every one bearer-authenticated" },
+    { "from": 828, "to": 910, "label": "4 · Checker WS — bearer via ?access_token=" },
+    { "from": 935, "to": 1095, "label": "5 · Logout — unconditional jti revocation" }
+  ],
+  "messages": [
+    { "id": "login-req", "from": "ui", "to": "cp", "y": 195, "label": "POST /api/login {username, password}", "variant": "emphasis" },
+    { "id": "login-resp", "from": "cp", "to": "ui", "y": 255, "label": "200 {token: HS256 JWT, username, role, expires_in}", "variant": "return" },
+    { "id": "external-issue", "from": "other", "to": "ui", "y": 350, "label": "their login flow hands the UI a JWT — HS256 with the shared secret", "variant": "dashed" },
+    { "id": "me-call", "from": "ui", "to": "cp", "y": 505, "label": "GET /api/me · Authorization: Bearer <JWT>", "variant": "emphasis" },
+    { "id": "deny-consult", "from": "cp", "to": "vk", "y": 558, "label": "EXISTS jwt:deny:<jti> — every guarded call", "variant": "security" },
+    { "id": "deny-miss", "from": "vk", "to": "cp", "y": 600, "label": "miss (not revoked)", "variant": "return" },
+    { "id": "me-ok", "from": "cp", "to": "ui", "y": 645, "label": "200 {username, role} — same principal for local and external tokens", "variant": "return" },
+    { "id": "mint-req", "from": "ui", "to": "cp", "y": 710, "label": "POST /api/token — mint-for-self (body username == mapped sub)", "variant": "emphasis" },
+    { "id": "mint-resp", "from": "cp", "to": "ui", "y": 762, "label": "200 {token…} — checker-role write-mint → 403 (read-only)", "variant": "return" },
+    { "id": "ws-open", "from": "ui", "to": "cp", "y": 862, "label": "GET /ws/checker?channel=sess:<sid>&access_token=<JWT>", "variant": "security" },
+    { "id": "ws-live", "from": "cp", "to": "ui", "y": 902, "label": "101 upgrade → live QueryEvents (checker role + SoD check)", "variant": "return" },
+    { "id": "logout-req", "from": "ui", "to": "cp", "y": 968, "label": "POST /api/logout · Bearer — registered even when login_enabled: false", "variant": "security" },
+    { "id": "deny-write", "from": "cp", "to": "vk", "y": 1012, "label": "SET jwt:deny:<jti> — TTL = remaining token life", "variant": "security" },
+    { "id": "logout-ok", "from": "cp", "to": "ui", "y": 1052, "label": "200 {\"ok\":\"true\"} — replaying the same token → 401", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "cp", "from": 195, "to": 262, "type": "backend" },
+    { "participant": "cp", "from": 505, "to": 770, "type": "backend" },
+    { "participant": "vk", "from": 558, "to": 608, "type": "database" },
+    { "participant": "other", "from": 340, "to": 356, "type": "external" },
+    { "participant": "cp", "from": 968, "to": 1059, "type": "backend" },
+    { "participant": "vk", "from": 1012, "to": 1059, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Two ways to hold a JWT", "items": ["Local /api/login self-issues an HS256 token (iss zerotrust-proxy, local secret) when login_enabled: true", "External JWTs arrive pre-issued — verified against their external_issuers entry, claims mapped in config", "Both paths converge on the same {username, role ∈ maker|checker} principal"] },
+    { "dot": "cyan", "title": "Every call authenticates with the bearer", "items": ["REST: Authorization: Bearer <JWT> on every guarded route", "Checker WS: ?access_token=<JWT> — browsers cannot set WS headers", "Each call consults the jti denylist after signature verification (fail closed)"] },
+    { "dot": "rose", "title": "Revocation is the jti denylist", "items": ["POST /api/logout is registered unconditionally — it verifies the presented token and denies its jti", "jwt:deny:<jti> lives in Valkey for the token's remaining life; replay of the same token → 401", "login_enabled: false only removes /api/login — external-only planes keep a revocation route"] }
+  ]
+}
