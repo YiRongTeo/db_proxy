@@ -98,6 +98,30 @@ func mintExternalJWT(t *testing.T, secret, iss, aud, username, role, jti string)
 	return signed
 }
 
+// mintOtherAppJWT (Phase 2b Task 2) signs a token shaped EXACTLY like the
+// integrating app's real JWT: NO iss/aud/jti claims; the principal rides
+// "username" and the role rides "role" with the app's own capitalization
+// ("Maker"/"Checker"); "sessionId" carries the IdP login session id
+// (logs/tracing only — never a revocation key); iat/exp present. This is
+// the shape the relaxed per-issuer config (require_iss:false,
+// require_aud:false, require_jti:false + claims mapping) must accept.
+func mintOtherAppJWT(t *testing.T, secret, username, rawRole, sessionID string) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"username":  username,
+		"role":      rawRole,
+		"sessionId": sessionID,
+		"exp":       time.Now().Add(5 * time.Minute).Unix(),
+		"iat":       time.Now().Unix(),
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("mintOtherAppJWT(%s): %v", username, err)
+	}
+	return signed
+}
+
 // authHeader returns the Authorization header value for a token.
 func authHeader(token string) string {
 	return "Bearer " + token
@@ -105,7 +129,7 @@ func authHeader(token string) string {
 
 // bearerTransport is an http.RoundTripper that attaches the bearer token to
 // every request it forwards — the test-side equivalent of the SPA attaching
-// "Authorization: Bearer ***" per call. The underlying request is cloned
+// "Authorization: Bearer <jwt>" per call. The underlying request is cloned
 // so the caller's headers are never mutated.
 type bearerTransport struct {
 	base  http.RoundTripper
@@ -157,4 +181,77 @@ func loginJWT(t *testing.T, client *http.Client, base, username, password string
 		t.Fatal("POST /api/login: empty token")
 	}
 	return got.Token
+}
+
+// mapClaimsNoAud (Phase 2b) signs an external token with iss/role/sub/jti
+// but NO aud claim — the shape a require_aud:false entry must accept and a
+// strict entry must reject.
+func mapClaimsNoAud(t *testing.T, secret, iss, username, role, jti string) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"sub":  username,
+		"role": role,
+		"iss":  iss,
+		"exp":  time.Now().Add(5 * time.Minute).Unix(),
+		"iat":  time.Now().Unix(),
+	}
+	if jti != "" {
+		claims["jti"] = jti
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("mapClaimsNoAud(%s): %v", iss, err)
+	}
+	return signed
+}
+
+// mapClaimsNoSessionID (Phase 2b) signs the other-app shape (username/
+// role/sessionId claims, no iss/aud/jti) with the sessionId claim OMITTED —
+// a relaxed token whose tracing id is absent must still be accepted.
+func mapClaimsNoSessionID(t *testing.T, secret, username, rawRole string) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"username": username,
+		"role":     rawRole,
+		"exp":      time.Now().Add(5 * time.Minute).Unix(),
+		"iat":      time.Now().Unix(),
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("mapClaimsNoSessionID(%s): %v", username, err)
+	}
+	return signed
+}
+
+// reSignWithSessionIDName (Phase 2b) re-signs a token minted by
+// mintOtherAppJWT with its sessionId claim RENAMED to the given name —
+// exercising an issuer whose session-id claim has a custom name
+// (claims.session_id config). It rebuilds the payload from the raw token
+// so callers pass a token they just minted.
+func reSignWithSessionIDName(t *testing.T, raw, newName, secret string) string {
+	t.Helper()
+	parsed, _, err := jwt.NewParser(jwt.WithoutClaimsValidation()).ParseUnverified(raw, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse raw for rename: %v", err)
+	}
+	mc, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		t.Fatal("raw token claims are not MapClaims")
+	}
+	renamed := jwt.MapClaims{}
+	for k, v := range mc {
+		renamed[k] = v
+	}
+	if sid, ok := renamed["sessionId"]; ok {
+		delete(renamed, "sessionId")
+		renamed[newName] = sid
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, renamed)
+	signed, err := tok.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("reSignWithSessionIDName: %v", err)
+	}
+	return signed
 }

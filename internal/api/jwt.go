@@ -55,6 +55,12 @@ import (
 // this same struct so the denylist and logout consumers stay unchanged.
 type jwtClaims struct {
 	Role string `json:"role"`
+	// SessionID is the IdP login session id (Phase 2b): parsed from the
+	// issuer's configured session_id claim (default "sessionId") for
+	// logs/tracing and the audit login_session_id column. It is NEVER a
+	// revocation key — the logout denylist keys on jti only, and this id
+	// is explicitly not equivalent to jti (user directive 2026-09-07).
+	SessionID string `json:"sessionId,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -183,8 +189,21 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 		return nil, jwtClaims{}, errUnauthorizedJWT
 	}
 	if iss == "" {
-		// No iss claim → the token names no trust root (the local parser
-		// below also requires iss via WithIssuer, so nothing is lost).
+		// No iss claim → the token names no trust root by iss. Phase 2b:
+		// entries with an EXPLICIT require_iss: false accept iss-less
+		// tokens — try each in config order (first verification that
+		// succeeds wins; an attacker still needs a configured secret,
+		// and every candidate that fails just falls through). Entries
+		// with the strict default (nil/true) are never tried for an
+		// iss-less token.
+		for i := range j.ExternalIssuers {
+			e := &j.ExternalIssuers[i]
+			if e.RequireISS != nil && !*e.RequireISS {
+				if sess, claims, err := parseExternalJWT(raw, e); err == nil {
+					return sess, claims, nil
+				}
+			}
+		}
 		return nil, jwtClaims{}, errUnauthorizedJWT
 	}
 	// Phase 2 — resolve the issuer and verify with ITS key material.
@@ -218,12 +237,35 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 // denylist. Any failure → errUnauthorizedJWT (fail closed).
 func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Session, jwtClaims, error) {
 	// Fail closed on a half-configured entry. config.Load guarantees
-	// iss/secret non-empty and audience materialized; a hand-built cfg (in
-	// tests, or a future caller) must not bypass the same bar.
-	if e == nil || e.Iss == "" || e.Secret == "" || e.Audience == "" {
+	// iss/secret non-empty (unless require_iss explicitly relaxes) and
+	// audience materialized (unless require_aud explicitly relaxes); a
+	// hand-built cfg (in tests, or a future caller) must not bypass the
+	// same bar.
+	if e == nil || e.Secret == "" {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	requireISS := e.RequireISS == nil || *e.RequireISS // nil = TRUE (strict)
+	requireAud := e.RequireAud == nil || *e.RequireAud
+	if requireISS && e.Iss == "" {
+		return nil, jwtClaims{}, errUnauthorizedJWT
+	}
+	if requireAud && e.Audience == "" {
 		return nil, jwtClaims{}, errUnauthorizedJWT
 	}
 	claims := jwt.MapClaims{}
+	// Parser options: the iss/aud assertions are applied ONLY when this
+	// entry requires them (Phase 2b — an issuer whose tokens carry no
+	// iss/aud claim opts out per entry). exp + HS256 pin always apply.
+	opts := []jwt.ParserOption{
+		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	}
+	if requireISS {
+		opts = append(opts, jwt.WithIssuer(e.Iss))
+	}
+	if requireAud {
+		opts = append(opts, jwt.WithAudience(e.Audience))
+	}
 	tok, err := jwt.ParseWithClaims(raw, claims,
 		func(t *jwt.Token) (any, error) {
 			// Same method pin as the local path: never hand the shared
@@ -233,10 +275,7 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 			}
 			return []byte(e.Secret), nil
 		},
-		jwt.WithIssuer(e.Iss),
-		jwt.WithAudience(e.Audience),
-		jwt.WithExpirationRequired(),
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		opts...,
 	)
 	if err != nil || !tok.Valid {
 		return nil, jwtClaims{}, errUnauthorizedJWT
@@ -257,8 +296,9 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 		jti = ""
 	}
 	// Claim mapping: zero config values mean the defaults (sub/role claim
-	// names; identity role translation). The issuer's JWT shape is adapted
-	// HERE — a different claim vocabulary is a config edit, never code.
+	// names; identity role translation; sessionId claim name). The
+	// issuer's JWT shape is adapted HERE — a different claim vocabulary
+	// is a config edit, never code.
 	m := e.Claims
 	subName := m.Subject
 	if subName == "" {
@@ -268,20 +308,39 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 	if roleName == "" {
 		roleName = "role"
 	}
+	sidName := m.SessionID
+	if sidName == "" {
+		sidName = "sessionId"
+	}
 	username, _ := claims[subName].(string)
 	if username == "" {
 		return nil, jwtClaims{}, errUnauthorizedJWT // no anonymous principals
 	}
 	rawRole, _ := claims[roleName].(string)
+	// Role alias lookup is CASE-INSENSITIVE: viper lowercases config map
+	// keys (an alias written "Maker" arrives as "maker"), so exact ==
+	// would never match a token's literal "Maker" value. Try the exact
+	// key first, then an EqualFold scan (Phase 2b Task 2).
 	role, aliased := m.RoleAliases[rawRole]
+	if !aliased {
+		for k, v := range m.RoleAliases {
+			if strings.EqualFold(k, rawRole) {
+				role = v
+				aliased = true
+				break
+			}
+		}
+	}
 	if !aliased {
 		role = rawRole // identity translation for values the operator did not alias
 	}
 	if role != "maker" && role != "checker" {
 		return nil, jwtClaims{}, errUnauthorizedJWT // role absent / unaliased non-canonical → reject (never a superuser)
 	}
-	return &models.Session{Username: username, Role: role}, jwtClaims{
-		Role: role,
+	sid, _ := claims[sidName].(string)
+	return &models.Session{Username: username, Role: role, LoginSessionID: sid}, jwtClaims{
+		Role:      role,
+		SessionID: sid,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   username,
 			Issuer:    e.Iss,

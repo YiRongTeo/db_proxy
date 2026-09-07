@@ -145,4 +145,12 @@ type QueryEvent struct {
 type Session struct {
 	Username string `json:"username"`
 	Role     string `json:"role,omitempty"` // "maker" | "checker"
+	// LoginSessionID (Phase 2b) is the IdP login session id from an
+	// external issuer's session_id claim (default name "sessionId"),
+	// carried on the principal so mint handlers can stamp it onto audit
+	// rows (zt_audit.sessions.login_session_id) — the trace from a DB
+	// session back to the login that requested it. It is NEVER a
+	// revocation key (the denylist keys on jti only) and is empty for
+	// local self-issued tokens (no IdP session in play).
+	LoginSessionID string `json:"loginSessionId,omitempty"`
 }
