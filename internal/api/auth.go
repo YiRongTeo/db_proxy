@@ -230,7 +230,10 @@ func (a *authMiddleware) handleMe(w http.ResponseWriter, r *http.Request) {
 // jti lands on the same denylist requireJWT consults. A missing or
 // unverifiable bearer is rejected 401 (nothing to revoke, nothing leaked);
 // a denylist write failure answers 500 — silent logout would leave the
-// token live while the SPA believes it is gone.
+// token live while the SPA believes it is gone. A VALID token without a
+// jti (Phase 2b: an external issuer with require_jti:false) answers 200
+// {"ok":"true","revoked":false} + a warn log — nothing server-side exists
+// to revoke, the caller discards it client-side, and it lives until exp.
 func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 	raw := bearerToken(r)
 	if raw == "" {
@@ -243,10 +246,17 @@ func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims.ID == "" {
-		// A valid token without a jti cannot be revoked — fail loudly
-		// instead of pretending the logout happened.
-		a.log.Error("logout: token carries no jti — cannot revoke")
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		// A valid token WITHOUT a jti cannot be revoked server-side (no
+		// denylist key). Phase 2b: the integrating app's tokens are
+		// jti-less by design (require_jti:false — operator-chosen, their
+		// sessionId is NOT a revocation key), so this is an expected
+		// state, not an error. Answer 200 revoked:false: the caller
+		// discards the token client-side; it remains valid until exp
+		// (short exp on their tokens is the mitigation). Warn loudly so
+		// operators see un-revocable logouts in the logs.
+		a.log.Warn("logout: token carries no jti — nothing revoked server-side; token lives until exp",
+			"username", sess.Username, "role", sess.Role)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": "true", "revoked": false})
 		return
 	}
 	// Deny for the token's remaining life (floor 1s): parseJWT already
@@ -260,5 +270,5 @@ func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": "true", "revoked": true})
 }

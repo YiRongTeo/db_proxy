@@ -16,10 +16,16 @@ package api
 // for consistency with the sibling tests where a store exists.
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"zerotrust-proxy/internal/config"
+	"zerotrust-proxy/internal/store"
 )
 
 // extWithRequireISS / extWithRequireAud: *bool opts for the relaxed
@@ -227,5 +233,125 @@ func TestSessionIDAbsentIsEmpty(t *testing.T) {
 	}
 	if sess.LoginSessionID != "" {
 		t.Errorf("LoginSessionID = %q, want empty when the claim is absent", sess.LoginSessionID)
+	}
+}
+
+// newPhase2bServer builds a full HTTP Control Plane mux whose JWT config
+// trusts the REAL other-app issuer (relaxed: no iss/aud/jti required)
+// alongside local login — the deployment the integration produces.
+func newPhase2bServer(t *testing.T) (*httptest.Server, *http.Client, *config.ControlConfig) {
+	t.Helper()
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	jwt := testJWTBlock()
+	jwt.LoginEnabled = true
+	jwt.ExternalIssuers = []config.ExternalIssuerConfig{otherAppIssuer()}
+	cfg := &config.ControlConfig{
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          jwt,
+		SessionTTL:   8,
+		TokenTTL:     60,
+		StaticDir:    t.TempDir(),
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
+	t.Cleanup(srv.Close)
+	return srv, &http.Client{}, cfg
+}
+
+// TestLogoutJtiLessTokenRevokedFalse (Phase 2b Task 3): a VALID jti-less
+// external token (the integrating app's real shape) logged out over HTTP →
+// 200 {"ok":"true","revoked":false} — nothing server-side exists to
+// revoke, and the token REMAINS usable until exp (client-side discard is
+// the only revocation; the warn log records the un-revocable logout).
+func TestLogoutJtiLessTokenRevokedFalse(t *testing.T) {
+	srv, client, _ := newPhase2bServer(t)
+	tok := mintOtherAppJWT(t, testExtSecret, "alice", "Maker", "sess-logout-1")
+	authed := withBearer(client, tok)
+
+	// Pre-logout: the token works.
+	me, err := authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me before logout: %v", err)
+	}
+	me.Body.Close()
+	if me.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/me before logout: status %d, want 200", me.StatusCode)
+	}
+
+	resp, body := logoutBearer(t, authed, srv.URL, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout of jti-less token: status %d, want 200 (revoked:false contract)", resp.StatusCode)
+	}
+	if !strings.Contains(body, `"ok":"true"`) || !strings.Contains(body, `"revoked":false`) {
+		t.Errorf("logout body = %s, want {\"ok\":\"true\",\"revoked\":false}", body)
+	}
+
+	// The token is NOT deniable — it still works (documented semantics:
+	// no jti → nothing on the denylist; lives until exp).
+	me, err = authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me after jti-less logout: %v", err)
+	}
+	me.Body.Close()
+	if me.StatusCode != http.StatusOK {
+		t.Errorf("GET /api/me after jti-less logout: status %d, want 200 (un-revocable token lives until exp)", me.StatusCode)
+	}
+}
+
+// TestLogoutWithJtiStillRevokes (Phase 2b Task 3 regression): the WITH-jti
+// path is unchanged — logout returns 200 {"ok":"true","revoked":true} and
+// the token is denylisted (replay 401). Guards against the revoked:false
+// branch widening to tokens that CAN be revoked. Uses a strict external
+// entry (iss/aud/jti required) so the with-jti denylist path is exercised.
+func TestLogoutWithJtiStillRevokes(t *testing.T) {
+	vs, err := store.NewValkeyStore(context.Background(), store.StoreOptions{Addrs: []string{"127.0.0.1:6379"}})
+	if err != nil {
+		t.Fatalf("NewValkeyStore: %v", err)
+	}
+	t.Cleanup(vs.Close)
+	jwt := testJWTBlock()
+	jwt.LoginEnabled = true
+	jwt.ExternalIssuers = []config.ExternalIssuerConfig{
+		extIssuer("strict-app", testExtIssuer, testExtSecret),
+	}
+	cfg := &config.ControlConfig{
+		AuthUser:     testJWTUser,
+		AuthPassword: testJWTPassword,
+		AuthRole:     "maker",
+		JWT:          jwt,
+		SessionTTL:   8,
+		TokenTTL:     60,
+		StaticDir:    t.TempDir(),
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewAPI(log, cfg, vs, nil).Routes())
+	t.Cleanup(srv.Close)
+	client := &http.Client{}
+
+	jti := randomJTI(t)
+	tok := mintExternalJWT(t, testExtSecret, testExtIssuer, testJWTAudience, "alice", "maker", jti)
+	authed := withBearer(client, tok)
+
+	resp, body := logoutBearer(t, authed, srv.URL, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout of jti-bearing token: status %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, `"ok":"true"`) || !strings.Contains(body, `"revoked":true`) {
+		t.Errorf("logout body = %s, want {\"ok\":\"true\",\"revoked\":true}", body)
+	}
+	// Replay → 401 (denylisted).
+	me, err := authed.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatalf("GET /api/me after logout: %v", err)
+	}
+	me.Body.Close()
+	if me.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /api/me with revoked token: status %d, want 401", me.StatusCode)
 	}
 }
