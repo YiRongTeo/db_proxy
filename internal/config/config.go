@@ -224,15 +224,40 @@ type JWTConfig struct {
 // start). require_jti is a *bool so an ABSENT field (nil) is
 // distinguishable from an EXPLICIT false: absent defaults to TRUE (external
 // tokens must be deniable — the denylist needs a jti to revoke), explicit
-// false is allowed for issuers that cannot mint jti claims. Claims (zero =
-// defaults: subject "sub", role "role", identity aliases) adapts
-// verification to the issuer's JWT shape without code changes.
+// false is allowed for issuers that cannot mint jti claims. require_iss and
+// require_aud follow the same *bool pattern (Phase 2b Task 1): absent
+// (nil) defaults to TRUE — the issuer's tokens are asserted to carry this
+// entry's iss and pass aud verification — while an EXPLICIT require_iss:
+// false relaxes the iss demand (the issuer's tokens may OMIT iss; iss-less
+// tokens are resolved by trying this entry's secret in config order) and an
+// EXPLICIT require_aud: false relaxes the aud demand (the token's aud is
+// NOT asserted; an unresolved empty audience is then fine instead of a load
+// error). Validation materializes both nil flags to TRUE and keeps the iss
+// uniqueness + no-local-shadow checks on every entry that DOES carry an
+// iss. Claims (zero = defaults: subject "sub", role "role", session_id
+// "sessionId", identity aliases) adapts verification to the issuer's JWT
+// shape without code changes.
 type ExternalIssuerConfig struct {
 	Name       string             `mapstructure:"name"`
 	Iss        string             `mapstructure:"iss"`
 	Audience   string             `mapstructure:"audience"`
 	Secret     string             `mapstructure:"secret"`
 	RequireJTI *bool              `mapstructure:"require_jti"`
+	// RequireISS *bool (mapstructure "require_iss"): ABSENT (nil) = TRUE —
+	// external tokens must carry this entry's iss (iss required at load,
+	// asserted at verification). An EXPLICIT require_iss: false means the
+	// issuer's tokens may OMIT iss — resolution tries this entry's secret
+	// for iss-less tokens (config order). If a relaxed entry still pins an
+	// iss, it remains subject to the uniqueness and no-local-shadow checks
+	// (an iss that IS present must never collide or shadow).
+	RequireISS *bool `mapstructure:"require_iss"`
+	// RequireAud *bool (mapstructure "require_aud"): ABSENT (nil) = TRUE —
+	// the token's aud is asserted against the resolved audience, and an
+	// entry resolving to an EMPTY audience is a load error (nothing it
+	// mints could verify). An EXPLICIT require_aud: false means the token's
+	// aud is NOT asserted (issuers whose tokens carry no aud claim); an
+	// unresolved empty audience is then fine.
+	RequireAud *bool              `mapstructure:"require_aud"`
 	Claims     ClaimMappingConfig `mapstructure:"claims"`
 }
 
@@ -240,13 +265,25 @@ type ExternalIssuerConfig struct {
 // principal model (username + maker|checker role). ZERO VALUES mean the
 // defaults and are left zero by validation — downstream consumers apply
 // them: Subject "" = the "sub" claim, Role "" = the "role" claim,
-// RoleAliases nil = identity translation. RoleAliases translates raw
+// SessionID "" = the "sessionId" claim (the IdP login session id, carried
+// for logs/tracing only — never a revocation key), RoleAliases nil =
+// identity translation. RoleAliases translates raw
 // role-claim VALUES to canonical roles ("some-svc-admin": "checker") —
 // every declared VALUE must be "maker" or "checker" (validated at load);
-// KEYS must be non-empty.
+// KEYS must be non-empty. KEY MATCHING IS CASE-INSENSITIVE at runtime:
+// viper lowercases config map keys, so an alias written as
+// "Maker": "maker" arrives here as "maker": "maker" — downstream must
+// match the token's raw role value with EqualFold against the alias
+// keys, not exact == (Phase 2b Task 2).
 type ClaimMappingConfig struct {
 	Subject     string            `mapstructure:"subject"`
 	Role        string            `mapstructure:"role"`
+	// SessionID names the claim carrying the IdP login session id
+	// (mapstructure "session_id"); empty = the consumer-side default
+	// "sessionId" — config stores it verbatim, downstream applies the
+	// default (mirrors the Subject/Role zero-value pattern). Distinct from
+	// the gateway's OWN DB-session id and never used for revocation.
+	SessionID   string            `mapstructure:"session_id"`
 	RoleAliases map[string]string `mapstructure:"role_aliases"`
 }
 
@@ -596,23 +633,31 @@ func LoadControl(path string) (*ControlConfig, error) {
 				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].name %q duplicates external_issuers[%d]", i, e.Name, j)
 			}
 			seen[e.Name] = i
-			// iss: required and must not claim the LOCAL issuer — an
-			// external entry for auth.jwt.issuer would shadow the
-			// self-issued login tokens (ambiguous trust).
-			if e.Iss == "" {
-				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss (%s) is required", i, e.Name)
+			// iss: required UNLESS require_iss is explicitly false (Phase
+			// 2b — the other app's JWT omits iss entirely; nil/absent
+			// keeps the strict default). An entry that opts out must not
+			// claim the LOCAL issuer either — a require_iss:false entry
+			// with iss == auth.jwt.issuer would shadow self-issued
+			// tokens for any token that DOES carry an iss.
+			relaxedIss := e.RequireISS != nil && !*e.RequireISS
+			if e.Iss == "" && !relaxedIss {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss (%s) is required (or set require_iss: false to accept iss-less tokens from this issuer)", i, e.Name)
 			}
-			if e.Iss == cfg.JWT.Issuer {
-				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q must not equal the local auth.jwt.issuer (an external issuer claiming the local iss would shadow self-issued tokens)", i, e.Iss)
+			// Shadow + uniqueness checks apply to every entry that
+			// CARRIES an iss (an iss-less entry has nothing to collide).
+			if e.Iss != "" {
+				if e.Iss == cfg.JWT.Issuer {
+					return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q must not equal the local auth.jwt.issuer (an external issuer claiming the local iss would shadow self-issued tokens)", i, e.Iss)
+				}
+				// iss: unique across entries — verification resolves a token
+				// to its entry BY iss, so two entries sharing one would
+				// resolve first-match-deterministically and the second
+				// issuer's tokens would 401 forever with zero log clue.
+				if j, dup := seenIss[e.Iss]; dup {
+					return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q duplicates external_issuers[%d]", i, e.Iss, j)
+				}
+				seenIss[e.Iss] = i
 			}
-			// iss: unique across entries — verification resolves a token
-			// to its entry BY iss, so two entries sharing one would
-			// resolve first-match-deterministically and the second
-			// issuer's tokens would 401 forever with zero log clue.
-			if j, dup := seenIss[e.Iss]; dup {
-				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].iss %q duplicates external_issuers[%d]", i, e.Iss, j)
-			}
-			seenIss[e.Iss] = i
 			// audience: optional per issuer — empty inherits the
 			// TOP-LEVEL audience, resolved HERE at validation time (not
 			// load time), so a later auth.jwt.audience edit re-defaults
@@ -624,9 +669,13 @@ func LoadControl(path string) (*ControlConfig, error) {
 			// pin AND no top-level auth.jwt.audience) can never pass aud
 			// verification — every token from it 401s fail-closed at
 			// runtime (parseExternalJWT refuses an empty audience). Fail
-			// here instead of booting a trust root nothing can use.
-			if e.Audience == "" {
-				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].audience (%s): empty and auth.jwt.audience is unset — external tokens from this issuer could never verify (set the entry's audience or the top-level auth.jwt.audience)", i, e.Name)
+			// here instead of booting a trust root nothing can use —
+			// UNLESS require_aud is explicitly false (Phase 2b: the
+			// other app's JWT carries no aud; the entry opts out of aud
+			// assertion and an empty value is then fine).
+			relaxedAud := e.RequireAud != nil && !*e.RequireAud
+			if e.Audience == "" && !relaxedAud {
+				return nil, fmt.Errorf("auth.jwt.external_issuers[%d].audience (%s): empty and auth.jwt.audience is unset — external tokens from this issuer could never verify (set the entry's audience or the top-level auth.jwt.audience, or set require_aud: false to accept tokens without aud)", i, e.Name)
 			}
 			// secret: ${VAR}-expandable, same fail-fast rule as the local
 			// auth.jwt.secret and the auth.users passwords.
@@ -644,6 +693,19 @@ func LoadControl(path string) (*ControlConfig, error) {
 			if e.RequireJTI == nil {
 				t := true
 				e.RequireJTI = &t
+			}
+			// require_iss / require_aud ABSENT (nil) default to TRUE —
+			// same *bool materialization pattern as require_jti: the
+			// strict default (iss/aud asserted) unless the operator
+			// explicitly opts out per issuer (Phase 2b — the other
+			// app's JWT carries neither claim).
+			if e.RequireISS == nil {
+				t := true
+				e.RequireISS = &t
+			}
+			if e.RequireAud == nil {
+				t := true
+				e.RequireAud = &t
 			}
 			// claims.role_aliases: every VALUE must be a canonical role;
 			// KEYS (the raw values found in the issuer's tokens) must be

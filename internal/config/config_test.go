@@ -2045,6 +2045,59 @@ auth:
         audience: "zt-other"
         secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
 `
+	// Phase 2b Task 1 relaxation fixtures (the other app's real JWT shape
+	// has NO iss/aud/jti claims — require_iss/require_aud opt out per
+	// issuer). noIssRelaxed omits the iss KEY entirely; emptyIssRelaxed
+	// declares it empty — both must resolve identically.
+	noIssRelaxed := `      - name: "other-app"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+`
+	emptyIssRelaxed := `      - name: "other-app"
+        iss: ""
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+`
+	dupIssRelaxed := `      - name: "app-a"
+        iss: "https://same-iss.example"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+      - name: "app-b"
+        iss: "https://same-iss.example"
+        secret: "b-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+`
+	shadowIssRelaxed := `      - name: "other-app"
+        iss: "zerotrust-proxy"
+        secret: "a-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+`
+	// noAudRelaxed: NO audience pin, NO top-level audience, aud not
+	// enforced — the resolved-empty audience must NOT be a load error.
+	noAudRelaxed := `      - name: "other-app"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+        require_aud: false
+`
+	audRelaxed := `      - name: "other-app"
+        iss: "https://other-app.example"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+        require_aud: false
+`
+	// realShape: the other app's actual config — no iss/aud/jti lines,
+	// claims map username/role(Maker|Checker)/sessionId.
+	realShape := `      - name: "other-app-real"
+        secret: "ext-secret-0123456789abcdefghijklmnopqrstuv"
+        require_iss: false
+        require_aud: false
+        require_jti: false
+        claims:
+          subject: "username"
+          role: "role"
+          session_id: "sessionId"
+          role_aliases:
+            "Maker": "maker"
+            "Checker": "checker"
+`
 
 	tests := []struct {
 		name    string
@@ -2126,6 +2179,43 @@ auth:
 			name: "external issuer with NO top-level audience but its OWN audience pin loads",
 			yaml: noTopAudBase + ext + pinnedAud,
 		},
+		// Phase 2b relaxation cases (the other app's JWT has NO iss/aud/jti).
+		{
+			name: "require_iss absent + empty iss fails fast (strict default)",
+			yaml: header + ext + emptyIss,
+			// emptyIss fixture has NO require_iss → iss still required.
+			wantErr: "external_issuers[0].iss",
+		},
+		{
+			name: "require_iss false + iss KEY omitted loads (iss-less issuer)",
+			yaml: header + ext + noIssRelaxed,
+		},
+		{
+			name: "require_iss false + declared-empty iss loads identically",
+			yaml: header + ext + emptyIssRelaxed,
+		},
+		{
+			name:    "require_iss false entry carrying a DUPLICATE iss still fails fast",
+			yaml:    header + ext + dupIssRelaxed,
+			wantErr: "external_issuers[1].iss",
+		},
+		{
+			name:    "require_iss false entry with iss == local issuer still fails fast",
+			yaml:    header + ext + shadowIssRelaxed,
+			wantErr: "shadow",
+		},
+		{
+			name: "require_aud false + NO audience anywhere loads (aud not asserted)",
+			yaml: noTopAudBase + ext + noAudRelaxed,
+		},
+		{
+			name: "require_aud false + audience present loads",
+			yaml: noTopAudBase + ext + audRelaxed,
+		},
+		{
+			name: "REAL other-app shape loads (no iss/aud/jti; username role Maker/Checker sessionId)",
+			yaml: header + ext + realShape,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2179,7 +2269,17 @@ auth:
 		} else if !*e.RequireJTI {
 			t.Error("RequireJTI = false, want default true when the field is absent")
 		}
-		if e.Claims.Subject != "" || e.Claims.Role != "" || len(e.Claims.RoleAliases) != 0 {
+		if e.RequireISS == nil {
+			t.Error("RequireISS = nil, want default true (absent field)")
+		} else if !*e.RequireISS {
+			t.Error("RequireISS = false, want default true when the field is absent")
+		}
+		if e.RequireAud == nil {
+			t.Error("RequireAud = nil, want default true (absent field)")
+		} else if !*e.RequireAud {
+			t.Error("RequireAud = false, want default true when the field is absent")
+		}
+		if e.Claims.Subject != "" || e.Claims.Role != "" || len(e.Claims.RoleAliases) != 0 || e.Claims.SessionID != "" {
 			t.Errorf("Claims = %+v, want zero values (downstream applies sub/role/identity defaults)", e.Claims)
 		}
 	})
@@ -2207,6 +2307,36 @@ auth:
 		}
 		if len(e.Claims.RoleAliases) != 2 || e.Claims.RoleAliases["svc_maker"] != "maker" || e.Claims.RoleAliases["svc_checker"] != "checker" {
 			t.Errorf("RoleAliases = %v, want {svc_maker:maker svc_checker:checker}", e.Claims.RoleAliases)
+		}
+	})
+
+	t.Run("resolved: relaxed flags false stay false, session_id claim lands", func(t *testing.T) {
+		cfg, err := LoadControl(writeTempConfig(t, header+ext+realShape))
+		if err != nil {
+			t.Fatalf("LoadControl: %v", err)
+		}
+		e := cfg.JWT.ExternalIssuers[0]
+		if e.Name != "other-app-real" {
+			t.Errorf("Name = %q, want other-app-real", e.Name)
+		}
+		if e.RequireISS == nil || *e.RequireISS {
+			t.Errorf("RequireISS = %v, want explicit false preserved", e.RequireISS)
+		}
+		if e.RequireAud == nil || *e.RequireAud {
+			t.Errorf("RequireAud = %v, want explicit false preserved", e.RequireAud)
+		}
+		if e.RequireJTI == nil || *e.RequireJTI {
+			t.Errorf("RequireJTI = %v, want explicit false preserved", e.RequireJTI)
+		}
+		if e.Claims.Subject != "username" || e.Claims.Role != "role" || e.Claims.SessionID != "sessionId" {
+			t.Errorf("Claims = %+v, want subject=username role=role session_id=sessionId", e.Claims)
+		}
+		if e.Claims.RoleAliases["maker"] != "maker" || e.Claims.RoleAliases["checker"] != "checker" {
+			// NOTE: viper lowercases config map keys — "Maker"/"Checker"
+			// as written arrive here as "maker"/"checker". Runtime alias
+			// matching must therefore be CASE-INSENSITIVE (Task 2) so a
+			// token's literal "Maker"/"Checker" role values still map.
+			t.Errorf("RoleAliases = %v, want {maker:maker checker:checker} (viper-lowercased keys)", e.Claims.RoleAliases)
 		}
 	})
 

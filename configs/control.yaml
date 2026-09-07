@@ -123,15 +123,33 @@ auth:
     # external_issuers:
     #   - name: "other-app"
     #     iss: "https://other-app.example"        # MUST match the JWT iss claim
+    #                                             # (OMIT iss + set require_iss: false for
+    #                                             # issuers whose JWT carries no iss claim)
     #     audience: "zt-api"                       # optional; default = top-level audience
     #     secret: "${ZT_OTHERAPP_JWT_SECRET}"      # HS256 shared secret (set in .env)
-    #     require_jti: true                        # token without jti -> 401 (default true)
+    #     require_iss: true                        # token without iss -> 401 (default true;
+    #                                             #  false = iss-less tokens tried against this
+    #                                             #  entry's secret in config order)
+    #     require_aud: true                        # token aud must match (default true;
+    #                                             #  false = aud NOT asserted — for JWTs
+    #                                             #  carrying no aud claim; then an empty
+    #                                             #  audience is no longer a load error)
+    #     require_jti: true                        # token without jti -> 401 (default true;
+    #                                             #  false = jti-less tokens accepted — they
+    #                                             #  are NOT server-side revocable; logout
+    #                                             #  returns 200 {"ok":"true","revoked":false})
     #     claims:                                  # OPTIONAL claim mapping (zero = defaults)
-    #       subject: "sub"                         # claim carrying the username (default "sub")
+    #       subject: "username"                    # claim carrying the username (default "sub")
     #       role: "role"                           # claim carrying the role (default "role")
-    #       role_aliases:                          # raw value -> maker|checker (default: identity)
-    #         approver: checker                    # non-identity example; canonical maker/checker
-    #                                              # values need NO alias
+    #       session_id: "sessionId"                # IdP login session id — parsed for
+    #                                             #  logs/tracing + the audit login_session_id
+    #                                             #  column; NEVER a revocation key
+    #       role_aliases:                          # raw value -> maker|checker (default:
+    #                                             #  identity; matching is CASE-INSENSITIVE —
+    #                                             #  viper lowercases keys, so "Maker" and
+    #                                             #  "maker" both map maker)
+    #         Maker: maker
+    #         Checker: checker
   # session_ttl_hours is INERT LEGACY RESIDUE of the cookie-session era: it
   # is still parsed (default 8) into an UNUSED ControlConfig.SessionTTL
   # field for backward compatibility, but NOTHING consumes it — the live
