@@ -67,31 +67,32 @@ func dropDatabase(t *testing.T, name string) {
 
 // auditRow is a decoded sessions row for assertions.
 type auditRow struct {
-	sessionID string
-	username  string
-	ticketID  string
-	dbType    string
-	dbUser    string
-	db        string
-	access    string
-	checker   sql.NullString
-	status    string
-	startedAt sql.NullTime
-	endedAt   sql.NullTime
-	lastSeen  time.Time
-	createdAt time.Time
+	sessionID      string
+	username       string
+	ticketID       string
+	dbType         string
+	dbUser         string
+	db             string
+	access         string
+	checker        sql.NullString
+	status         string
+	startedAt      sql.NullTime
+	endedAt        sql.NullTime
+	loginSessionID sql.NullString // Phase 2b: IdP login session id (NULL for local logins)
+	lastSeen       time.Time
+	createdAt      time.Time
 }
 
 // fetchRow SELECTs the session row from the writer's table.
 func fetchRow(t *testing.T, w *Writer, sid string) auditRow {
 	t.Helper()
 	q := "SELECT `session_id`, `username`, `ticket_id`, `db_type`, `db_user`, `db`, `access`, " +
-		"`checker_username`, `status`, `started_at`, `ended_at`, `last_seen`, `created_at` FROM " +
+		"`checker_username`, `status`, `started_at`, `ended_at`, `login_session_id`, `last_seen`, `created_at` FROM " +
 		w.tbl + " WHERE `session_id` = ?"
 	var r auditRow
 	err := w.db.QueryRowContext(context.Background(), q, sid).Scan(
 		&r.sessionID, &r.username, &r.ticketID, &r.dbType, &r.dbUser, &r.db, &r.access,
-		&r.checker, &r.status, &r.startedAt, &r.endedAt, &r.lastSeen, &r.createdAt)
+		&r.checker, &r.status, &r.startedAt, &r.endedAt, &r.loginSessionID, &r.lastSeen, &r.createdAt)
 	if err != nil {
 		t.Fatalf("SELECT audit row %s: %v", sid, err)
 	}
@@ -137,6 +138,112 @@ func TestNewWriterCreatesSchema(t *testing.T) {
 	if n != 1 {
 		t.Errorf("sessions table in throwaway db: count = %d, want 1", n)
 	}
+}
+
+// TestLoginSessionIDPersisted (Phase 2b Task 4): UpsertSession with a
+// LoginSessionID writes it into the row (external JWT mint → the trace to
+// the IdP login); an empty LoginSessionID lands NULL (local login).
+func TestLoginSessionIDPersisted(t *testing.T) {
+	w := newLiveWriter(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// External-issuer mint: session carries the IdP login session id.
+	if err := w.UpsertSession(ctx, SessionRecord{
+		SessionID:      "sid-ext-1",
+		Username:       "alice",
+		TicketID:       "T-EXT-1",
+		DBType:         "mysql",
+		DBUser:         "rw_user",
+		Access:         "write",
+		LoginSessionID: "sess-login-abc123",
+		LastSeen:       now,
+	}); err != nil {
+		t.Fatalf("UpsertSession with login session id: %v", err)
+	}
+	r := fetchRow(t, w, "sid-ext-1")
+	if !r.loginSessionID.Valid || r.loginSessionID.String != "sess-login-abc123" {
+		t.Errorf("login_session_id = %+v, want sess-login-abc123", r.loginSessionID)
+	}
+
+	// Local login: no IdP session → NULL in the row.
+	if err := w.UpsertSession(ctx, SessionRecord{
+		SessionID: "sid-local-1",
+		Username:  "admin",
+		TicketID:  "T-LOCAL-1",
+		DBType:    "postgres",
+		DBUser:    "ro_user",
+		Access:    "read",
+		LastSeen:  now,
+	}); err != nil {
+		t.Fatalf("UpsertSession without login session id: %v", err)
+	}
+	r2 := fetchRow(t, w, "sid-local-1")
+	if r2.loginSessionID.Valid {
+		t.Errorf("login_session_id = %q, want NULL for a local login", r2.loginSessionID.String)
+	}
+}
+
+// TestLoginSessionIDMigration (Phase 2b Task 4): NewWriter against a
+// PRE-EXISTING table created WITHOUT the login_session_id column adds it
+// (the ALTER path — CREATE TABLE IF NOT EXISTS alone would never touch a
+// legacy table). Idempotent: a second NewWriter run sees the column and
+// skips the ALTER.
+func TestLoginSessionIDMigration(t *testing.T) {
+	t.Helper()
+	// Create a LEGACY-shape table (no login_session_id) in a throwaway db.
+	name := fmt.Sprintf("zt_audit_legacy_%d", time.Now().UnixNano()%1_000_000_000)
+	root, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/", liveUser, livePass, liveHost, livePort))
+	if err != nil {
+		t.Fatalf("root open: %v", err)
+	}
+	t.Cleanup(func() { root.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := root.ExecContext(ctx, "CREATE DATABASE `"+name+"`"); err != nil {
+		t.Fatalf("create legacy db: %v", err)
+	}
+	t.Cleanup(func() {
+		dc, dcCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcCancel()
+		_, _ = root.ExecContext(dc, "DROP DATABASE IF EXISTS `"+name+"`")
+	})
+	legacyCols := "(`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `session_id` VARCHAR(64) NOT NULL UNIQUE, " +
+		"`username` VARCHAR(128) NOT NULL, `ticket_id` VARCHAR(128) NOT NULL DEFAULT '', " +
+		"`db_type` VARCHAR(16) NOT NULL DEFAULT '', `db_user` VARCHAR(128) NOT NULL DEFAULT '', " +
+		"`db` VARCHAR(128) NOT NULL DEFAULT '', `access` VARCHAR(8) NOT NULL DEFAULT 'read', " +
+		"`checker_username` VARCHAR(128) NULL, `status` VARCHAR(16) NOT NULL DEFAULT 'pending', " +
+		"`started_at` DATETIME(3) NULL, `ended_at` DATETIME(3) NULL, " +
+		"`last_seen` DATETIME(3) NOT NULL, `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), " +
+		"INDEX `idx_status` (`status`), INDEX `idx_username` (`username`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+	if _, err := root.ExecContext(ctx, "CREATE TABLE `"+name+"`.`sessions` "+legacyCols); err != nil {
+		t.Fatalf("create legacy sessions table: %v", err)
+	}
+
+	// NewWriter against the legacy table must ADD the column (migration).
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w, err := NewWriter(log, Config{Host: liveHost, Port: livePort, User: liveUser, Password: livePass, Database: name})
+	if err != nil {
+		t.Fatalf("NewWriter on legacy table: %v", err)
+	}
+	defer w.Close()
+
+	var colCount int
+	if err := w.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'sessions' AND COLUMN_NAME = 'login_session_id'",
+		name).Scan(&colCount); err != nil {
+		t.Fatalf("column probe after migration: %v", err)
+	}
+	if colCount != 1 {
+		t.Fatalf("login_session_id column count after NewWriter = %d, want 1 (migration ran)", colCount)
+	}
+
+	// Idempotency: a second NewWriter run must not error on the ALTER.
+	w2, err := NewWriter(log, Config{Host: liveHost, Port: livePort, User: liveUser, Password: livePass, Database: name})
+	if err != nil {
+		t.Fatalf("second NewWriter (idempotency): %v", err)
+	}
+	w2.Close()
 }
 
 // TestNewWriterFailFasts: missing fields, an unreachable host and a bad

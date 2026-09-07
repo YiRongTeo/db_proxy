@@ -67,6 +67,7 @@ const tableColumns = "(" +
 	"`status` VARCHAR(16) NOT NULL DEFAULT 'pending', " +
 	"`started_at` DATETIME(3) NULL, " +
 	"`ended_at` DATETIME(3) NULL, " +
+	"`login_session_id` VARCHAR(128) NULL, " + // Phase 2b: the IdP login session id (external JWTs' sessionId claim) — traces a DB session to the login that requested it; NULL for local logins
 	"`last_seen` DATETIME(3) NOT NULL, " +
 	"`created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), " +
 	"INDEX `idx_status` (`status`), " +
@@ -106,6 +107,21 @@ func NewWriter(log *slog.Logger, cfg Config) (*Writer, error) {
 	}
 	if _, err := setup.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+dbName+".`sessions` "+tableColumns); err != nil {
 		return nil, fmt.Errorf("audit mysql create table: %w", err)
+	}
+	// Phase 2b migration: pre-existing tables (created before the
+	// login_session_id column) lack it — CREATE TABLE IF NOT EXISTS is a
+	// no-op for them. Probe information_schema and ALTER when the column
+	// is missing. Idempotent: a second run sees the column and skips.
+	var colCount int
+	if err := setup.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'sessions' AND COLUMN_NAME = 'login_session_id'",
+		cfg.Database).Scan(&colCount); err != nil {
+		return nil, fmt.Errorf("audit mysql column probe: %w", err)
+	}
+	if colCount == 0 {
+		if _, err := setup.ExecContext(ctx, "ALTER TABLE "+dbName+".`sessions` ADD COLUMN `login_session_id` VARCHAR(128) NULL AFTER `ended_at`"); err != nil {
+			return nil, fmt.Errorf("audit mysql add login_session_id column: %w", err)
+		}
 	}
 	if err := setup.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("audit mysql ping: %w", err)
@@ -157,7 +173,12 @@ type SessionRecord struct {
 	DBType    string
 	DBUser    string
 	Access    string
-	LastSeen  time.Time
+	// LoginSessionID (Phase 2b) is the IdP login session id from the
+	// requesting JWT (external issuers' sessionId claim) — the trace from
+	// this DB session back to the login that requested it. Empty for
+	// local logins (no IdP session in play) → NULL in the row.
+	LoginSessionID string
+	LastSeen       time.Time
 }
 
 // ActiveRecord is the started-state refresh carried by the data plane's
@@ -175,16 +196,23 @@ type ActiveRecord struct {
 // UpsertSession inserts the pending row at token issue time. Idempotent: a
 // re-issue for the same session_id refreshes the maker/db fields + last_seen
 // but never touches status, checker_username, started_at or ended_at (the
-// lifecycle owns those).
+// lifecycle owns those). login_session_id (Phase 2b) is written on insert
+// AND refreshed on duplicate — a re-issue under a different login session
+// re-stamps the trace.
 func (w *Writer) UpsertSession(ctx context.Context, rec SessionRecord) error {
+	var loginSID any
+	if rec.LoginSessionID != "" {
+		loginSID = rec.LoginSessionID
+	}
 	q := "INSERT INTO " + w.tbl +
-		" (`session_id`, `username`, `ticket_id`, `db_type`, `db_user`, `access`, `last_seen`) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
+		" (`session_id`, `username`, `ticket_id`, `db_type`, `db_user`, `access`, `login_session_id`, `last_seen`) " +
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE " +
 		"`username` = VALUES(`username`), `ticket_id` = VALUES(`ticket_id`), " +
 		"`db_type` = VALUES(`db_type`), `db_user` = VALUES(`db_user`), " +
-		"`access` = VALUES(`access`), `last_seen` = VALUES(`last_seen`)"
+		"`access` = VALUES(`access`), `login_session_id` = VALUES(`login_session_id`), " +
+		"`last_seen` = VALUES(`last_seen`)"
 	_, err := w.db.ExecContext(ctx, q, rec.SessionID, rec.Username, rec.TicketID,
-		rec.DBType, rec.DBUser, rec.Access, rec.LastSeen.UTC())
+		rec.DBType, rec.DBUser, rec.Access, loginSID, rec.LastSeen.UTC())
 	return err
 }
 

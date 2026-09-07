@@ -19,9 +19,12 @@ import (
 
 // auditUpsertPending writes the pending row at token issue time (hook in
 // handleToken). Access falls back to "read" for ungated presets (absent
-// access means read per the token contract). Best-effort: the token is
-// already stored — an audit hiccup must not fail the issue.
-func (a *api) auditUpsertPending(ctx context.Context, p *models.TokenPayload) {
+// access means read per the token contract). loginSessionID (Phase 2b) is
+// the requesting JWT principal's IdP login session id — stamped on the
+// audit row so every DB session traces back to the login that requested
+// it (empty for local logins). Best-effort: the token is already stored —
+// an audit hiccup must not fail the issue.
+func (a *api) auditUpsertPending(ctx context.Context, p *models.TokenPayload, loginSessionID string) {
 	if a.audit == nil {
 		return
 	}
@@ -30,13 +33,14 @@ func (a *api) auditUpsertPending(ctx context.Context, p *models.TokenPayload) {
 		access = "read"
 	}
 	err := a.audit.UpsertSession(ctx, audit.SessionRecord{
-		SessionID: p.SessionID,
-		Username:  p.Username,
-		TicketID:  p.TicketID,
-		DBType:    p.DBType,
-		DBUser:    p.DBUser,
-		Access:    access,
-		LastSeen:  time.Now().UTC(),
+		SessionID:      p.SessionID,
+		Username:       p.Username,
+		TicketID:       p.TicketID,
+		DBType:         p.DBType,
+		DBUser:         p.DBUser,
+		Access:         access,
+		LoginSessionID: loginSessionID,
+		LastSeen:       time.Now().UTC(),
 	})
 	if err != nil {
 		a.log.Error("audit upsert pending", "session_id", p.SessionID, "err", err)

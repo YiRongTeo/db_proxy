@@ -227,8 +227,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	a.recordPendingSession(r.Context(), &payload)
 	// Task 9.7 audit: persist the pending row (maker username, ticket, db
 	// target, access). Best-effort like the directory record — an audit
-	// write failure is logged, never fatal to the issue.
-	a.auditUpsertPending(r.Context(), &payload)
+	// write failure is logged, never fatal to the issue. Phase 2b: stamp
+	// the requesting JWT's IdP login session id (empty for local logins)
+	// so the DB session traces back to the login that requested it.
+	loginSID := ""
+	if sess := sessionFrom(r); sess != nil {
+		loginSID = sess.LoginSessionID
+	}
+	a.auditUpsertPending(r.Context(), &payload, loginSID)
 	a.log.Info("token issued", "username", payload.Username, "db_user", payload.DBUser,
 		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access,
 		"session_id", payload.SessionID)
