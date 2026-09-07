@@ -238,11 +238,11 @@ type JWTConfig struct {
 // "sessionId", identity aliases) adapts verification to the issuer's JWT
 // shape without code changes.
 type ExternalIssuerConfig struct {
-	Name       string             `mapstructure:"name"`
-	Iss        string             `mapstructure:"iss"`
-	Audience   string             `mapstructure:"audience"`
-	Secret     string             `mapstructure:"secret"`
-	RequireJTI *bool              `mapstructure:"require_jti"`
+	Name       string `mapstructure:"name"`
+	Iss        string `mapstructure:"iss"`
+	Audience   string `mapstructure:"audience"`
+	Secret     string `mapstructure:"secret"`
+	RequireJTI *bool  `mapstructure:"require_jti"`
 	// RequireISS *bool (mapstructure "require_iss"): ABSENT (nil) = TRUE —
 	// external tokens must carry this entry's iss (iss required at load,
 	// asserted at verification). An EXPLICIT require_iss: false means the
@@ -276,8 +276,8 @@ type ExternalIssuerConfig struct {
 // match the token's raw role value with EqualFold against the alias
 // keys, not exact == (Phase 2b Task 2).
 type ClaimMappingConfig struct {
-	Subject     string            `mapstructure:"subject"`
-	Role        string            `mapstructure:"role"`
+	Subject string `mapstructure:"subject"`
+	Role    string `mapstructure:"role"`
 	// SessionID names the claim carrying the IdP login session id
 	// (mapstructure "session_id"); empty = the consumer-side default
 	// "sessionId" — config stores it verbatim, downstream applies the
