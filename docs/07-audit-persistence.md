@@ -33,9 +33,10 @@ flowchart LR
 | `checker_username` | The **current** watcher — `NULL` when no checker is connected |
 | `status` | `pending` → `active` → `ended` |
 | `started_at` / `ended_at` | Session open/close timestamps (`DATETIME(3)`) |
+| `login_session_id` | (Phase 2b) The IdP login session id from the requesting JWT's `sessionId` claim (external issuers) — the trace from this DB session back to the login that requested it; `NULL` for local logins. **Distinct from `session_id`** (the gateway's own DB-session id) and never used for revocation |
 | `last_seen` / `created_at` | Heartbeat/insertion timestamps |
 
-The table (and database) are created automatically on startup when the feature is enabled.
+The table (and database) are created automatically on startup when the feature is enabled. Existing tables (pre-Phase 2b) get the `login_session_id` column added automatically at startup (idempotent information_schema probe + `ALTER TABLE`).
 
 ## Lifecycle mapping
 

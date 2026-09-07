@@ -387,18 +387,35 @@ jwt:
     - name: "other-app"                  # label for logs; required + unique
       iss: "https://other-app.example"   # MUST equal the iss claim on their JWTs;
                                          # must NOT equal the local issuer (load error)
+                                         # OMIT + set require_iss: false for issuers
+                                         # whose JWT carries NO iss claim (below)
       audience: "zt-api"                 # optional — empty inherits auth.jwt.audience
       secret: "${ZT_OTHERAPP_JWT_SECRET}"  # their HS256 shared secret, via .env (see
                                          # .env.example) — NEVER committed to yaml
+      require_iss: true                  # ABSENT = true: token without iss -> 401;
+                                         # false = iss-less tokens tried against this
+                                         # entry's secret (config order among relaxed
+                                         # entries; first verify wins)
+      require_aud: true                  # ABSENT = true: token aud must match the
+                                         # resolved audience; false = aud NOT asserted
+                                         # (an empty resolved audience is then legal)
       require_jti: true                  # ABSENT = true: token without jti -> 401
       claims:                            # optional — adapt to THEIR token shape (below)
         subject: "sub"                   #   claim carrying the username (default "sub")
         role: "role"                     #   claim carrying the role (default "role")
+        session_id: "sessionId"          #   claim carrying the IdP login session id
+                                         #   (default "sessionId") — parsed for
+                                         #   logs/tracing + the audit
+                                         #   login_session_id column; NEVER a
+                                         #   revocation key
         role_aliases:                    #   raw role-claim VALUES -> maker|checker
           approver: checker              #     non-identity example: their role claim says
                                          #     "approver" where we say "checker". Canonical
                                          #     "maker"/"checker" values need NO alias — the
-                                         #     default translation is identity.
+                                         #     default translation is identity. Matching
+                                         #     is CASE-INSENSITIVE (viper lowercases
+                                         #     yaml map keys, so "Maker" and "maker"
+                                         #     both match a token's literal "Maker").
 ```
 
 Every ACTIVE entry's secret is required at load (empty → the plane refuses
@@ -408,6 +425,13 @@ token to its entry BY `iss`, so a duplicate would make the second issuer's
 tokens 401 forever with no log clue — and an entry that resolves to an
 EMPTY audience (no per-entry `audience`, no top-level `auth.jwt.audience`)
 refuses to start: nothing it mints could ever pass `aud` verification.
+**Relaxations (Phase 2b) are per-entry and EXPLICIT:** `require_iss: false`
+permits an iss-less entry (the iss-required/unique/shadow checks then only
+apply to entries that DO carry an iss — an iss-less token is resolved by
+trying each relaxed entry's secret in config order, first verify wins);
+`require_aud: false` skips the audience assertion entirely, making an empty
+resolved audience legal for that entry. Entries with the strict defaults
+are never consulted for tokens that omit the corresponding claim.
 
 **Claim mapping — "their JWT differs" is a config edit, never code.** An
 external token is verified as-is (HS256 with their secret, `iss` == the
@@ -438,9 +462,14 @@ undeniably live until `exp`.
 Task 4b), not just when `login_enabled` — it verifies the presented bearer
 through the same issuer-aware path and denylists its `jti`, so an
 external-only deployment (or an external token used alongside local logins)
-keeps a server-side revocation route. A valid token without a `jti`
-(`require_jti: false` issuers) is refused at logout (500 — nothing to
-revoke), never silently "logged out".
+keeps a server-side revocation route. A valid token WITH a jti → 200
+`{"ok":"true","revoked":true}` (denylisted; replay 401). A valid token
+WITHOUT a jti (`require_jti: false` issuers — e.g. the integrating app's
+real shape) → 200 `{"ok":"true","revoked":false}` + a warn log (Phase 2b):
+nothing server-side exists to revoke (their `sessionId` claim is a tracing
+id, never a revocation key), the caller discards it client-side, and the
+token lives until `exp` — keep their tokens short-lived; that is the only
+revocation lever for jti-less issuers.
 
 **Mint-for-self.** The mint endpoint binds every token to the authenticated
 principal: the optional body `username` MUST equal the JWT's (mapped)
@@ -491,7 +520,10 @@ Roles come entirely from the mapped claims.
 5. Verify: present one of their JWTs and confirm the mapped principal —
    `curl -H "Authorization: Bearer <their-jwt>" http://127.0.0.1:8080/api/me`
    → `200 {"username":"<their-sub>","role":"maker|checker"}` (401 = verify
-   the entry: `iss`/`audience`/`secret`/`require_jti`/claim names).
+   the entry: `iss`/`audience`/`secret`/`require_jti`/claim names — and if
+   their JWT omits `iss` or `aud`, set `require_iss: false` /
+   `require_aud: false`; if it omits `jti`, `require_jti: false` and accept
+   un-revocable tokens, §logout above).
    Then mint through `POST /api/token` as usual (§3).
 
 **Secret hygiene.** An external issuer's shared secret IS the trust root —
@@ -520,11 +552,16 @@ jwt:
                                     # non-default port must be spelled out
   external_issuers:
     - name: "other-app"             # §2.1.1 for the full key table
-      iss: "https://other-app.example"
+      # iss: "https://other-app.example"  # OMIT + require_iss: false if their
+      #                               # JWT carries no iss (their real shape)
       # audience: "zt-api"          # optional — empty inherits auth.jwt.audience
       secret: "${ZT_OTHERAPP_JWT_SECRET}"   # the ONE shared HS256 secret
-      # require_jti: true           # ABSENT = true
-      # claims: { subject: "...", role: "...", role_aliases: {...} }  # only if
+      # require_iss: false          # ABSENT = true (their real shape omits iss)
+      # require_aud: false          # ABSENT = true (their real shape omits aud)
+      # require_jti: false          # ABSENT = true (their real shape omits jti —
+                                    #   tokens then un-revocable; keep them short)
+      # claims: { subject: "username", role: "role", session_id: "sessionId",
+      #           role_aliases: {Maker: maker, Checker: checker} }  # only if
                                     # their claim names/role VALUES differ
 ```
 
@@ -544,7 +581,8 @@ jwt:
    - identity — `curl -H "Authorization: Bearer <their-jwt>"
      http://127.0.0.1:8080/api/me` → `200 {"username":"<their-sub>",
      "role":"maker|checker"}` (401 = re-check `iss`/`audience`/`secret`/
-     `require_jti`/claim names on the entry);
+     `require_jti`/claim names — or relax `require_iss`/`require_aud`/
+     `require_jti` per their actual token shape, §2.1.1);
    - mint — `POST /api/token` with their JWT: maker principal → `200`
      (read AND write presets); checker principal → `200` on read-access
      mints, **403** on write-access mints (read-only, §3);
@@ -575,7 +613,8 @@ jwt:
    # /api/login is gone → 404
    curl -s -o /dev/null -w "%{http_code}" -X POST \
      http://127.0.0.1:8080/api/login -d '{"username":"x","password":"y"}'
-   # logout still revokes an external token → 200 {"ok":"true"}, replay → 401
+   # logout still revokes a jti-bearing external token → 200 {"ok":"true",
+   # "revoked":true}, replay → 401 (a jti-less token → 200 revoked:false)
    curl -X POST -H "Authorization: Bearer <their-jwt>" \
      http://127.0.0.1:8080/api/logout
    ```
@@ -614,12 +653,15 @@ credential** this plane accepts — no cookie, no server-side UI session.
   **unconditionally** (not gated by `login_enabled`): it verifies the
   presented bearer through the issuer-aware path and denylists its `jti`
   (`jwt:deny:<jti>` in Valkey) for the token's remaining life — replaying
-  the same token anywhere → 401. A valid token without a `jti`
-  (`require_jti: false` issuers) is refused at logout (500 — nothing to
-  revoke).
-- **External path (Phase 2)** — the other app signs the JWT (sub = their
-  user id, role `maker`|`checker`, their `iss`, `aud` = `zt-api` or the
-  entry's, `exp`, `jti` required by default) with the SHARED secret
+  the same token anywhere → 401 (`{"ok":"true","revoked":true}`). A valid
+  token without a `jti` (`require_jti: false` issuers) answers
+  `{"ok":"true","revoked":false}` + a warn — nothing server-side exists to
+  revoke, so the caller discards it client-side and it lives until `exp`.
+- **External path (Phase 2/2b)** — the other app signs the JWT (their
+  claims; the integrating app's real shape is `username`/`role`
+  `Maker`|`Checker`/`sessionId` with NO `iss`/`aud`/`jti` — map the
+  vocabulary + relax per entry with `require_iss`/`require_aud`/
+  `require_jti: false`, §2.1.1) with the SHARED secret
   (`auth.jwt.external_issuers[].secret`, §2.1.1). This plane verifies it
   against that entry and maps claims onto the same
   `{username, role ∈ maker|checker}` principal — vocabulary differences are

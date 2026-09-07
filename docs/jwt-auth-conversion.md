@@ -129,7 +129,7 @@ so operators can script against it:
 | Success response | `200 {"token": <HS256 JWT>, "username": <name>, "role": <maker\|checker>, "expires_in": <ttl_seconds>}` — the JWT self-issued by the local issuer: `sub`, `role`, `iss` (`zerotrust-proxy`), `aud` (`zt-api`), `exp`/`iat`, `jti`. No cookie, no Valkey session — the token is the only credential handed to the caller. |
 | Failure responses | `401` invalid credentials — rate-limited per (IP, requested username); the key is blocked **429** after the window's failure budget, and a successful login clears the counter. |
 | Every call after that | `Authorization: Bearer <jwt>` on every guarded REST route (header-only by design); `GET /api/me` answers `200 {"username", "role"}` for the token's principal. The checker WebSocket is the one header-less surface: `/ws/checker` accepts the bearer header **or** `?access_token=<jwt>`. |
-| Logout semantics | `POST /api/logout` is registered **unconditionally** (Phase 2 Task 4b — never gated by `login_enabled`). It verifies the presented bearer through the issuer-aware path, writes `SET jwt:deny:<jti>` (TTL = the token's remaining life, floor 1 s) and answers `200 {"ok":"true"}` — replaying the same token on any guarded route → 401. A valid token without a `jti` is refused **500** (nothing to revoke), never silently "logged out". |
+| Logout semantics | `POST /api/logout` is registered **unconditionally** (Phase 2 Task 4b — never gated by `login_enabled`). It verifies the presented bearer through the issuer-aware path, writes `SET jwt:deny:<jti>` (TTL = the token's remaining life, floor 1 s) and answers `200 {"ok":"true","revoked":true}` — replaying the same token on any guarded route → 401. A valid token WITHOUT a `jti` (a `require_jti: false` issuer — Phase 2b, e.g. the integrating app's real shape) answers `200 {"ok":"true","revoked":false}` + a warn log: nothing server-side exists to revoke (their `sessionId` is a tracing id, never a revocation key), the caller discards it client-side, and the token lives until `exp`. |
 | External-only mode | `login_enabled: false` removes only the login route: local secret + local credentials are not required, but **≥ 1 `external_issuers` entry is required at load** — a plane nothing can authenticate must not boot. Roles then come entirely from mapped external claims. |
 
 Everything else — the issuer-aware verification order, the jti denylist
@@ -218,9 +218,9 @@ code**. Local `/api/login` keeps working unchanged alongside.
 | Trust root / key material | `auth.jwt.secret` (HS256) | per-issuer: local `auth.jwt.secret`; each external entry's OWN `secret` (its shared HS256 key with us) |
 | External JWT verification | an "external" JWT only verified if signed with the LOCAL secret (`iss` == local issuer) | verified against the matching entry's secret; `iss` must equal the entry's; **unknown `iss` → 401** |
 | `iss` collisions | n/a | an external entry claiming the local `iss` is a **config load error** (it would shadow self-issued tokens) |
-| Principal claims | `sub` = username, `role` = maker\|checker (required) | local unchanged; external: subject/role claim NAMES and role VALUES mapped via `claims` (defaults `sub`/`role`/identity) |
+| Principal claims | `sub` = username, `role` = maker\|checker (required) | local unchanged; external: subject/role claim NAMES and role VALUES mapped via `claims` (defaults `sub`/`role`/identity; alias matching case-insensitive) — plus `sessionId` parsed as `login_session_id` for logs/audit (never authz) |
 | Role gates | maker/checker on every token | identical — the mapped principal is the same `{username, role}` model |
-| Revocation | jti denylist (self-issued tokens always carry a `jti`) | same denylist — `require_jti` (absent = **true**) forces external tokens to carry a `jti`, closing the Phase-1 "jti-less tokens bypass the denylist" gap for external tokens |
+| Revocation | jti denylist (self-issued tokens always carry a `jti`) | same denylist — `require_jti` (absent = **true**) forces external tokens to carry a `jti`, closing the Phase-1 "jti-less tokens bypass the denylist" gap for external tokens; a `require_jti: false` issuer's tokens are un-revocable by design (logout 200 `revoked:false`) |
 | `/api/login` | gated by `login_enabled` | unchanged (still gated) |
 | `/api/logout` | (Phase 1 doc said "registered when `login_enabled`") | **registered UNCONDITIONALLY** (Task 4b): issuer-aware verify + jti denylist, so external-only deployments keep an HTTP revocation route |
 | Browser cross-origin | checker WS origin allowlist only | `allowed_origins` = ONE list for REST CORS **and** checker WS origins (Task 3) |
@@ -234,13 +234,16 @@ other app is live). Fail-fast at load, naming the entry.
 | Key | Required? | Meaning / validation |
 |---|---|---|
 | `name` | ✅ | label for logs; required + unique across the list |
-| `iss` | ✅ | MUST equal the `iss` claim on their JWTs; must NOT equal the local `auth.jwt.issuer` (load error); UNIQUE across the list — two entries sharing an `iss` would resolve first-match and 401 the second issuer's tokens forever (load error) |
-| `audience` | optional | empty inherits the top-level `auth.jwt.audience` (resolved at validation, so a later top-level edit re-defaults issuers that did not pin their own); an entry that would resolve EMPTY (no pin AND no top-level audience) is a load error — nothing it mints could ever pass `aud` |
+| `iss` | ✅ unless `require_iss: false` | MUST equal the `iss` claim on their JWTs; must NOT equal the local `auth.jwt.issuer` (load error); UNIQUE across the list — two entries sharing an `iss` would resolve first-match and 401 the second issuer's tokens forever (load error). Both checks apply only to entries that DO carry an `iss` — an iss-less entry (below) has nothing to collide |
+| `audience` | optional | empty inherits the top-level `auth.jwt.audience` (resolved at validation, so a later top-level edit re-defaults issuers that did not pin their own); an entry that would resolve EMPTY (no pin AND no top-level audience) is a load error — nothing it mints could ever pass `aud` (unless `require_aud: false`, below) |
 | `secret` | ✅ | their HS256 shared secret — `${VAR}` from the environment (e.g. `ZT_OTHERAPP_JWT_SECRET`), never committed; empty = plane refuses to start |
-| `require_jti` | optional | ABSENT = **true**: a token without a non-empty string `jti` → 401 (nothing the denylist could revoke). Explicit `false` opts out (issuer cannot mint jti) — those tokens are live until `exp` and logout refuses them (500: nothing to revoke) |
+| `require_iss` | optional | ABSENT = **true**: `iss` required at load + asserted at verification. Explicit `false` (Phase 2b): the entry's tokens may OMIT `iss` — resolution tries each relaxed entry's secret in config order for an iss-less token (first verify wins; an attacker still needs a configured secret) |
+| `require_aud` | optional | ABSENT = **true**: `aud` asserted against the resolved audience. Explicit `false` (Phase 2b): `aud` NOT asserted — for issuers whose JWTs carry no `aud` claim; an empty resolved audience is then legal instead of a load error |
+| `require_jti` | optional | ABSENT = **true**: a token without a non-empty string `jti` → 401 (nothing the denylist could revoke). Explicit `false` opts out (issuer cannot mint jti) — those tokens are live until `exp`; logout of one answers 200 `revoked:false` (nothing server-side to revoke) |
 | `claims.subject` | optional | claim carrying the username; empty = `"sub"` |
 | `claims.role` | optional | claim carrying the role; empty = `"role"` |
-| `claims.role_aliases` | optional | raw role-claim VALUE → canonical role; every VALUE must be `maker`\|`checker` (load error otherwise); empty = identity translation (their value must already be canonical) |
+| `claims.session_id` | optional | claim carrying the IdP login session id (Phase 2b); empty = `"sessionId"`. Parsed for logs/tracing and stamped onto audit rows as `zt_audit.sessions.login_session_id`. **Never** a revocation key — the denylist keys on `jti` only |
+| `claims.role_aliases` | optional | raw role-claim VALUE → canonical role; every VALUE must be `maker`\|`checker` (load error otherwise); empty = identity translation (their value must already be canonical). **Matching is case-insensitive** — viper lowercases yaml map keys, so `Maker: maker` in yaml arrives as `maker: maker` and still matches a token's literal `"Maker"` value |
 
 Environment binding: per-entry secrets expand `${VAR}` like every other
 secret; the list itself has no dedicated env binding (UnmarshalKey — same
@@ -255,7 +258,8 @@ An external token is verified as-is (HS256 with the entry's secret, `iss`,
 |---|---|---|---|
 | username | `sub` | `claims.subject: "<their-claim>"` (e.g. `user_name`) | non-empty, else 401 (no anonymous principals) |
 | role | `role` | `claims.role: "<their-claim>"` (e.g. `access_level`) | canonical ∈ {maker, checker}, else 401 |
-| role VALUE `maker`/`checker` | identity (their token already says `maker`/`checker`) | `claims.role_aliases: {<their-raw>: maker\|checker}` (e.g. `admin: checker`) | alias VALUES validated at config load; unaliased values translate identically |
+| role VALUE `maker`/`checker` | identity (their token already says `maker`/`checker`) | `claims.role_aliases: {<their-raw>: maker\|checker}` (e.g. `admin: checker`) | alias VALUES validated at config load; unaliased values translate identically; **matching is case-insensitive** (viper lowercases yaml map keys, so `Maker` written in yaml still matches a token's literal `"Maker"`) |
+| login session id (tracing/audit only) | `sessionId` | `claims.session_id: "<their-claim>"` | carried as `login_session_id` onto audit rows; NEVER a revocation key |
 
 Example — their token puts the username in `user_name`, the role in
 `access_level`, and calls the checker role `admin`:
@@ -266,6 +270,26 @@ claims:
   role: "access_level"
   role_aliases:
     admin: checker
+```
+
+Phase 2b real-shape example — the integrating app's JWT carries
+`username`/`role` (`Maker`|`Checker`)/`sessionId` and NO `iss`/`aud`/`jti`
+(verified live 2026-09-08):
+
+```yaml
+external_issuers:
+  - name: "other-app"
+    secret: "${ZT_OTHERAPP_JWT_SECRET}"
+    require_iss: false       # their JWT carries no iss claim
+    require_aud: false       # ... and no aud claim
+    require_jti: false       # ... and no jti — tokens are un-revocable server-side
+    claims:
+      subject: "username"    # their username claim IS our sub
+      role: "role"           # same claim name
+      session_id: "sessionId"  # parsed for logs/audit login_session_id only
+      role_aliases:
+        Maker: maker         # viper lowercases the key; matching is case-insensitive
+        Checker: checker
 ```
 
 Only `role_aliases` VALUES are validated at load (`maker`|`checker` only);
@@ -351,8 +375,12 @@ sequenceDiagram
   key on `jti`. Self-issued tokens always carry one; `require_jti` (absent
   = true) demands the same of external tokens, so every accepted token is
   deniable. Only an explicit `false` accepts jti-less external tokens — and
-  those can never be revoked server-side (logout refuses them with 500
-  rather than pretending).
+  those can never be revoked server-side (logout answers 200
+  `revoked:false` + a warn: the caller discards client-side, the token
+  lives until `exp`). The integrating app's real JWT (username/role/
+  sessionId, no jti) is exactly this case — keep their tokens
+  short-lived; their `sessionId` claim is a tracing id, never a revocation
+  key (user directive 2026-09-07).
 - **CORS is not auth.** `allowed_origins` only decides whether a BROWSER
   may send cross-origin requests and read responses (preflights and actual
   requests 403 before auth when disallowed; responses never
