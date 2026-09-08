@@ -2,6 +2,8 @@
 
 > **This page describes how the gateway CALLS OUT to an external API to withdraw DB passwords.** This is the section most likely to be modified — the contract below is the source of truth for anyone changing it.
 
+> **Implementing the endpoint?** See [Page 10 — Credential Retrieval API Contract](10-credential-api-contract.md) — the same contract written for the credential-service developer (audience, request/response/status rules, lifecycle, operator checklist).
+
 > **Key disambiguation (JWT conversion):** the `X-Api-Key` on THIS page is the
 > **data plane's** key to its vault (`credentials_api.api_key` /
 > `ZT_CREDENTIALS_API_API_KEY`) — a different, still-live credential. The
