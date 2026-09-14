@@ -349,6 +349,21 @@ cd /d/AI/hermes/Project/Project-D
 go run ./cmd/control
 ```
 
+**SPA prerequisite (rebuild after ANY `web/src` change — a stale bundle fails
+silently, it does not 404).** The control plane serves the Angular build from
+`web/dist/web/browser/` (`static_dir`), and `web/dist/` is **gitignored**, so
+nothing in git flags a bundle that predates a source change: the UI simply
+keeps running the old code against the new API (e.g. a pre-JWT bundle still
+speaks the retired cookie-session protocol, so **every browser login fails**
+even though `POST /api/login` returns 200 via curl). Check the served bundle
+age against the source, and rebuild when stale:
+
+```bash
+ls -la web/dist/web/browser/main-*.js     # bundle mtime
+ls -lat web/src | head -3                 # newest source change
+cd web && npm ci && npm run build && cd ..   # then restart the control plane
+```
+
 Auth model (JWT conversion — the old `ZT_API_API_KEY` / control-plane
 `X-Api-Key` is GONE): every authenticated route takes a **Bearer JWT**
 (`Authorization: Bearer <jwt>`); `/api/login` self-issues those JWTs when
