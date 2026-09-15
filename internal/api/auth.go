@@ -139,6 +139,17 @@ type authMiddleware struct {
 	loginLimiter *rateLimiter
 }
 
+// logger returns the middleware's logger, falling back to a discarding one
+// when none was wired (hand-built middlewares in tests). Logging must never
+// be what panics a request path: every rejection is an expected, handled
+// outcome, and a nil *slog.Logger dereferences nil inside Handler().
+func (a *authMiddleware) logger() *slog.Logger {
+	if a.log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return a.log
+}
+
 type sessionKey struct{}
 
 func sessionFrom(r *http.Request) *models.Session {
@@ -237,11 +248,13 @@ func (a *authMiddleware) handleMe(w http.ResponseWriter, r *http.Request) {
 func (a *authMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
 	raw := bearerToken(r)
 	if raw == "" {
+		a.logger().Debug("logout: no bearer token presented", "client", r.RemoteAddr)
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 	sess, claims, err := a.parseToken(raw)
 	if err != nil || sess == nil {
+		a.logger().Warn("logout: token rejected", "reason", rejectReason(err), "client", r.RemoteAddr)
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}

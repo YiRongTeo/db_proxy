@@ -27,6 +27,7 @@ func setSecretEnv(t *testing.T) {
 	t.Setenv("ZT_AUTH_PASSWORD", "admin123")
 	t.Setenv("ZT_AUTH_CHECKER_PASSWORD", "checker123")
 	t.Setenv("ZT_JWT_SECRET", "jwt-dev-secret-0123456789abcdef0123456789")
+	t.Setenv("ZT_OTHERAPP_JWT_SECRET", "otherapp-dev-secret-0123456789abcdef0123456789")
 	t.Setenv("ZT_CRED_MYSQL_RO_PASSWORD", "ro_pw")
 	t.Setenv("ZT_CRED_MYSQL_RW_PASSWORD", "rw_pw")
 	t.Setenv("ZT_CRED_PG_RO_PASSWORD", "ro_pw")

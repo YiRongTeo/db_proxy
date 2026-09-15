@@ -699,6 +699,44 @@ curl -s http://127.0.0.1:8080/api/health      # expect: {"status":"ok","valkey":
 > The Angular SPA must already be built (`web/dist/web/browser/`). If the UI 404s, rebuild:
 > `cd web && npm ci && npm run build && cd ..` then restart the control plane.
 
+### 2.1.4 Debugging a rejected token (401)
+
+The client always receives the SAME opaque body — `401 {"error":"unauthorized"}` — so a
+rejection never tells the caller *why* (that is deliberate: the response must not
+distinguish a bad signature from an expired token from an unknown issuer). The REASON is
+therefore written to the **server-side log** instead, where an operator can see it.
+
+Every rejection is a `WARN` line; an accepted request is a `DEBUG` line naming the
+resolved trust root:
+
+```bash
+# stdout is the log sink; PM2 already writes it to files (ecosystem.config.cjs):
+#   logs/control-out.log / logs/control-error.log
+cd /d/AI/hermes/Project/Project-D
+ZT_LOG_LEVEL=debug "$LOCALAPPDATA/Temp/zt-run/zt-control.exe" >> logs/control-out.log 2>&1
+
+# then, after a failed call, read the reason:
+grep '"requireJWT: token rejected"' logs/control-out.log | tail -5
+```
+
+| Logged reason (field `reason`) | What it means / what to fix |
+|---|---|
+| `requireJWT: no bearer token presented` (DEBUG) | No `Authorization: Bearer` header, or an empty token — REST is **header-only** |
+| `token is not a parseable JWT` | Not three dot-separated base64url segments (truncated paste, wrong header) |
+| `unknown issuer "X": not the local issuer and no external_issuers entry matches` | The token carries an `iss` that no `auth.jwt.external_issuers[]` entry declares — set that entry's `iss` to match, or have the IdP stop sending `iss` |
+| `token has no iss claim; N require_iss:false issuer(s) tried, last rejection: …` | iss-less token (the integrating app's shape): the detail after the colon is the LAST issuer's specific failure — read that |
+| `external issuer "name": token invalid: token is expired` | `exp` in the past — clock skew or a stale token |
+| `external issuer "name": token invalid: token signature is invalid` | Signed with a **different secret** than the entry's `secret` (the classic integration bug: the two apps don't share the same value) |
+| `external issuer "name": role "Vendor" maps to no canonical role (add a role_aliases entry)` | Role value not `maker`/`checker` after aliasing — add the raw value to `claims.role_aliases` |
+| `external issuer "name": no "username" claim carrying a username` | The claim named by `claims.subject` is absent/empty in the token |
+| `external issuer "name": token carries no jti while require_jti is in force` | `require_jti` is on (absent config = true) but the token has no `jti` — set `require_jti: false` if the IdP cannot emit one |
+| `local token invalid: …` | A token claiming the LOCAL `iss` failed verification against `auth.jwt.secret` |
+| `requireJWT: token rejected - jti denylisted` | The token was explicitly logged out (or its `jti` was revoked) |
+
+Reasons never include the token, the secret or the signature — they are derived from the
+token's own claims (iss/role/claim presence) and from config state, so the log is safe to
+share with the integrating team.
+
 ### 2.2 Data Plane (:3306 — ONE shared port, MySQL + PostgreSQL)
 
 ```bash

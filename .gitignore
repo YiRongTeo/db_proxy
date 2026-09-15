@@ -5,6 +5,8 @@ web/dist/
 *.exe
 configs/*.local.yaml
 .superpowers/
+.hermes/
+logs/
 build/
 *.zip
 .env

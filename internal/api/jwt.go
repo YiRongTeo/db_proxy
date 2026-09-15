@@ -113,6 +113,55 @@ func signJWT(cfg *config.ControlConfig, username, role string, ttl time.Duration
 // nothing about WHY a token was rejected.
 var errUnauthorizedJWT = errors.New("unauthorized")
 
+// jwtReject is a rejection REASON that still IS errUnauthorizedJWT for
+// errors.Is purposes: callers keep matching the sentinel and answering the
+// one opaque 401, while Error() yields the reason so the server-side log
+// finally says WHY a token was refused. Every rejection used to be silent,
+// which left integration debugging with no evidence at all. Reasons are
+// built from the token's own claims (iss/role/claim presence) or from
+// config state — never from the signature, the secret or the raw token.
+type jwtReject struct{ reason string }
+
+func (e jwtReject) Error() string        { return e.reason }
+func (e jwtReject) Is(target error) bool { return target == errUnauthorizedJWT }
+
+// reject builds a sentinel-matching rejection with a static reason.
+func reject(reason string) error { return jwtReject{reason: reason} }
+
+// rejectf builds a sentinel-matching rejection with a formatted reason.
+func rejectf(format string, a ...any) error {
+	return jwtReject{reason: fmt.Sprintf(format, a...)}
+}
+
+// issuerName names an external issuer entry for logs, tolerating nil/unnamed
+// entries (a nil entry is itself a rejection reason).
+func issuerName(e *config.ExternalIssuerConfig) string {
+	if e == nil || e.Name == "" {
+		return "(unnamed)"
+	}
+	return e.Name
+}
+
+// rejectReason renders a rejection for the log, tolerating a nil error.
+func rejectReason(err error) string {
+	if err == nil {
+		return "verification returned no principal"
+	}
+	return err.Error()
+}
+
+// jwtErr renders a token-parser error for a rejection reason. Safe to log:
+// the jwt library's messages name the failing CONDITION ("token is expired",
+// "signature is invalid", "audience invalid") — never the key, the secret or
+// the raw token. A nil error (an unparseable-but-clean token) degrades to a
+// generic phrase.
+func jwtErr(err error) string {
+	if err == nil {
+		return "token is not valid"
+	}
+	return err.Error()
+}
+
 // parseJWT verifies a raw bearer token against the LOCAL issuer (the
 // middleware's own auth.jwt.* config) and returns the principal session
 // plus the verified claims (the jti the Task 6 denylist needs — requireJWT
@@ -127,7 +176,7 @@ var errUnauthorizedJWT = errors.New("unauthorized")
 func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error) {
 	j := a.cfg.JWT
 	if !j.Enabled || j.Secret == "" || j.Issuer == "" || j.Audience == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, reject("local issuer not configured (jwt.enabled/secret/issuer/audience)")
 	}
 	claims := &jwtClaims{}
 	tok, err := jwt.ParseWithClaims(raw, claims,
@@ -145,13 +194,13 @@ func (a *authMiddleware) parseJWT(raw string) (*models.Session, jwtClaims, error
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 	)
 	if err != nil || !tok.Valid {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, rejectf("local token invalid: %s", jwtErr(err))
 	}
 	if claims.Subject == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT // no anonymous principals
+		return nil, jwtClaims{}, reject("local token: empty sub claim") // no anonymous principals
 	}
 	if claims.Role != "maker" && claims.Role != "checker" {
-		return nil, jwtClaims{}, errUnauthorizedJWT // role absent or not a known role → reject
+		return nil, jwtClaims{}, rejectf("local token: role %q is not maker|checker", claims.Role) // never a superuser
 	}
 	return &models.Session{Username: claims.Subject, Role: claims.Role}, *claims, nil
 }
@@ -173,7 +222,7 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 	// Master switch: jwt.enabled=false → no token is trusted (fail closed,
 	// exactly as parseJWT always did).
 	if !j.Enabled {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, reject("jwt disabled (auth.jwt.enabled=false)")
 	}
 	// Phase 1 — read the iss claim WITHOUT verification so the token can be
 	// attributed to a trust root (local issuer vs external list). MapClaims
@@ -182,11 +231,11 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 	// closed.
 	probe := jwt.MapClaims{}
 	if _, _, err := jwt.NewParser(jwt.WithoutClaimsValidation()).ParseUnverified(raw, probe); err != nil {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, reject("token is not a parseable JWT")
 	}
 	iss, err := probe.GetIssuer()
 	if err != nil {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, reject("iss claim present but not a string")
 	}
 	if iss == "" {
 		// No iss claim → the token names no trust root by iss. Phase 2b:
@@ -196,15 +245,28 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 		// and every candidate that fails just falls through). Entries
 		// with the strict default (nil/true) are never tried for an
 		// iss-less token.
+		// The LAST attempted entry's reason is preserved: on a multi-entry
+		// chain the final rejection is the most specific evidence of why
+		// the token was refused (e.g. an unaliased role value), and losing
+		// it to a generic message is exactly what made integration
+		// debugging blind.
+		lastReason := ""
+		tried := 0
 		for i := range j.ExternalIssuers {
 			e := &j.ExternalIssuers[i]
 			if e.RequireISS != nil && !*e.RequireISS {
-				if sess, claims, err := parseExternalJWT(raw, e); err == nil {
+				tried++
+				sess, claims, err := parseExternalJWT(raw, e)
+				if err == nil {
 					return sess, claims, nil
 				}
+				lastReason = err.Error()
 			}
 		}
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		if tried == 0 {
+			return nil, jwtClaims{}, reject("token has no iss claim and no require_iss:false external issuer is configured to accept one")
+		}
+		return nil, jwtClaims{}, rejectf("token has no iss claim; %d require_iss:false issuer(s) tried, last rejection: %s", tried, lastReason)
 	}
 	// Phase 2 — resolve the issuer and verify with ITS key material.
 	if iss == j.Issuer {
@@ -220,7 +282,7 @@ func (a *authMiddleware) parseToken(raw string) (*models.Session, jwtClaims, err
 		}
 	}
 	// Unknown iss: no configured trust root claims this token.
-	return nil, jwtClaims{}, errUnauthorizedJWT
+	return nil, jwtClaims{}, rejectf("unknown issuer %q: not the local issuer and no external_issuers entry matches", iss)
 }
 
 // parseExternalJWT verifies a raw token against ONE external issuer entry
@@ -242,15 +304,15 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 	// hand-built cfg (in tests, or a future caller) must not bypass the
 	// same bar.
 	if e == nil || e.Secret == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, rejectf("external issuer %q is not configured (nil entry or empty secret)", issuerName(e))
 	}
 	requireISS := e.RequireISS == nil || *e.RequireISS // nil = TRUE (strict)
 	requireAud := e.RequireAud == nil || *e.RequireAud
 	if requireISS && e.Iss == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, rejectf("external issuer %q: iss required but not configured on the entry", issuerName(e))
 	}
 	if requireAud && e.Audience == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, rejectf("external issuer %q: audience required but not configured on the entry", issuerName(e))
 	}
 	claims := jwt.MapClaims{}
 	// Parser options: the iss/aud assertions are applied ONLY when this
@@ -278,11 +340,11 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 		opts...,
 	)
 	if err != nil || !tok.Valid {
-		return nil, jwtClaims{}, errUnauthorizedJWT
+		return nil, jwtClaims{}, rejectf("external issuer %q: token invalid: %s", issuerName(e), jwtErr(err))
 	}
 	exp, err := claims.GetExpirationTime()
 	if err != nil || exp == nil {
-		return nil, jwtClaims{}, errUnauthorizedJWT // defensive — WithExpirationRequired passed above
+		return nil, jwtClaims{}, rejectf("external issuer %q: no usable exp claim", issuerName(e)) // defensive
 	}
 	// jti: read verbatim (string claim). A malformed (non-string) jti is
 	// treated as absent — with require_jti that is a rejection; without it
@@ -290,7 +352,7 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 	jti, jtiIsString := claims["jti"].(string)
 	requireJTI := e.RequireJTI == nil || *e.RequireJTI // nil = absent = TRUE (Task-1 default)
 	if requireJTI && (!jtiIsString || jti == "") {
-		return nil, jwtClaims{}, errUnauthorizedJWT // no jti → nothing the logout denylist could revoke
+		return nil, jwtClaims{}, rejectf("external issuer %q: token carries no jti while require_jti is in force (unrevocable)", issuerName(e))
 	}
 	if !jtiIsString {
 		jti = ""
@@ -314,7 +376,7 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 	}
 	username, _ := claims[subName].(string)
 	if username == "" {
-		return nil, jwtClaims{}, errUnauthorizedJWT // no anonymous principals
+		return nil, jwtClaims{}, rejectf("external issuer %q: no %q claim carrying a username", issuerName(e), subName)
 	}
 	rawRole, _ := claims[roleName].(string)
 	// Role alias lookup is CASE-INSENSITIVE: viper lowercases config map
@@ -335,7 +397,7 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 		role = rawRole // identity translation for values the operator did not alias
 	}
 	if role != "maker" && role != "checker" {
-		return nil, jwtClaims{}, errUnauthorizedJWT // role absent / unaliased non-canonical → reject (never a superuser)
+		return nil, jwtClaims{}, rejectf("external issuer %q: role %q maps to no canonical role (add a role_aliases entry)", issuerName(e), rawRole)
 	}
 	sid, _ := claims[sidName].(string)
 	return &models.Session{Username: username, Role: role, LoginSessionID: sid}, jwtClaims{
@@ -362,10 +424,12 @@ func parseExternalJWT(raw string, e *config.ExternalIssuerConfig) (*models.Sessi
 // revocation state must never be skipped because the store hiccuped.
 func (a *authMiddleware) authorizeJWT(r *http.Request, raw string) (*http.Request, error) {
 	if raw == "" {
+		a.logger().Debug("requireJWT: no bearer token presented", "path", r.URL.Path, "client", r.RemoteAddr)
 		return nil, errUnauthorizedJWT
 	}
 	sess, claims, err := a.parseToken(raw)
 	if err != nil || sess == nil {
+		a.logger().Warn("requireJWT: token rejected", "reason", rejectReason(err), "path", r.URL.Path, "client", r.RemoteAddr)
 		return nil, errUnauthorizedJWT
 	}
 	// Task 6: a token id on the denylist (handleLogout wrote it) is
@@ -376,13 +440,15 @@ func (a *authMiddleware) authorizeJWT(r *http.Request, raw string) (*http.Reques
 	if claims.ID != "" {
 		denied, err := a.vs.JWTDenied(r.Context(), claims.ID)
 		if err != nil {
-			a.log.Warn("requireJWT: denylist consult failed", "err", err)
+			a.logger().Warn("requireJWT: denylist consult failed", "err", err)
 			return nil, errUnauthorizedJWT
 		}
 		if denied {
+			a.logger().Warn("requireJWT: token rejected - jti denylisted", "jti", claims.ID, "sub", claims.Subject, "path", r.URL.Path)
 			return nil, errUnauthorizedJWT
 		}
 	}
+	a.logger().Debug("requireJWT: accepted", "sub", sess.Username, "role", sess.Role, "iss", claims.Issuer, "has_jti", claims.ID != "", "path", r.URL.Path)
 	return r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess)), nil
 }
 
