@@ -2,8 +2,17 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -168,5 +177,149 @@ func TestNewAPICredResolverFailFast(t *testing.T) {
 	}
 	if r.hc.Timeout != 5*time.Second {
 		t.Errorf("default timeout = %v, want 5s", r.hc.Timeout)
+	}
+}
+
+// --- credential-vault TLS trust (internal CA / self-signed) --------------
+
+// writeServerCAPEM writes the httptest TLS server's certificate to a PEM file
+// and returns its path: exactly what an operator does with their internal CA
+// (or the self-signed certificate itself) for credentials_api.tls.ca_file.
+func writeServerCAPEM(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "vault-ca.pem")
+	raw := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(p, raw, 0o600); err != nil {
+		t.Fatalf("write ca pem: %v", err)
+	}
+	return p
+}
+
+func tlsVaultServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"password":"tls-pw"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestAPICredResolverTLSCustomCA is the internal-CA fix: once the vault's
+// certificate is trusted through ca_file, the password draw succeeds over
+// HTTPS (before this, the same draw failed with x509 unknown authority).
+func TestAPICredResolverTLSCustomCA(t *testing.T) {
+	srv := tlsVaultServer(t)
+	r, err := NewAPICredResolverTLS(srv.URL, "k", 5*time.Second, &CredAPITLS{CAFile: writeServerCAPEM(t, srv)})
+	if err != nil {
+		t.Fatalf("NewAPICredResolverTLS: %v", err)
+	}
+	pw, err := r.Password(context.Background(), "mysql:ro_user@127.0.0.1:3307")
+	if err != nil {
+		t.Fatalf("Password over internal-CA TLS: %v", err)
+	}
+	if pw != "tls-pw" {
+		t.Fatalf("password = %q, want %q", pw, "tls-pw")
+	}
+}
+
+// TestAPICredResolverTLSRejectsUntrustedCert pins the PRE-FIX behaviour: an
+// internal/self-signed vault with no ca_file fails on TRUST, which is what a
+// maker saw as "backend unavailable".
+func TestAPICredResolverTLSRejectsUntrustedCert(t *testing.T) {
+	srv := tlsVaultServer(t)
+	r, err := NewAPICredResolver(srv.URL, "k", 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewAPICredResolver: %v", err)
+	}
+	_, err = r.Password(context.Background(), "mysql:ro_user@127.0.0.1:3307")
+	if err == nil {
+		t.Fatal("want x509 trust failure without ca_file, got success")
+	}
+	if !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("error = %v, want an x509 trust error", err)
+	}
+}
+
+// writeUnrelatedCAPEM generates a self-signed CA that signed NOTHING here, so
+// trusting it must not make the vault trustable. (httptest's TLS servers all
+// share one internal test certificate, so a second server's cert would be
+// indistinguishable — hence a freshly generated CA.)
+func writeUnrelatedCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "unrelated-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	p := filepath.Join(t.TempDir(), "unrelated-ca.pem")
+	if err := os.WriteFile(p, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write pem: %v", err)
+	}
+	return p
+}
+
+// TestAPICredResolverTLSTwoServersWrongCA: trusting an UNRELATED certificate
+// must not make this vault trustable.
+func TestAPICredResolverTLSTwoServersWrongCA(t *testing.T) {
+	srv := tlsVaultServer(t)
+	r, err := NewAPICredResolverTLS(srv.URL, "k", 5*time.Second, &CredAPITLS{CAFile: writeUnrelatedCAPEM(t)})
+	if err != nil {
+		t.Fatalf("NewAPICredResolverTLS: %v", err)
+	}
+	if _, err := r.Password(context.Background(), "mysql:ro_user@127.0.0.1:3307"); err == nil {
+		t.Fatal("want failure when ca_file holds an unrelated certificate")
+	}
+}
+
+// TestNewAPICredResolverTLSBadCAFile: a missing or non-certificate ca_file is
+// caught at construction (boot), never mid-session.
+func TestNewAPICredResolverTLSBadCAFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.pem")
+	if _, err := NewAPICredResolverTLS("https://vault:9000/creds", "k", time.Second, &CredAPITLS{CAFile: missing}); err == nil {
+		t.Fatal("want error for a missing ca_file")
+	}
+	garbage := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(garbage, []byte("not a pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewAPICredResolverTLS("https://vault:9000/creds", "k", time.Second, &CredAPITLS{CAFile: garbage}); err == nil {
+		t.Fatal("want error for a non-PEM ca_file")
+	}
+}
+
+// TestAPICredResolverTLSMinVersion13: the configured floor is actually applied.
+func TestAPICredResolverTLSMinVersion13(t *testing.T) {
+	srv := tlsVaultServer(t)
+	r, err := NewAPICredResolverTLS(srv.URL, "k", 5*time.Second, &CredAPITLS{CAFile: writeServerCAPEM(t, srv), MinVersion: "1.3"})
+	if err != nil {
+		t.Fatalf("NewAPICredResolverTLS: %v", err)
+	}
+	if _, err := r.Password(context.Background(), "mysql:ro_user@127.0.0.1:3307"); err != nil {
+		t.Fatalf("draw with a TLS1.3 floor: %v", err)
+	}
+}
+
+// TestAPICredResolverNilTLSKeepsDefaultTransport: no TLS block = the historical
+// client (system trust store), so existing deployments are unchanged.
+func TestAPICredResolverNilTLSKeepsDefaultTransport(t *testing.T) {
+	r, err := NewAPICredResolver("https://vault:9000/creds", "k", time.Second)
+	if err != nil {
+		t.Fatalf("NewAPICredResolver: %v", err)
+	}
+	if r.hc.Transport != nil {
+		t.Fatalf("Transport = %v, want nil (http.DefaultTransport)", r.hc.Transport)
 	}
 }

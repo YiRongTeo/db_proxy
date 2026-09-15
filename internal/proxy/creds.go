@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -54,6 +57,59 @@ type APICredResolver struct {
 	hc     *http.Client
 }
 
+// CredAPITLS is the outbound TLS trust for the credential vault, mirrored
+// from config.CredentialsAPITLSConfig so this package keeps taking primitives
+// (no config import, no layering inversion). The zero value means "system
+// trust store", which already covers a publicly-trusted HTTPS vault; only an
+// internal CA / self-signed endpoint needs CAFile.
+type CredAPITLS struct {
+	CAFile             string
+	MinVersion         string
+	InsecureSkipVerify bool
+}
+
+// newCredHTTPClient builds the vault client. With no TLS options it returns
+// the historical client (nil Transport = http.DefaultTransport = system trust
+// store), so existing deployments are byte-for-byte unchanged. With options it
+// clones the default transport and swaps in a TLS config: the CA file is
+// APPENDED to the system pool (public and internal endpoints both work),
+// min_version pins the floor, and InsecureSkipVerify is honoured as the
+// dev-only escape hatch its config comment promises.
+func newCredHTTPClient(timeout time.Duration, o *CredAPITLS) (*http.Client, error) {
+	if o == nil {
+		return &http.Client{Timeout: timeout}, nil
+	}
+	tc := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// Operator-set, warned about at boot by cmd/data; never defaulted on.
+		InsecureSkipVerify: o.InsecureSkipVerify, // #nosec G402
+	}
+	if o.MinVersion == "1.3" {
+		tc.MinVersion = tls.VersionTLS13
+	}
+	if o.CAFile != "" {
+		raw, err := os.ReadFile(o.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("credential api: read ca_file: %w", err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(raw) {
+			return nil, fmt.Errorf("credential api: ca_file %q: no certificates found", o.CAFile)
+		}
+		tc.RootCAs = pool
+	}
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("credential api: default transport is not *http.Transport")
+	}
+	tr := base.Clone()
+	tr.TLSClientConfig = tc
+	return &http.Client{Timeout: timeout, Transport: tr}, nil
+}
+
 // NewAPICredResolver validates the vault URL (fail fast at construction:
 // an unreachable/malformed vault must not surface mid-session) and builds
 // the client with the configured timeout. timeout <= 0 falls back to 5s.
@@ -71,10 +127,37 @@ func NewAPICredResolver(rawURL, apiKey string, timeout time.Duration) (*APICredR
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	return newResolverWithTLS(rawURL, apiKey, timeout, nil)
+}
+
+// NewAPICredResolverTLS is NewAPICredResolver plus outbound TLS trust for an
+// internal CA / self-signed vault (tls may be nil for the system trust store).
+func NewAPICredResolverTLS(rawURL, apiKey string, timeout time.Duration, tlsOpts *CredAPITLS) (*APICredResolver, error) {
+	return newResolverWithTLS(rawURL, apiKey, timeout, tlsOpts)
+}
+
+func newResolverWithTLS(rawURL, apiKey string, timeout time.Duration, tlsOpts *CredAPITLS) (*APICredResolver, error) {
+	if strings.TrimSpace(rawURL) == "" {
+		return nil, fmt.Errorf("credential api: empty url")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("credential api: parse url: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("credential api: url %q must be absolute (scheme + host)", rawURL)
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	hc, err := newCredHTTPClient(timeout, tlsOpts)
+	if err != nil {
+		return nil, err
+	}
 	return &APICredResolver{
 		url:    rawURL,
 		apiKey: apiKey,
-		hc:     &http.Client{Timeout: timeout},
+		hc:     hc,
 	}, nil
 }
 

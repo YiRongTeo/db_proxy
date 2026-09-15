@@ -33,7 +33,7 @@ backend login fails cleanly.
 | Auth | `X-Api-Key: <key>` header. The key is the data plane's `credentials_api.api_key` (`ZT_CREDENTIALS_API_API_KEY`), shared out-of-band. **Distinct from the retired control-plane `X-Api-Key`** — that key is gone (JWT conversion); this one is data-plane↔vault and still live |
 | Timeout | Client-side 5 s (configurable `credentials_api.timeout_seconds`); the service may take much less — the request is one password lookup, not a search |
 | Retries | **None** — the client makes exactly one attempt per connect. A failed draw = a failed session (safe, zero-trust posture) |
-| TLS | Over the wire should be HTTPS (client permits any scheme the config specifies, but an unencrypted vault is an operator choice, not a contract) |
+| TLS | **HTTPS is supported, and how it's trusted is configurable.** With no `credentials_api.tls` block the client uses the **system trust store** (`http.DefaultTransport`), which already covers a publicly-trusted certificate. For an **internal CA or self-signed** certificate set `tls.ca_file` (a PEM bundle *appended* to the system pool, so public and internal endpoints both keep working); `tls.min_version` pins the floor (1.2 default, 1.3 opt-in); `tls.require_https: true` refuses a plaintext URL; a `tls` block on a non-https URL is a load error, and a missing/invalid `ca_file` refuses to boot — never mid-session |
 
 ### Query parameters
 

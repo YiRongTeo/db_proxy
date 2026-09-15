@@ -802,6 +802,55 @@ socketserver.TCPServer(('127.0.0.1',9000),H).serve_forever()" &
 go run ./cmd/data   # then §4: token → SELECT works, password served by the stub
 ```
 
+### 2.3.1 Vault TLS — internal CA / self-signed certificates
+
+The credential-API client uses Go's default transport (the **system trust
+store**), so a publicly-trusted HTTPS vault needs **no configuration**. An
+internal CA or self-signed certificate needs its PEM anchor:
+
+```yaml
+# configs/data.yaml
+credentials_source: api
+credentials_api:
+  url: "https://vault.internal.example/creds"
+  api_key: "${ZT_CREDENTIALS_API_API_KEY}"
+  tls:
+    ca_file: "certs/vault-ca.pem"    # internal CA, or the self-signed cert itself
+    min_version: "1.2"               # "1.2" (default) | "1.3"
+    require_https: true              # optional: refuse a non-https url
+```
+
+`ca_file` is **appended to** the system pool (public and internal endpoints
+keep working). Both of these refuse to **boot** rather than fail mid-session:
+
+- `ca_file` missing, unreadable, or containing no parseable PEM CERTIFICATE;
+- a `tls` block on a non-`https` URL (the options would be inert while the
+  password travelled in plaintext) — or `require_https: true` alone on a
+  plaintext URL.
+
+Dev escape hatch: `insecure_skip_verify: true` disables verification — the
+data plane logs a loud warning at boot and this **must not** be used with real
+credentials. It exists so an internal-CA mismatch is debuggable without
+disabling TLS entirely.
+
+Diagnosing a trust failure (it fails closed — the maker sees
+`ERROR 1045 ... backend unavailable`, never a password):
+
+```bash
+# the data plane's own log names the TLS cause, e.g.:
+#   "credential api: Get \"https://vault…\": x509: certificate signed by unknown authority"
+ZT_LOG_LEVEL=debug go run ./cmd/data 2>&1 | grep -i "credential api"
+
+# capture the CA the vault actually serves (then point ca_file at this file):
+openssl s_client -connect vault.internal.example:443 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM > certs/vault-ca.pem
+
+# confirm the trust anchor BEFORE connecting through the proxy:
+curl --cacert certs/vault-ca.pem \
+  -H "X-Api-Key: $ZT_CREDENTIALS_API_API_KEY" \
+  "https://vault.internal.example/creds?db_type=mysql&db_user=ro_user&db_ip=127.0.0.1&db_port=3307"
+```
+
 ### 2.4 Query logging (Task 8.8)
 
 Every query passing through the proxy is **always** logged at Info with full context:

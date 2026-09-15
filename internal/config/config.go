@@ -1,8 +1,11 @@
 package config
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -768,6 +771,71 @@ type CredentialsAPIConfig struct {
 	URL            string `mapstructure:"url"`
 	APIKey         string `mapstructure:"api_key"`
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
+	// TLS carries the outbound trust options for the vault (optional). A nil
+	// value keeps Go's default transport, i.e. the SYSTEM trust store — which
+	// already supports a publicly-trusted HTTPS vault. An internal CA or a
+	// self-signed certificate needs ca_file here.
+	TLS *CredentialsAPITLSConfig
+}
+
+// CredentialsAPITLSConfig is the optional `credentials_api.tls` block: the
+// trust anchor and floor for the per-connect password draw. All fields are
+// optional; validateCredAPITLS fail-fasts at load, because a broken trust
+// anchor must surface at boot — never mid-session while a maker connects.
+type CredentialsAPITLSConfig struct {
+	// CAFile is a PEM bundle (internal CA, or the self-signed certificate
+	// itself) APPENDED to the system pool, so publicly-trusted and internal
+	// endpoints both keep working. Empty = system trust store only.
+	CAFile string `mapstructure:"ca_file"`
+	// MinVersion is the TLS floor: "" (Go's 1.2 default) or "1.3".
+	MinVersion string `mapstructure:"min_version"`
+	// InsecureSkipVerify disables certificate verification — DEV ONLY. The
+	// data plane logs a loud warning at boot whenever it is set.
+	InsecureSkipVerify bool `mapstructure:"insecure_skip_verify"`
+	// RequireHTTPS makes the scheme itself the check: set it and a non-https
+	// vault URL is a load error even with no other TLS option present.
+	RequireHTTPS bool `mapstructure:"require_https"`
+}
+
+// validateCredAPITLS fail-fasts the outbound vault TLS trust:
+//   - ca_file must exist and parse as PEM with at least one certificate that
+//     x509 accepts (a truncated or wrong-format file is caught here, not at
+//     the first password draw);
+//   - min_version must be "" | "1.2" | "1.3";
+//   - require_https rejects a non-https scheme outright;
+//   - a TLS block combined with a non-https URL is itself an error: the
+//     options would be inert while the password travelled in plaintext.
+func validateCredAPITLS(t *CredentialsAPITLSConfig, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("credentials_api.url: %w", err)
+	}
+	isHTTPS := strings.EqualFold(u.Scheme, "https")
+	if t.RequireHTTPS && !isHTTPS {
+		return fmt.Errorf("credentials_api.tls.require_https is set but credentials_api.url is %q — the vault password must not travel in plaintext", u.Scheme)
+	}
+	if !isHTTPS {
+		return fmt.Errorf("credentials_api.tls is configured but credentials_api.url is %q — the TLS options would be inert", u.Scheme)
+	}
+	switch t.MinVersion {
+	case "", "1.2", "1.3":
+	default:
+		return fmt.Errorf("credentials_api.tls.min_version must be \"1.2\" or \"1.3\", got %q", t.MinVersion)
+	}
+	if t.CAFile != "" {
+		raw, err := os.ReadFile(t.CAFile)
+		if err != nil {
+			return fmt.Errorf("credentials_api.tls.ca_file: %w", err)
+		}
+		block, _ := pem.Decode(raw)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return fmt.Errorf("credentials_api.tls.ca_file %q: no PEM CERTIFICATE block found", t.CAFile)
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return fmt.Errorf("credentials_api.tls.ca_file %q: %w", t.CAFile, err)
+		}
+	}
+	return nil
 }
 
 // MetricsConfig is the OTel/Prometheus scrape endpoint block (Task 9.8,
@@ -914,6 +982,18 @@ func LoadData(path string) (*DataConfig, error) {
 		}
 		if apiCfg.URL == "" {
 			return nil, fmt.Errorf("credentials_source=api requires credentials_api.url")
+		}
+		// Optional outbound TLS trust for the vault (internal CA / self-signed
+		// deployments). An all-zero block is treated as absent.
+		var tlsCfg CredentialsAPITLSConfig
+		if err := v.UnmarshalKey("credentials_api.tls", &tlsCfg); err != nil {
+			return nil, fmt.Errorf("unmarshal credentials_api.tls: %w", err)
+		}
+		if tlsCfg != (CredentialsAPITLSConfig{}) {
+			if err := validateCredAPITLS(&tlsCfg, apiCfg.URL); err != nil {
+				return nil, err
+			}
+			apiCfg.TLS = &tlsCfg
 		}
 	}
 	// Task 8.13: negative gate_wait_seconds is a config error in spirit —

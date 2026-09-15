@@ -38,9 +38,25 @@ sequenceDiagram
 credentials_source: api          # config | api   (env ZT_CREDENTIALS_SOURCE)
 credentials_api:
   url: "https://vault.example.internal/creds"   # env ZT_CREDENTIALS_API_URL
-  api_key: "..."                                # env ZT_CREDENTIALS_API_KEY
+  api_key: "..."                                # env ZT_CREDENTIALS_API_API_KEY
   timeout_seconds: 5                            # env ZT_CREDENTIALS_API_TIMEOUT_SECONDS (default 5)
+  tls:                                          # OPTIONAL — omit for a publicly-trusted cert
+    ca_file: "certs/vault-ca.pem"               # internal CA / self-signed anchor (PEM)
+    min_version: "1.2"                          # TLS floor: "1.2" (default) | "1.3"
+    require_https: false                        # true = a non-https url refuses to boot
+    insecure_skip_verify: false                 # DEV ONLY — boots with a loud warning
 ```
+
+**How the vault's TLS is trusted.** With no `tls` block the client uses Go's
+default transport → the **system trust store** (Windows certificate store /
+system CA bundle on Linux), which already covers a publicly-trusted HTTPS
+vault. An **internal CA or self-signed** certificate needs `ca_file`: it is
+**appended to** the system pool, so public and internal endpoints keep working
+side by side. `min_version` pins the floor; `require_https` makes the scheme
+itself the check. Two failures are refused at **load** (never mid-session,
+where they'd surface to a maker as "backend unavailable"): a missing or
+non-certificate `ca_file`, and a `tls` block on a non-`https` URL (the options
+would be inert while the password travelled in plaintext).
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -67,13 +68,36 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 // stored or logged — it exists in memory only for each in-flight connect.
 func buildCredResolver(cfg *config.DataConfig) (proxy.CredResolver, error) {
 	if cfg.CredentialsSource == "api" {
-		return proxy.NewAPICredResolver(
+		var tlsOpts *proxy.CredAPITLS
+		if t := cfg.CredentialsAPI.TLS; t != nil {
+			tlsOpts = &proxy.CredAPITLS{
+				CAFile:             t.CAFile,
+				MinVersion:         t.MinVersion,
+				InsecureSkipVerify: t.InsecureSkipVerify,
+			}
+		}
+		return proxy.NewAPICredResolverTLS(
 			cfg.CredentialsAPI.URL,
 			cfg.CredentialsAPI.APIKey,
 			time.Duration(cfg.CredentialsAPI.TimeoutSeconds)*time.Second,
+			tlsOpts,
 		)
 	}
 	return &proxy.ConfigCredResolver{Creds: cfg.Credentials}, nil
+}
+
+// warnCredAPITLS logs the ONE vault TLS option that must never pass silently:
+// disabling verification turns an internal-CA problem into a MITM hole. The
+// resolver itself logs nothing by design (password hygiene), so the warning
+// lives here at boot. Config load fail-fasts everything else (missing CA file,
+// bad min_version, TLS options on a non-https url).
+func warnCredAPITLS(cfg *config.DataConfig, log *slog.Logger) {
+	if cfg.CredentialsSource != "api" || cfg.CredentialsAPI == nil || cfg.CredentialsAPI.TLS == nil {
+		return
+	}
+	if cfg.CredentialsAPI.TLS.InsecureSkipVerify {
+		log.Warn("credential api: TLS certificate verification is DISABLED (credentials_api.tls.insecure_skip_verify) — dev only; an internal-CA vault needs ca_file instead", "url", cfg.CredentialsAPI.URL)
+	}
 }
 
 func main() {
@@ -128,6 +152,7 @@ func main() {
 		log.Error("credentials", "err", err)
 		os.Exit(1)
 	}
+	warnCredAPITLS(cfg, log)
 	mysqlProxy := proxy.NewMySQLProxy(log, vs, credResolver, dataTLS)
 	pgProxy := proxy.NewPGProxy(log, vs, credResolver, dataTLS)
 	// Task 9.2: the TDS (SQL Server) proxy shares the listener; the

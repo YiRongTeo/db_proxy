@@ -1,12 +1,20 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Paths are relative to this package; `go test ./internal/config/` runs with
@@ -2374,4 +2382,171 @@ auth:
 			t.Errorf("issuers[1].Audience = %q, want explicit \"zt-b\"", issuers[1].Audience)
 		}
 	})
+}
+
+// --- credential-vault TLS config (internal CA / self-signed) -------------
+
+// writeTestCAPEM generates a throwaway self-signed CA and returns its PEM
+// path: the stand-in for an operator's internal CA bundle.
+func writeTestCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-internal-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	p := filepath.Join(t.TempDir(), "internal-ca.pem")
+	if err := os.WriteFile(p, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write pem: %v", err)
+	}
+	return p
+}
+
+func TestCredentialsAPITLSCustomCA(t *testing.T) {
+	ca := writeTestCAPEM(t)
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "https://vault.internal:9000/creds"
+  api_key: "k-123"
+  tls:
+    ca_file: %q
+    min_version: "1.2"
+`, ca))
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData error: %v", err)
+	}
+	if cfg.CredentialsAPI == nil || cfg.CredentialsAPI.TLS == nil {
+		t.Fatal("CredentialsAPI.TLS = nil, want the parsed tls block")
+	}
+	if got := cfg.CredentialsAPI.TLS.CAFile; got != ca {
+		t.Errorf("TLS.CAFile = %q, want %q", got, ca)
+	}
+	if got := cfg.CredentialsAPI.TLS.MinVersion; got != "1.2" {
+		t.Errorf("TLS.MinVersion = %q, want \"1.2\"", got)
+	}
+	if cfg.CredentialsAPI.TLS.InsecureSkipVerify {
+		t.Error("TLS.InsecureSkipVerify = true, want false by default")
+	}
+}
+
+// TestCredentialsAPITLSAbsentKeepsSystemTrust: no tls block leaves the client
+// on the system trust store (publicly-trusted HTTPS vaults need no config).
+func TestCredentialsAPITLSAbsentKeepsSystemTrust(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "https://vault.example.com/creds"
+`)
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData error: %v", err)
+	}
+	if cfg.CredentialsAPI.TLS != nil {
+		t.Errorf("CredentialsAPI.TLS = %+v, want nil", cfg.CredentialsAPI.TLS)
+	}
+}
+
+func TestCredentialsAPITLSMissingCAFileFailsFast(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "https://vault.internal:9000/creds"
+  tls:
+    ca_file: "/nonexistent/internal-ca.pem"
+`)
+	_, err := LoadData(path)
+	if err == nil || !strings.Contains(err.Error(), "ca_file") {
+		t.Fatalf("err = %v, want a ca_file error", err)
+	}
+}
+
+func TestCredentialsAPITLSGarbageCAFileFailsFast(t *testing.T) {
+	junk := filepath.Join(t.TempDir(), "junk.pem")
+	if err := os.WriteFile(junk, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "https://vault.internal:9000/creds"
+  tls:
+    ca_file: %q
+`, junk))
+	_, err := LoadData(path)
+	if err == nil || !strings.Contains(err.Error(), "CERTIFICATE") {
+		t.Fatalf("err = %v, want a PEM CERTIFICATE error", err)
+	}
+}
+
+func TestCredentialsAPITLSBadMinVersionFailsFast(t *testing.T) {
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "https://vault.internal:9000/creds"
+  tls:
+    ca_file: %q
+    min_version: "1.1"
+`, writeTestCAPEM(t)))
+	_, err := LoadData(path)
+	if err == nil || !strings.Contains(err.Error(), "min_version") {
+		t.Fatalf("err = %v, want a min_version error", err)
+	}
+}
+
+// TestCredentialsAPITLSNonHTTPSURLFailsFast: TLS options on a plaintext URL
+// would be inert while the password travelled in the clear — a load error.
+func TestCredentialsAPITLSNonHTTPSURLFailsFast(t *testing.T) {
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "http://vault:9000/creds"
+  tls:
+    ca_file: %q
+`, writeTestCAPEM(t)))
+	_, err := LoadData(path)
+	if err == nil || !strings.Contains(err.Error(), "inert") {
+		t.Fatalf("err = %v, want an inert-TLS-options error", err)
+	}
+}
+
+func TestCredentialsAPITLSRequireHTTPSFailsFast(t *testing.T) {
+	path := writeTempConfig(t, `
+listen:
+  addr: ":3306"
+credentials_source: api
+credentials_api:
+  url: "http://vault:9000/creds"
+  tls:
+    require_https: true
+`)
+	_, err := LoadData(path)
+	if err == nil || !strings.Contains(err.Error(), "plaintext") {
+		t.Fatalf("err = %v, want a require_https error", err)
+	}
 }

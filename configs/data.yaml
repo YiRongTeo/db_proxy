@@ -34,9 +34,18 @@ valkey:
 # empty.
 credentials_source: config   # config | api (env: ZT_CREDENTIALS_SOURCE)
 credentials_api:
-  url: ""                    # vault endpoint, e.g. http://vault:9000/creds (env: ZT_CREDENTIALS_API_URL)
+  url: ""                    # vault endpoint — use https:// (env: ZT_CREDENTIALS_API_URL)
   api_key: ""                # sent as X-Api-Key (env: ZT_CREDENTIALS_API_API_KEY)
   timeout_seconds: 5         # per-request timeout (env: ZT_CREDENTIALS_API_TIMEOUT_SECONDS)
+  # tls:                     # OPTIONAL outbound TLS trust for the vault. Omit it for a
+  #                          # publicly-trusted HTTPS endpoint (system trust store).
+  #   ca_file: "certs/vault-ca.pem"   # internal CA / self-signed anchor (PEM), APPENDED
+  #                                   # to the system pool; missing/invalid = refuse to boot
+  #   min_version: "1.2"              # TLS floor: "1.2" (default) | "1.3"
+  #   insecure_skip_verify: false     # DEV ONLY — boots with a loud warning, MITM-exposed
+  #   require_https: false            # true = a non-https url refuses to boot
+  # NOTE: any tls block on a non-https url is a load error (the options would be inert
+  # while the password travelled in plaintext).
 credentials:                  # Data Plane owns DB credentials (zero-trust); key format <dbtype>:<db_user>@<db_ip>:<db_port>
                               # NO SECRETS IN COMMITTED CONFIGS — each password is a ${VAR} placeholder resolved from
                               # .env (git-ignored, see .env.example) or the process environment; unset = load error.
