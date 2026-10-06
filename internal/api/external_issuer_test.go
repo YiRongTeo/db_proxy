@@ -405,7 +405,7 @@ func newExtOnlyAPIServer(t *testing.T, exts ...config.ExternalIssuerConfig) (*ht
 		// Secret left EMPTY — the local self-issuer does not exist in this mode.
 	}
 	cfg := &config.ControlConfig{
-		JWT:       jwt,
+		JWT:        jwt,
 		SessionTTL: 8,
 		TokenTTL:   60,
 		StaticDir:  t.TempDir(),
