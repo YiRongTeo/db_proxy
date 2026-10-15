@@ -99,6 +99,28 @@ session:
   idle_seconds: 1800
   max_lifetime_seconds: 0
   revoke_poll_seconds: 1
+# node-integration Task 3: session-status callbacks to the main application.
+# On Maker session START (backend connect success) and END (any close reason)
+# the data plane POSTs {url}/dbpxy/session/{sessionId}/status with body
+# {"action":"started"|"ended","timestamp":"<RFC3339 UTC>"} — fire-and-forget
+# with ONE retry after 2s; failures log WARN and never affect the relay.
+#   url: the main application's base URL. EMPTY = DISABLED (the default —
+#     zero HTTP traffic; existing deployments untouched). Enable here or via
+#     env ZT_SESSION_CALLBACK_URL.
+#   timeout_seconds: per-attempt HTTP timeout (env: ZT_SESSION_CALLBACK_TIMEOUT_SECONDS).
+#   shared_secret: sent as the X-Session-Callback-Key header when set;
+#     EMPTY = no header. Deliberately NOT a ${VAR} placeholder — an unset
+#     ${VAR} fails the boot, which would force every deployment to define
+#     the secret even with callbacks disabled. Set it via
+#     ZT_SESSION_CALLBACK_SHARED_SECRET in .env when enabling.
+#   control_plane_addr: the control plane's own address — callbacks aimed
+#     at it are SKIPPED (loop protection). Default matches control.yaml
+#     http.addr; change it when the control plane moves.
+session_callback:
+  url: ""
+  timeout_seconds: 5
+  shared_secret: ""
+  control_plane_addr: "127.0.0.1:8080"
 # Task 9.8 metrics (user directive 2026-08-15): OpenTelemetry instruments
 # for the data plane, exposed on an HTTP endpoint a Prometheus server can
 # scrape. DISABLED by default — zero overhead (the proxies' metrics wrapper

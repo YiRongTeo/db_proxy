@@ -51,6 +51,11 @@ func (p *OracleProxy) SetLogQueryOutput(bool) {}
 // SetMetrics wires the OTel instruments (Task 9.8); nil keeps no-ops.
 func (p *OracleProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
+// SetSessionCallbacks wires the session-status callback client
+// (node-integration Task 3). nil (the default — session_callback.url empty)
+// keeps every notify call a no-op (the feature is disabled).
+func (p *OracleProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
+
 // oracleSession is the TNS session record (sessionCommon surface).
 type oracleSession struct {
 	id        string

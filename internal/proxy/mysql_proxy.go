@@ -123,6 +123,11 @@ func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
 // config metrics.enabled=false) keeps every instrument call a no-op.
 func (p *MySQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
+// SetSessionCallbacks wires the session-status callback client
+// (node-integration Task 3). nil (the default — session_callback.url empty)
+// keeps every notify call a no-op (the feature is disabled).
+func (p *MySQLProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
+
 // bufferedConn is a net.Conn whose reads drain a bufio.Reader before
 // touching the underlying conn. The SSLRequest reader may buffer client
 // bytes that belong to the TLS handshake (clients commonly coalesce the

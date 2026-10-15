@@ -29,11 +29,15 @@ import (
 // duplicated per proxy: log/vs (session + lifecycle publishing),
 // logQueryOutput (Task 8.8 captured-result payload on query log lines) and
 // metrics (Task 9.8 OTel instruments; nil = disabled, every call a no-op).
+// callbacks (node-integration Task 3) is the session-status callback client
+// (nil = disabled — every notify a no-op); wired once from cmd/data via
+// SetSessionCallbacks, consumed by publishLifecycle/finishSession below.
 type sessionPublisher struct {
 	log            *slog.Logger
 	vs             Store
 	logQueryOutput bool
 	metrics        *metrics.Metrics
+	callbacks      *SessionCallbacks
 }
 
 // storeCallTimeout bounds every store call made from the relay/gate hot
@@ -238,6 +242,14 @@ func (pub *sessionPublisher) publishLifecycle(s sessionCommon, tok *models.Token
 	defer cancel()
 	_ = pub.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	_ = pub.vs.Publish(ctx, "queries:sess:"+id, raw)
+	// node-integration Task 3: session-status callback to the main
+	// application — the SAME funnel serves all four protocols (one wiring,
+	// not per-protocol copies). The nil-receiver no-op (feature disabled,
+	// the default) costs nothing; fire-and-forget: the HTTP round trip
+	// runs on the callback client's own recovered goroutine, never the
+	// relay. tok carries the authoritative session id (the one the mint
+	// response returned, 0ac5768).
+	pub.callbacks.NotifySession(s, tok, action)
 	// Task 8.8 lifecycle logging: same context fields as the query line,
 	// minus sql (lifecycle events carry none). ticket_id comes from the
 	// TOKEN directly — the lifecycle WIRE event deliberately carries no

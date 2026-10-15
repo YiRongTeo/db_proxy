@@ -924,6 +924,38 @@ type DataConfig struct {
 	// keyspace-notification fast path (when the server publishes del/
 	// expired events) revokes instantly regardless.
 	RevokePollSeconds int
+	// SessionCallback (node-integration Task 3; yaml session_callback.*,
+	// env ZT_SESSION_CALLBACK_*) is the session-status callback block: on
+	// Maker session START (backend connect success) and END (any close
+	// reason) the data plane POSTs {url}/dbpxy/session/{sessionId}/status
+	// to the main application. URL empty (the committed default) = the
+	// feature is DISABLED — no HTTP traffic, existing deployments
+	// untouched (G3). SharedSecret, when set, rides every request as the
+	// X-Session-Callback-Key header; empty = no header.
+	SessionCallback SessionCallbackConfig
+}
+
+// SessionCallbackConfig is the `session_callback:` block (Task 3). The
+// committed data.yaml deliberately carries NO ${VAR} placeholder for
+// shared_secret: expandEnv fails the boot on an UNSET variable, so a
+// committed placeholder would make ZT_SESSION_CALLBACK_SECRET mandatory for
+// every existing deployment — the exact opposite of "disabled by default".
+// Operators enable via env (ZT_SESSION_CALLBACK_URL / _SHARED_SECRET /
+// _TIMEOUT_SECONDS — viper maps the single-segment keys) or by setting url
+// in the yaml.
+type SessionCallbackConfig struct {
+	// URL is the main application's base URL. Empty = disabled (default).
+	URL string `mapstructure:"url"`
+	// TimeoutSeconds bounds each callback HTTP attempt. <= 0 → the data
+	// plane's constructor applies its own 5s default.
+	TimeoutSeconds int `mapstructure:"timeout_seconds"`
+	// SharedSecret is sent as X-Session-Callback-Key when non-empty.
+	SharedSecret string `mapstructure:"shared_secret"`
+	// ControlPlaneAddr is the control plane's own address (host or
+	// host:port) — the loop-protection seed: callbacks targeting it are
+	// skipped entirely. Default 127.0.0.1:8080 (the committed control
+	// plane address).
+	ControlPlaneAddr string `mapstructure:"control_plane_addr"`
 }
 
 // LoadData reads the Data Plane config (configs/data.yaml). Secrets come
@@ -974,6 +1006,14 @@ func LoadData(path string) (*DataConfig, error) {
 		"metrics.enabled": false,
 		"metrics.listen":  "0.0.0.0:9464",
 		"metrics.path":    "/metrics",
+		// node-integration Task 3: session-status callbacks to the main
+		// application — DISABLED by default (empty url = no HTTP traffic).
+		// timeout 5s per attempt; the control plane's committed address
+		// seeds the callback client's loop protection.
+		"session_callback.url":                "",
+		"session_callback.timeout_seconds":    5,
+		"session_callback.shared_secret":      "",
+		"session_callback.control_plane_addr": "127.0.0.1:8080",
 	}); err != nil {
 		return nil, err
 	}
@@ -1046,7 +1086,13 @@ func LoadData(path string) (*DataConfig, error) {
 		SessionIdleSeconds:        v.GetInt("session.idle_seconds"),
 		SessionMaxLifetimeSeconds: v.GetInt("session.max_lifetime_seconds"),
 		RevokePollSeconds:         v.GetInt("session.revoke_poll_seconds"),
-		Metrics:                   mcfg,
+		SessionCallback: SessionCallbackConfig{
+			URL:              v.GetString("session_callback.url"),
+			TimeoutSeconds:   v.GetInt("session_callback.timeout_seconds"),
+			SharedSecret:     v.GetString("session_callback.shared_secret"),
+			ControlPlaneAddr: v.GetString("session_callback.control_plane_addr"),
+		},
+		Metrics: mcfg,
 	}
 	vc, err := readValkey(v)
 	if err != nil {

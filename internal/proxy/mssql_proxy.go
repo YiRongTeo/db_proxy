@@ -118,6 +118,11 @@ func (p *MSSQLProxy) SetGateWaitSeconds(seconds int) {
 // config metrics.enabled=false) keeps every instrument call a no-op.
 func (p *MSSQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
+// SetSessionCallbacks wires the session-status callback client
+// (node-integration Task 3). nil (the default — session_callback.url empty)
+// keeps every notify call a no-op (the feature is disabled).
+func (p *MSSQLProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
+
 // tdsTLSConn is the 0x12-wrapping seam for the TDS 8.0 TLS upgrade. TLS
 // handshake records travel inside PRELOGIN (0x12) TDS packets: the client
 // wraps each TLS record it sends in a 0x12 header, and expects the server's

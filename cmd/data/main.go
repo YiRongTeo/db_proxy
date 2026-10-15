@@ -100,6 +100,22 @@ func warnCredAPITLS(cfg *config.DataConfig, log *slog.Logger) {
 	}
 }
 
+// buildSessionCallbacks constructs the session-status callback client from
+// the session_callback block (node-integration Task 3). url empty (the
+// committed default) → (nil, nil): the feature is DISABLED and the proxies'
+// notify calls become no-ops. A non-empty url fails fast here on a malformed
+// value — a plane configured to report must never start silently broken.
+func buildSessionCallbacks(cfg *config.DataConfig, log *slog.Logger) (*proxy.SessionCallbacks, error) {
+	sc := cfg.SessionCallback
+	return proxy.NewSessionCallbacks(
+		log,
+		sc.URL,
+		time.Duration(sc.TimeoutSeconds)*time.Second,
+		sc.SharedSecret,
+		sc.ControlPlaneAddr,
+	)
+}
+
 func main() {
 	log := logging.New("data")
 	cfg, err := config.LoadData("configs/data.yaml")
@@ -192,6 +208,25 @@ func main() {
 	pgProxy.SetMetrics(m)
 	mssqlProxy.SetMetrics(m)
 	oracleProxy.SetMetrics(m)
+	// node-integration Task 3: session-status callbacks to the main
+	// application — ONE client wired into the SHARED session lifecycle
+	// funnel of all four proxies (started at connect success, ended from
+	// every close path). Disabled (nil) while session_callback.url is
+	// empty — the committed default.
+	sessionCallbacks, err := buildSessionCallbacks(cfg, log)
+	if err != nil {
+		log.Error("session callback", "err", err)
+		os.Exit(1)
+	}
+	if sessionCallbacks != nil {
+		log.Info("session callbacks enabled", "url", cfg.SessionCallback.URL,
+			"timeout_seconds", cfg.SessionCallback.TimeoutSeconds,
+			"secret", cfg.SessionCallback.SharedSecret != "")
+	}
+	mysqlProxy.SetSessionCallbacks(sessionCallbacks)
+	pgProxy.SetSessionCallbacks(sessionCallbacks)
+	mssqlProxy.SetSessionCallbacks(sessionCallbacks)
+	oracleProxy.SetSessionCallbacks(sessionCallbacks)
 	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
 	killer.SetMetrics(m)
 	killer.SetStore(vs)

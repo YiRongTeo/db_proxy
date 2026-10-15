@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
 
 	"zerotrust-proxy/internal/config"
@@ -103,5 +105,46 @@ func TestStoreOptionsTLSServerName(t *testing.T) {
 	}
 	if opts.TLS.ServerName != "" {
 		t.Errorf("sentinel mode ServerName = %q, want \"\" (master host unknown until discovery)", opts.TLS.ServerName)
+	}
+}
+
+// TestBuildSessionCallbacksDisabled (node-integration Task 3): url empty
+// (the committed default) → (nil, nil) — the feature is disabled and the
+// proxies' SetSessionCallbacks(nil) keeps every notify a no-op.
+func TestBuildSessionCallbacksDisabled(t *testing.T) {
+	cfg := &config.DataConfig{}
+	cb, err := buildSessionCallbacks(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("buildSessionCallbacks: %v", err)
+	}
+	if cb != nil {
+		t.Fatal("buildSessionCallbacks(empty url) = non-nil, want nil (disabled by default)")
+	}
+}
+
+// TestBuildSessionCallbacksEnabled pins the wiring: the block's fields flow
+// into the client (non-nil when url is set; a malformed url fails fast —
+// never a plane configured to report starting silently broken).
+func TestBuildSessionCallbacksEnabled(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &config.DataConfig{
+		SessionCallback: config.SessionCallbackConfig{
+			URL:              "http://10.0.0.9:9000",
+			TimeoutSeconds:   3,
+			SharedSecret:     "sekrit",
+			ControlPlaneAddr: "127.0.0.1:8080",
+		},
+	}
+	cb, err := buildSessionCallbacks(cfg, log)
+	if err != nil {
+		t.Fatalf("buildSessionCallbacks: %v", err)
+	}
+	if cb == nil {
+		t.Fatal("buildSessionCallbacks(url set) = nil, want non-nil")
+	}
+	if _, err := buildSessionCallbacks(&config.DataConfig{
+		SessionCallback: config.SessionCallbackConfig{URL: "::bad::"},
+	}, log); err == nil {
+		t.Fatal("buildSessionCallbacks(malformed url): want error, got nil")
 	}
 }
