@@ -1064,11 +1064,25 @@ JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 # 2) mint with the JWT. The body username (optional) must match the JWT's
 #    subject or be omitted — the token is always issued for the principal.
+#    Node-integration: db_port is OPTIONAL now (resolved from db_type +
+#    db_subtype defaults: mysql 3306 / postgres 5432 / mssql 1433 / oracle 1521;
+#    an explicit db_port always wins), and the OPTIONAL end_time / password
+#    fields are shown commented:
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
   -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"TICKET-1"}' \
+  -d '{"username":"admin","db_user":"ro_user","db_ip":"127.0.0.1","db_type":"mysql","ticket_id":"TICKET-1"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+#    - omit "db_port" → resolved from the default-port map (3306 above);
+#      "db_subtype" refines the lookup but no non-default subtypes ship yet —
+#      pass db_port explicitly for those or the mint is 422.
+#    - add  "end_time":"2026-10-15T18:00:00Z"  (or integer epoch seconds) → the
+#      token dies at that instant; response then carries "expires_at" too.
+#      Ceiling: api.max_session_seconds (0 = uncapped).
+#    - add  "password":"<backend-password>" → at-mint credential override
+#      (ztcred:<session_id> key, TTL = token TTL, data plane resolves
+#      override-first). Requires a FINITE token ttl: with session mode +
+#      session_token_ttl_seconds: 0 you MUST also pass end_time (else 422).
 echo "$TOKEN"
 ```
 
@@ -1078,14 +1092,53 @@ life): `curl -X POST http://127.0.0.1:8080/api/logout -H "Authorization: Bearer 
 Self-issued JWTs default to `auth.jwt.ttl_seconds: 28800` (8 h); on expiry the
 SPA sends you back to `/login`.
 
-Response shape (DB token is always `sess_…`): `{"token":"sess_…","host":"127.0.0.1","port":"3306","expires_in":300}`
-(session-mode tokens report `expires_in: -1` = infinite, revoked by deletion).
+Response shape (DB token is always `sess_…`): `{"token":"sess_…","session_id":"sid-…","host":"127.0.0.1","port":"3306","expires_in":300}`
+(session-mode tokens report `expires_in: -1` = infinite, revoked by deletion;
+**`expires_at` (unix seconds) appears only when the mint carried `end_time`**,
+and then `expires_in` is the end_time-derived TTL even in the infinite-TTL
+session case).
 
 For PostgreSQL swap `"db_type":"postgres"` and the backend port `"db_port":"5433"` (user `ro_user`).
 
 > Mint without a bearer → `401`; unknown `db_type` → `422`; missing fields → `400`;
 > a **checker**-role principal minting a write-access token → `403` (checkers are
 > read-only minters — they cannot create a write session they could then watch, §5).
+> All node-integration request/response fields, defaults and error messages:
+> **[docs/11-node-integration.md](docs/11-node-integration.md)**.
+
+### 3.2 Session callbacks to the main application (node-integration)
+
+Optional: the data plane can report Maker session **start/end** to the main
+application — `POST {url}/dbpxy/session/{sessionId}/status` with body
+`{"action":"started"|"ended","timestamp":"<RFC3339 UTC>"}` and an
+`X-Session-Callback-Key` header when a shared secret is set. Fire-and-forget
+with exactly one retry after 2 s; failures are WARN-only and never affect the
+relay. **Disabled by default** (`session_callback.url` empty). Full contract:
+[docs/11-node-integration.md](docs/11-node-integration.md) §11.6.
+
+**Enable** (config in `configs/data.yaml`, or env — restart the data plane after):
+
+```bash
+# via env (the secret lives in .env — there is deliberately NO committed
+# ${VAR} placeholder for it, so enabling never forces the secret on others):
+ZT_SESSION_CALLBACK_URL=http://127.0.0.1:8080 \
+ZT_SESSION_CALLBACK_SHARED_SECRET=change-me-to-a-long-random-string-0123456789 \
+ZT_SESSION_CALLBACK_TIMEOUT_SECONDS=5 \
+  go run ./cmd/data
+# the main app then receives on session start/end:
+#   POST http://127.0.0.1:8080/dbpxy/session/sid-<hex>/status
+#   X-Session-Callback-Key: change-me-to-a-long-random-string-0123456789
+#   {"action":"started","timestamp":"2026-10-15T09:00:00Z"}
+```
+
+**Disable**: leave `ZT_SESSION_CALLBACK_URL` unset/empty (committed default)
+— the data plane never sends a callback. Turning it off needs only a restart
+without the env (or `session_callback.url: ""` in `configs/data.yaml`).
+
+**Loop protection:** the data plane never dials a callback target whose
+host:port equals `session_callback.control_plane_addr` (default
+`127.0.0.1:8080`) — update that knob when the control plane moves or is
+reached non-loopback; a protected target is skipped with no attempt.
 
 ---
 

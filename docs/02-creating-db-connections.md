@@ -62,7 +62,7 @@ sequenceDiagram
 | `username` | no | Must match the bearer JWT's subject or be omitted — the token is ALWAYS issued for the authenticated principal (mint-for-others is rejected) |
 | `ticket_id` | yes | Approval/change ticket — required since Phase 6; missing → `400` |
 | `db_type` | yes | `mysql` \| `postgres` \| `mssql` \| `oracle` |
-| `db_user`, `db_ip`, `db_port` | yes | Target connection parameters (the `db_presets` allowlist in `configs/control.yaml` decides the resolved `access` level) |
+| `db_user`, `db_ip`, `db_port` | `db_user`/`db_ip` yes; `db_port` optional — resolved from `db_type` + `db_subtype` defaults when omitted (explicit wins; see [Page 11](11-node-integration.md)) | Target connection parameters (the `db_presets` allowlist in `configs/control.yaml` decides the resolved `access` level) |
 | `mode` | no | Token flavor: `single-use` (default) \| `session` (multi-connect, IP-locked, revocable — see RUN.md §3) |
 | `idle_seconds` | no | Per-token data-plane idle override (0/absent = the data-plane default) |
 
@@ -75,6 +75,7 @@ principal is limited to read-access mints — `POST /api/token` for a write pres
 ```json
 {
   "token": "sess_3dbeca423e...",
+  "session_id": "sid-1a2b3c4d5e6f7a8b",
   "host": "127.0.0.1",
   "port": "3306",
   "expires_in": 300
@@ -84,8 +85,14 @@ principal is limited to read-access mints — `POST /api/token` for a write pres
 | Field | Meaning |
 |---|---|
 | `token` | The single-use token. **The client uses it as the DB username.** Format `sess_<32 hex>`. TTL 300 s. |
+| `session_id` | The session directory id (`sid-<16 hex>`) stamped at mint — the key for checker feeds, `/api/kill`, audit rows and session callbacks. |
 | `host` / `port` | The shared Data Plane public listener (from `configs/control.yaml` `api.data_plane_*`) — same port for every protocol |
 | `expires_in` | Seconds until expiry (`-1` for infinite session-mode tokens) |
+| `expires_at` | **Only present when the mint carried `end_time`** — the absolute expiry in unix seconds; omitted otherwise |
+
+> **Node integration** (optional `db_port` + `db_subtype`, `end_time`, `password`,
+> session callbacks to the main application): the full client-facing contract is
+> **[Page 11 — Node Integration](11-node-integration.md)**.
 
 ### Error responses
 
