@@ -20,11 +20,11 @@ import (
 // DataRow, CommandComplete, ReadyForQuery) so the message-level relay starts
 // from a clean stream.
 //
-// Task 8.2 degrade-gracefully rule: ANY failure — send/receive error,
-// ErrorResponse, unparsable cell — logs and returns 0. The session proceeds
-// with pid 0; the session directory simply lacks connection context.
-// Review round 3: the probe runs under a read deadline (threadIDCaptureTimeout)
-// so a stalled backend degrades to 0 instead of hanging the session setup.
+// Degrade-gracefully rule: ANY failure — send/receive error, ErrorResponse,
+// unparsable cell — logs and returns 0; the session directory simply lacks
+// connection context. The probe runs under a read deadline
+// (threadIDCaptureTimeout) so a stalled backend degrades to 0 instead of
+// hanging the session setup.
 func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
 	if err := front.conn.SetReadDeadline(time.Now().Add(threadIDCaptureTimeout)); err != nil {
 		log.Warn("thread id capture: set read deadline failed", "err", err)
@@ -72,11 +72,10 @@ func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
 // backend connection with the session's credentials (PostgreSQL permits
 // same-role cancel) and consumes the full exchange. Bounded by ctx and a
 // conn deadline; returns whether the backend answered 't'. Shared by
-// KillQuery (Task 8.3) and the client CancelRequest path (review
-// 2026-08-17 — de-duplicated from KillQuery's inline exchange).
+// KillQuery and the client CancelRequest path.
 func (p *PGProxy) cancelBackendExchange(ctx context.Context, s *pgSession) (bool, error) {
-	// OverrideCreds: the cancel second connect resolves the credential
-	// through the same override-first chain as the session's own connect.
+	// OverrideCreds: the cancel second connect uses the same
+	// override-first chain as the session connect.
 	front, err := connectPostgresBackend(ctx, s.tok, OverrideCreds(p.creds, s.tok), s.db)
 	if err != nil {
 		return false, err
@@ -120,7 +119,7 @@ const defaultPGDatabase = "appdb"
 // connectPostgresBackend authenticates to the real PostgreSQL backend with
 // Data-Plane-owned credentials (keyed by backendKey, shared with the MySQL
 // side), then hijacks the connection and hands back the raw byte stream for
-// the relay (Task 4.3). pgx performs the FULL auth handshake
+// the relay. pgx performs the FULL auth handshake
 // (SCRAM-SHA-256 etc.) so the proxy never re-implements PG auth; after the
 // handshake the backend session is idle and its stream is clean for relaying
 // subsequent client traffic verbatim.
@@ -151,13 +150,13 @@ const defaultPGDatabase = "appdb"
 // connect_timeout=10 bounds the whole connect+auth (dial AND handshake):
 // pgx's default is unbounded, and a backend that accepts but never speaks
 // would pin the session goroutine, the client connection and the consumed
-// token forever — same failure mode Task 3.8 bounded on the MySQL side.
+// token forever — the same failure mode bounded on the MySQL side.
 func connectPostgresBackend(ctx context.Context, t *models.TokenPayload, res CredResolver, dbName string) (*pgFrontend, error) {
 	pw, err := res.Password(ctx, backendKey(t))
 	if err != nil {
 		return nil, err
 	}
-	// Review round 3: the password is set via the parsed config FIELDS (not
+	// The password is set via the parsed config FIELDS (not
 	// DSN interpolation) so a password containing spaces, quotes, or
 	// backslashes cannot corrupt the DSN parameter syntax. user= is also
 	// applied as a field for the same reason.

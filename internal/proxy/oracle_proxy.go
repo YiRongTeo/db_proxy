@@ -51,9 +51,8 @@ func (p *OracleProxy) SetLogQueryOutput(bool) {}
 // SetMetrics wires the OTel instruments (Task 9.8); nil keeps no-ops.
 func (p *OracleProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
-// SetSessionCallbacks wires the session-status callback client
-// (node-integration Task 3). nil (the default — session_callback.url empty)
-// keeps every notify call a no-op (the feature is disabled).
+// SetSessionCallbacks wires the session-status callback client. nil (the
+// default — session_callback.url empty) keeps every notify a no-op.
 func (p *OracleProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
 
 // oracleSession is the TNS session record (sessionCommon surface).
@@ -193,8 +192,7 @@ func (p *OracleProxy) handleConn(client net.Conn) {
 	}
 	ctx, cancel = storeCallCtx()
 	// OverrideCreds: a CredOverride token resolves its password from
-	// ztcred:<sid> first (node-integration Task 4), falling back to the
-	// configured chain — same contract as the other three protocols.
+	// ztcred:<sid> first — same contract as the other protocols.
 	password, err := OverrideCreds(p.creds, tok).Password(ctx, backendKey(tok))
 	cancel()
 	if err != nil {

@@ -123,9 +123,8 @@ func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
 // config metrics.enabled=false) keeps every instrument call a no-op.
 func (p *MySQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
-// SetSessionCallbacks wires the session-status callback client
-// (node-integration Task 3). nil (the default — session_callback.url empty)
-// keeps every notify call a no-op (the feature is disabled).
+// SetSessionCallbacks wires the session-status callback client. nil (the
+// default — session_callback.url empty) keeps every notify a no-op.
 func (p *MySQLProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
 
 // bufferedConn is a net.Conn whose reads drain a bufio.Reader before
@@ -204,8 +203,8 @@ func (p *MySQLProxy) KillQuery(id string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
 	defer cancel()
-	// OverrideCreds: the kill-query second connect resolves the credential
-	// through the same override-first chain as the session's own connect.
+	// OverrideCreds: the kill-query second connect resolves its credential
+	// through the same override-first chain as the session connect.
 	backend, err := connectMySQLBackend(ctx, s.tok, OverrideCreds(p.creds, s.tok), s.db)
 	if err != nil {
 		p.log.Warn("kill query: backend connect failed", "session_id", id, "err", err)
@@ -362,8 +361,8 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 
 	// 4. backend connection (real credentials, client-requested database).
 	// OverrideCreds: a CredOverride token resolves its password from
-	// ztcred:<sid> first (node-integration Task 4), falling back to the
-	// configured chain on miss/expiry — see cred_chain.go.
+	// ztcred:<sid> first, falling back to the configured chain (see
+	// cred_chain.go).
 	backend, err := connectMySQLBackend(ctx, tok, OverrideCreds(p.creds, tok), database)
 	if err != nil {
 		p.metrics.ConnectionsTotal("mysql", "rejected")

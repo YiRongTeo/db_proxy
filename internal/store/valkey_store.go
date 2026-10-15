@@ -450,20 +450,17 @@ func (s *ValkeyStore) ListSessionsParsed(ctx context.Context) ([]SessionInfo, er
 	return out, nil
 }
 
-// credOverridePrefix keys the at-mint credential overrides (node-integration
-// Task 4): ztcred:<session_id> = JSON {"password":"…"}, written by the mint
-// when POST /api/token carried a password. The key is SEPARATE from tok: (a
-// leaked payload must not drag the credential with it) and dies by its own
-// TTL — the token's resolved TTL — so the override can never outlive the
-// session it belongs to.
+// credOverridePrefix keys the at-mint credential overrides:
+// ztcred:<session_id> = JSON {"password":"…"}, written by the mint when
+// POST /api/token carried a password. SEPARATE from tok: (a leaked payload
+// must not drag the credential with it); its TTL is the token's resolved
+// TTL, so the override never outlives its session.
 const credOverridePrefix = "ztcred:"
 
-// SetCredOverride stores the at-mint password override for sid with a TTL.
-// The value is exactly {"password":<pw>} — the shape the data plane's
-// override chain decodes. Hard refusals (caller bugs): an empty sid, an
-// empty password (an override that carries nothing must never be written —
-// absent means absent), and a non-positive ttl (an eternal credential is
-// exactly what G2 forbids). The password appears in NO error path here.
+// SetCredOverride stores the at-mint password override for sid with a TTL,
+// as exactly {"password":<pw>}. Hard refusals (caller bugs): empty sid,
+// empty password (absent means absent), non-positive ttl (an eternal
+// credential is forbidden). The password appears in NO error path here.
 func (s *ValkeyStore) SetCredOverride(ctx context.Context, sid, pw string, ttl time.Duration) error {
 	if sid == "" {
 		return errors.New("cred override: empty session id")
@@ -486,13 +483,13 @@ func (s *ValkeyStore) SetCredOverride(ctx context.Context, sid, pw string, ttl t
 		Ex(ttl).Build()).Error()
 }
 
-// GetCredOverride reads the override password for sid. GET, deliberately NOT
-// GETDEL: session-mode reconnects may need the override more than once; its
-// life is bounded by the TTL, not by consumption. A missing/expired key is a
-// clean MISS ("" , nil) — the caller falls back to the normal resolver
-// chain. A stored value that fails to decode is a FIXED error string: the
-// message must never embed the stored bytes, because it can reach a WARN log
-// line. All error paths here are constant — the password cannot leak.
+// GetCredOverride reads the override password for sid. GET, deliberately
+// NOT GETDEL: session-mode reconnects may need the override more than once;
+// its life is bounded by the TTL. A missing/expired key is a clean MISS
+// ("", nil) — the caller falls back to the normal chain. A stored value
+// that fails to decode returns a FIXED error string: the message must
+// never embed the stored bytes (they can reach a WARN log). All error
+// paths here are constant — the password cannot leak.
 func (s *ValkeyStore) GetCredOverride(ctx context.Context, sid string) (string, error) {
 	if sid == "" {
 		return "", errors.New("cred override: empty session id")

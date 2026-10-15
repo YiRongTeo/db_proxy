@@ -118,9 +118,8 @@ func (p *MSSQLProxy) SetGateWaitSeconds(seconds int) {
 // config metrics.enabled=false) keeps every instrument call a no-op.
 func (p *MSSQLProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
-// SetSessionCallbacks wires the session-status callback client
-// (node-integration Task 3). nil (the default — session_callback.url empty)
-// keeps every notify call a no-op (the feature is disabled).
+// SetSessionCallbacks wires the session-status callback client. nil (the
+// default — session_callback.url empty) keeps every notify a no-op.
 func (p *MSSQLProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
 
 // tdsTLSConn is the 0x12-wrapping seam for the TDS 8.0 TLS upgrade. TLS
@@ -445,7 +444,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// derived obfuscation, client-requested database kept). The backend
 	// leg is TLS when the data plane is (the backend accepts both).
 	// OverrideCreds: a CredOverride token resolves its password from
-	// ztcred:<sid> first (node-integration Task 4).
+	// ztcred:<sid> first.
 	backend, backendBR, loginResp, loginOK, envDB, err := connectMSSQLBackend(ctx, tok, OverrideCreds(p.creds, tok), li, p.tlsCfg != nil)
 	if err != nil {
 		p.metrics.ConnectionsTotal("mssql", "rejected")

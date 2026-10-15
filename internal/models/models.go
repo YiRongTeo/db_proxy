@@ -17,14 +17,14 @@ type TokenPayload struct {
 	DBPort   string `json:"db_port"`             // backend DB port
 	DBType   string `json:"db_type"`             // "mysql" | "postgres" | "mssql"
 	TicketID string `json:"ticket_id,omitempty"` // optional maker-checker grouping
-	Access   string `json:"access,omitempty"`    // "read" | "write" (Task 8.6 maker write-gating); absent = read
-	// SessionID (Task 8.11) is the session directory id stamped by the
-	// CONTROL PLANE at issue time, so the session is visible to checkers
-	// (status "pending") BEFORE the maker ever connects — the gating
-	// deadlock fix. The data plane adopts it as its session id; tokens
-	// without it (pre-8.11 / tests) fall back to generating one.
+	Access   string `json:"access,omitempty"`    // "read" | "write"; absent = read
+	// SessionID is the session directory id stamped by the CONTROL PLANE
+	// at issue time, so the session is visible to checkers (status
+	// "pending") BEFORE the maker ever connects. The data plane adopts it
+	// as its session id; tokens without it (tests) fall back to generating
+	// one.
 	SessionID string `json:"session_id,omitempty"`
-	// MaxUses (Task 9.12, option-2 multi-use) is the number of REMAINING
+	// MaxUses is the number of REMAINING
 	// connections this token may open before it is deleted. 0/absent = 1
 	// (single-use — the historical zero-trust default; the data plane
 	// treats any value < 1 as 1). The store decrements it atomically on
@@ -33,7 +33,7 @@ type TokenPayload struct {
 	// GUI clients (SSMS/DBeaver) open several connections per session and
 	// need a small budget; the TTL still bounds the window.
 	MaxUses int `json:"max_uses,omitempty"`
-	// Mode (Task 9.13, option-A session tokens) is ""|"single-use" (the
+	// Mode is ""|"single-use" (the
 	// historical behavior) or "session": a session token is NOT consumed
 	// by connections — it stays valid until revoked (key deleted), its
 	// TTL (infinite when the mint TTL is 0), or the data plane's
@@ -46,28 +46,21 @@ type TokenPayload struct {
 	Mode     string `json:"mode,omitempty"`
 	IP       string `json:"ip,omitempty"`        // issue-time client IP (normalized), session mode only
 	IssuedAt int64  `json:"issued_at,omitempty"` // unix seconds — max-lifetime anchor (session mode)
-	// IdleSeconds (Task 9.13 per-token idle override) is the session idle
+	// IdleSeconds is the session idle
 	// timeout for THIS token, in seconds. 0/absent = follow the data
 	// plane's session.idle_seconds default (which applies to EVERY token
 	// mode). >0 overrides the default for sessions opened with this token.
 	IdleSeconds int `json:"idle_seconds,omitempty"`
-	// ExpiresAt (node-integration Task 2) is the end_time instant the mint
-	// was asked to honor, unix seconds — stamped at issue when the request
-	// carried end_time, absent otherwise. INFORMATIONAL: it lets the data
-	// plane log remaining life; force-close does NOT depend on it. The
-	// enforcement is the tok: key TTL (the mint stores the token with
-	// ttl = min(end_time − now, existing TTL rules)), and when that key
-	// expires the existing revoke path (poll + keyspace fast path) closes
-	// running sessions — same as any other key deletion.
+	// ExpiresAt is the end_time instant the mint was asked to honor, unix
+	// seconds — informational only: enforcement is the tok: key TTL, and
+	// when that key expires the revoke path closes running sessions.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
-	// CredOverride (node-integration Task 4) marks a token whose mint
-	// carried a `password`: the data plane must consult the ztcred:<sid>
-	// override key FIRST when resolving the backend credential, falling
-	// back to the normal config/api chain when the key is missing or
-	// expired (a WARN with the reason only — never a value). Absent/false
-	// (G3): the chain behaves exactly as before — the store is never
-	// consulted. The password itself NEVER rides the payload; it lives in
-	// the separate ztcred:<sid> key with the token's own TTL.
+	// CredOverride marks a token minted with a `password`: the data plane
+	// consults the ztcred:<sid> override key FIRST, falling back to the
+	// normal chain on a missing/expired key (the WARN carries the reason
+	// only — never a value). Absent/false: the store is never consulted.
+	// The password NEVER rides the payload; it lives only in the ztcred:
+	// key with the token's own TTL.
 	CredOverride bool `json:"cred_override,omitempty"`
 }
 
@@ -94,9 +87,8 @@ func NormalizeIP(host string) string {
 
 // randomHex returns n random bytes hex-encoded (2*n hex chars). rand.Read
 // cannot fail in practice on supported platforms; the zero fallback keeps
-// the id well-formed in that pathological case. Shared by NewSessionID and
-// NewEventID (Task 9.9: the control plane's duplicate event-id generator
-// was deduplicated onto this).
+// the id well-formed in that pathological case. Shared by NewSessionID
+// and NewEventID.
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -106,17 +98,16 @@ func randomHex(n int) string {
 }
 
 // NewSessionID returns a random session id in the sid-<hex> form shared by
-// the Control Plane (stamped into tokens at issue time — Task 8.11) and the
-// Data Plane (fallback when a token carries no sid). The form mirrors the
-// data plane's legacy "sid-" + 16-hex generation so old and new ids are
-// indistinguishable on the wire.
+// the Control Plane (stamped into tokens at issue time) and the Data Plane
+// (fallback when a token carries no sid). The form mirrors the data plane's
+// generation so old and new ids are indistinguishable on the wire.
 func NewSessionID() string {
 	return "sid-" + randomHex(8)
 }
 
 // NewEventID returns a random 64-bit hex id for control-plane lifecycle
 // events (kind=session issued events; mirrors the data plane's event id
-// format). Deduplicated with NewSessionID via randomHex (Task 9.9).
+// format), via randomHex.
 func NewEventID() string {
 	return randomHex(8)
 }
@@ -128,10 +119,8 @@ type TokenResponse struct {
 	Host      string `json:"host"`
 	Port      string `json:"port"`
 	ExpiresIn int    `json:"expires_in"` // seconds
-	// ExpiresAt (node-integration Task 2) is the absolute token expiry as
-	// unix seconds — present only when the mint carried end_time (the
-	// endTime instant); 0/omitempty otherwise, keeping the response
-	// byte-identical to the pre-end_time shape for existing clients (G3).
+	// ExpiresAt is the absolute token expiry as unix seconds — present
+	// only when the mint carried end_time; omitted otherwise.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
@@ -149,7 +138,7 @@ type QueryEvent struct {
 	DBType     string    `json:"db_type"` // mysql | postgres | mssql
 	SQL        string    `json:"sql"`
 	ClientAddr string    `json:"client_addr"`
-	// Phase 6 enhancement fields — all omitempty for wire backward compatibility.
+	// Query-result fields — all omitempty for wire backward compatibility.
 	StmtType  string     `json:"stmt_type,omitempty"`  // select|insert|update|delete|other
 	SessionID string     `json:"session_id,omitempty"` // data-plane session id (kill target; NOT the token)
 	Status    string     `json:"status,omitempty"`     // ok|error (from DB response)
@@ -157,19 +146,18 @@ type QueryEvent struct {
 	Columns   []string   `json:"columns,omitempty"`
 	Rows      [][]string `json:"rows,omitempty"`
 	Truncated bool       `json:"truncated,omitempty"`
-	// Phase 8 enhancement fields — all omitempty for wire backward compatibility.
+	// Session-lifecycle fields — all omitempty for wire backward compatibility.
 	Action string `json:"action,omitempty"` // started|ended — session lifecycle events
 	DB     string `json:"db,omitempty"`     // client-requested target database
 }
 
 // Session is the authenticated principal — username plus maker/checker
-// role — carried in the request context: requireJWT (and the bare
-// /api/token route since Task 4) parses a self-issued bearer JWT and builds
-// this under sessionKey{}, where sessionFrom(r) consumers read it.
+// role — carried in the request context: requireJWT parses a bearer JWT
+// and builds this under sessionKey{}, where sessionFrom(r) consumers read.
 type Session struct {
 	Username string `json:"username"`
 	Role     string `json:"role,omitempty"` // "maker" | "checker"
-	// LoginSessionID (Phase 2b) is the IdP login session id from an
+	// LoginSessionID is the IdP login session id from an
 	// external issuer's session_id claim (default name "sessionId"),
 	// carried on the principal so mint handlers can stamp it onto audit
 	// rows (zt_audit.sessions.login_session_id) — the trace from a DB

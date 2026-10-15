@@ -141,9 +141,8 @@ func (p *PGProxy) SetGateWaitSeconds(seconds int) {
 // config metrics.enabled=false) keeps every instrument call a no-op.
 func (p *PGProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
-// SetSessionCallbacks wires the session-status callback client
-// (node-integration Task 3). nil (the default — session_callback.url empty)
-// keeps every notify call a no-op (the feature is disabled).
+// SetSessionCallbacks wires the session-status callback client. nil (the
+// default — session_callback.url empty) keeps every notify a no-op.
 func (p *PGProxy) SetSessionCallbacks(cb *SessionCallbacks) { p.callbacks = cb }
 
 // registerSession adds a session to the registry so it can be killed by id

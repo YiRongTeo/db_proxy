@@ -1,19 +1,14 @@
 package proxy
 
-// node-integration Task 4 — the credential-override chain. When a token
-// carries CredOverride (minted with a password), the backend credential is
-// resolved from ztcred:<sid> FIRST; a missing/expired key (or a store error)
-// falls through to the normal resolver chain with a WARN that carries the
-// REASON only — never a value (G2). Tokens without the flag resolve exactly
-// as before (G3): the store is never consulted, byte-for-byte today's path.
-//
-// Wiring: the proxy constructors wrap the configured CredResolver into an
-// overrideChain ONCE (WrapCredResolver). The connect paths call
-// OverrideCreds(creds, tok) — a CredResolver view bound to the token — and
-// hand THAT to the existing connect*Backend functions, so no connect
-// signature changes and every protocol (MySQL, PostgreSQL, MSSQL, Oracle —
-// including the kill-query / pg_cancel second connects) inherits
-// override-first resolution uniformly.
+// The credential-override chain: when a token carries CredOverride (minted
+// with a password), the backend credential resolves from ztcred:<sid>
+// FIRST; a missing/expired key (or a store error) falls through to the
+// normal resolver chain with a WARN carrying the REASON only — never a
+// value. Tokens without the flag never touch the store. Wiring: the proxy
+// constructors wrap the configured CredResolver once (WrapCredResolver);
+// connect paths call OverrideCreds(creds, tok), so every protocol —
+// including kill-query / pg_cancel second connects — inherits
+// override-first resolution with no connect signature changes.
 
 import (
 	"context"
@@ -24,8 +19,7 @@ import (
 )
 
 // overrideStore is the narrow store surface the chain needs (the concrete
-// *store.ValkeyStore satisfies it; the interface keeps this file taking
-// primitives, mirroring Store in store_iface.go).
+// *store.ValkeyStore satisfies it).
 type overrideStore interface {
 	// GetCredOverride returns the override password for sid; ""/nil on a
 	// clean miss (missing or expired key).
@@ -44,11 +38,8 @@ type overrideChain struct {
 // compile-time: the concrete store satisfies the narrow override surface.
 var _ overrideStore = (*store.ValkeyStore)(nil)
 
-// WrapCredResolver builds the chain around r. A nil vs or nil r (tests
-// constructing proxies without a store/resolver) degrades to the bare
-// resolver — every behavior below the wrap stays byte-identical. vs is the
-// Store the proxy already holds: only its GetCredOverride surface is used
-// (satisfying overrideStore is compile-time-checked here).
+// WrapCredResolver builds the chain around r. A nil vs or nil r degrades
+// to the bare resolver — behavior below the wrap stays byte-identical.
 func WrapCredResolver(r CredResolver, vs overrideStore, log *slog.Logger) CredResolver {
 	if vs == nil || r == nil {
 		return r
@@ -56,9 +47,8 @@ func WrapCredResolver(r CredResolver, vs overrideStore, log *slog.Logger) CredRe
 	return &overrideChain{fallback: r, vs: vs, log: log}
 }
 
-// Password is the un-bound resolution path (the chain itself satisfies
-// CredResolver for symmetry; today's call sites all go through
-// OverrideCreds with the token in scope).
+// Password is the un-bound resolution path (the chain satisfies
+// CredResolver for symmetry; call sites go through OverrideCreds).
 func (c *overrideChain) Password(ctx context.Context, key string) (string, error) {
 	return c.fallback.Password(ctx, key)
 }
@@ -76,28 +66,27 @@ func (t *tokenBoundResolver) Password(ctx context.Context, key string) (string, 
 	c := t.chain
 	tok := t.tok
 	if tok == nil || !tok.CredOverride || tok.SessionID == "" {
-		// G3: no override in play — today's path, no store call.
+		// No override in play — plain fallback path, no store call.
 		return c.fallback.Password(ctx, key)
 	}
 	ov, oerr := c.vs.GetCredOverride(ctx, tok.SessionID)
 	if oerr != nil {
 		// The error text is FIXED upstream (never carries a value) — the
-		// reason reaches the log, the value never does (G2).
+		// reason reaches the log, the value never does.
 		c.warn("cred override read failed; falling back to the configured resolver", tok.SessionID)
 		return c.fallback.Password(ctx, key)
 	}
 	if ov == "" {
-		// Missing/expired key: the override died with its TTL (the same TTL
-		// the token has, so this is a narrow race window, not a policy
-		// change). WARN with the reason only, then the normal chain.
+		// Missing/expired key: the override died with its TTL (the same
+		// TTL the token has — a narrow race window, not a policy change).
 		c.warn("cred override miss; falling back to the configured resolver", tok.SessionID)
 		return c.fallback.Password(ctx, key)
 	}
 	return ov, nil
 }
 
-// warn logs at WARN with the session id — a REASON ONLY. The passwords
-// resolved above never reach it (G2: no password in any log line).
+// warn logs at WARN with the session id — REASON ONLY; passwords never
+// reach any log line.
 func (c *overrideChain) warn(msg, sid string) {
 	if c.log != nil {
 		c.log.Warn(msg, "session_id", sid)
@@ -105,8 +94,7 @@ func (c *overrideChain) warn(msg, sid string) {
 }
 
 // OverrideCreds returns the token-bound CredResolver for tok. Non-chain
-// resolvers (tests passing bare ConfigCredResolvers) pass through
-// unchanged, so their exact behavior is preserved everywhere.
+// resolvers pass through unchanged.
 func OverrideCreds(r CredResolver, tok *models.TokenPayload) CredResolver {
 	if c, ok := r.(*overrideChain); ok {
 		return c.credsFor(tok)

@@ -104,13 +104,11 @@ type ControlConfig struct {
 	// (key deleted) or the data plane's idle/max-lifetime enforcement.
 	// Single-use tokens keep api.token_ttl_seconds.
 	SessionTokenTTL int
-	// MaxSessionSeconds (node-integration Task 2; yaml
-	// api.max_session_seconds, env ZT_API_MAX_SESSION_SECONDS) is the
-	// OPTIONAL CEILING on an end_time-derived token lifetime: when > 0, a
-	// mint whose end_time − now exceeds it is rejected 422 ("end_time
-	// exceeds max session duration"); a value exactly at the ceiling is
-	// accepted. 0 (default) = UNCAPPED. It bounds ONLY the end_time
-	// mechanism — mints without end_time are untouched (G3).
+	// MaxSessionSeconds (yaml api.max_session_seconds, env
+	// ZT_API_MAX_SESSION_SECONDS) is the OPTIONAL CEILING on an
+	// end_time-derived token lifetime: when > 0, a mint whose end_time
+	// exceeds it is rejected 422 (exactly at the ceiling accepted);
+	// 0 = uncapped. Bounds ONLY the end_time mechanism.
 	MaxSessionSeconds int
 	DataPlaneHost     string
 	DataPlanePort     string
@@ -445,8 +443,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		// Task 9.13 session tokens: default issue mode single-use; session
 		// TTL 0 = infinite (revocation is explicit, never timer-based).
 		"api.token_mode": "single-use", "api.session_token_ttl_seconds": 0,
-		// node-integration Task 2: the end_time mint ceiling — 0 (default)
-		// = uncapped; >0 rejects end_time-derived lifetimes beyond it 422.
+		// end_time mint ceiling: 0 (default) = uncapped; >0 caps it (422).
 		"api.max_session_seconds": 0,
 		// JWT conversion (Task 2): the bearer-JWT block defaults ON —
 		// auth.jwt.enabled ABSENT = true (JWT is the mode going forward; an
@@ -924,25 +921,21 @@ type DataConfig struct {
 	// keyspace-notification fast path (when the server publishes del/
 	// expired events) revokes instantly regardless.
 	RevokePollSeconds int
-	// SessionCallback (node-integration Task 3; yaml session_callback.*,
-	// env ZT_SESSION_CALLBACK_*) is the session-status callback block: on
-	// Maker session START (backend connect success) and END (any close
-	// reason) the data plane POSTs {url}/dbpxy/session/{sessionId}/status
-	// to the main application. URL empty (the committed default) = the
-	// feature is DISABLED — no HTTP traffic, existing deployments
-	// untouched (G3). SharedSecret, when set, rides every request as the
-	// X-Session-Callback-Key header; empty = no header.
+	// SessionCallback (yaml session_callback.*, env ZT_SESSION_CALLBACK_*)
+	// is the session-status callback block: on session START and END the
+	// data plane POSTs {url}/dbpxy/session/{sessionId}/status to the main
+	// application. URL empty (the committed default) = DISABLED — no HTTP
+	// traffic. SharedSecret rides every request as the
+	// X-Session-Callback-Key header.
 	SessionCallback SessionCallbackConfig
 }
 
-// SessionCallbackConfig is the `session_callback:` block (Task 3). The
-// committed data.yaml deliberately carries NO ${VAR} placeholder for
-// shared_secret: expandEnv fails the boot on an UNSET variable, so a
-// committed placeholder would make ZT_SESSION_CALLBACK_SECRET mandatory for
-// every existing deployment — the exact opposite of "disabled by default".
-// Operators enable via env (ZT_SESSION_CALLBACK_URL / _SHARED_SECRET /
-// _TIMEOUT_SECONDS — viper maps the single-segment keys) or by setting url
-// in the yaml.
+// SessionCallbackConfig is the `session_callback:` block. The committed
+// data.yaml deliberately carries NO ${VAR} placeholder for shared_secret:
+// expandEnv fails the boot on an unset variable, so a placeholder would
+// make the secret mandatory for every deployment — the opposite of
+// "disabled by default". Enable via env (ZT_SESSION_CALLBACK_URL /
+// _SHARED_SECRET / _TIMEOUT_SECONDS) or url in the yaml.
 type SessionCallbackConfig struct {
 	// URL is the main application's base URL. Empty = disabled (default).
 	URL string `mapstructure:"url"`
@@ -953,8 +946,7 @@ type SessionCallbackConfig struct {
 	SharedSecret string `mapstructure:"shared_secret"`
 	// ControlPlaneAddr is the control plane's own address (host or
 	// host:port) — the loop-protection seed: callbacks targeting it are
-	// skipped entirely. Default 127.0.0.1:8080 (the committed control
-	// plane address).
+	// skipped entirely. Default 127.0.0.1:8080.
 	ControlPlaneAddr string `mapstructure:"control_plane_addr"`
 }
 
@@ -1006,10 +998,8 @@ func LoadData(path string) (*DataConfig, error) {
 		"metrics.enabled": false,
 		"metrics.listen":  "0.0.0.0:9464",
 		"metrics.path":    "/metrics",
-		// node-integration Task 3: session-status callbacks to the main
-		// application — DISABLED by default (empty url = no HTTP traffic).
-		// timeout 5s per attempt; the control plane's committed address
-		// seeds the callback client's loop protection.
+		// Session-status callbacks: DISABLED by default (empty url = no
+		// HTTP traffic); the control plane address seeds loop protection.
 		"session_callback.url":                "",
 		"session_callback.timeout_seconds":    5,
 		"session_callback.shared_secret":      "",

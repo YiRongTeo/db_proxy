@@ -7,21 +7,16 @@ import (
 	"zerotrust-proxy/internal/metrics"
 )
 
-// The data-plane kill contract (Task 8.3 two-level kill): force-close a
-// live session by id, reporting whether a session was found, or abort ONLY
-// its in-flight query, leaving the session alive. MySQLProxy, PGProxy,
-// MSSQLProxy and OracleProxy all implement KillSession through their
-// per-session registries (the closer closes the client AND backend conns,
-// so the relay pipes exit and handleConn tears the session down); KillQuery
-// exists on the MySQL/PG/MSSQL planes (Oracle capture is Phase 1 — no
-// in-flight query abort yet). Review 2026-08-16:
-// the one-method mssqlProxy-style interface was removed as unnecessary —
-// the Killer now holds the concrete proxy types directly.
+// The data-plane kill contract (two-level kill): force-close a live session
+// by id, reporting whether a session was found, or abort ONLY its in-flight
+// query, leaving the session alive. All four proxies implement KillSession
+// through their per-session registries (the closer closes the client AND
+// backend conns, so the relay pipes exit and handleConn tears the session
+// down); KillQuery exists on the MySQL/PG/MSSQL planes (no Oracle in-flight
+// query abort yet).
 
-// Kill modes for the ctl:kill payload (Task 8.3 two-level kill). The mode
-// field is OPTIONAL — absent means KillModeConnection, preserving the Task
-// 6.4 payload shape ({session_id} only), so older publishers keep working
-// unchanged.
+// Kill modes for the ctl:kill payload. The mode field is OPTIONAL — absent
+// means KillModeConnection, so older publishers keep working unchanged.
 const (
 	KillModeConnection = "connection"
 	KillModeQuery      = "query"
@@ -33,7 +28,7 @@ const (
 const killQueryTimeout = 10 * time.Second
 
 // mssqlAttnTimeout bounds how long the proxy's ATTENTION ack expectation
-// (attnPending) stays armed (Task 9.10): the backend normally acks within
+// (attnPending) stays armed: the backend normally acks within
 // the aborted batch's response, but a dead/hung backend must not poison the
 // DONE_ATTN swallow for the rest of the session.
 const mssqlAttnTimeout = 10 * time.Second
@@ -41,26 +36,26 @@ const mssqlAttnTimeout = 10 * time.Second
 // Killer fans a ctl:kill request out to the MySQL, PostgreSQL, MSSQL and
 // Oracle proxies' registries. Session ids are generated per proxy ("sid-" + random
 // hex), so a live session lives on exactly one plane — but the ctl:kill
-// subscriber (Task 6.4) does not know which protocol a session uses, so it
+// subscriber does not know which protocol a session uses, so it
 // asks all of them. All are always tried so an (astronomically unlikely) id
 // collision on another plane cannot leave a session alive;
 // KillSession/KillQuery are fast mutex-guarded map lookups on a miss.
 type Killer struct {
 	mysql  *MySQLProxy
 	pg     *PGProxy
-	mssql  *MSSQLProxy  // Task 9.2: TDS sessions (kill-query N/A until 9.4)
-	oracle *OracleProxy // node-integration: TNS sessions (kill-query N/A — Phase 1 capture)
+	mssql  *MSSQLProxy  // TDS sessions (kill-query N/A — no ATTENTION wiring)
+	oracle *OracleProxy // TNS sessions (kill-query N/A)
 
-	// vs (Task 9.13) is the store used to DELETE the session token's key
+	// vs is the store used to DELETE the session token's key
 	// when a connection-mode kill lands — revocation converges on "no key
 	// = no session": killing once both closes the live conns AND prevents
 	// any reconnect (new connections fail the consume, the sweeper closes
 	// stragglers). nil (tests) skips the deletion.
 	vs Store
 
-	// metrics (Task 9.8): kills.total is recorded here — the ctl:kill
-	// handler — per APPLIED kill (successful KillSession/KillQuery), by
-	// mode. nil = metrics disabled (every call a no-op).
+	// metrics: kills.total is recorded here — the ctl:kill handler —
+	// per APPLIED kill (successful KillSession/KillQuery), by mode.
+	// nil = metrics disabled (every call a no-op).
 	metrics *metrics.Metrics
 }
 
@@ -98,8 +93,8 @@ func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy, oracle *Oracle
 	return &Killer{mysql: mysql, pg: pg, mssql: mssql, oracle: oracle}
 }
 
-// SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
-// config metrics.enabled=false) keeps every instrument call a no-op.
+// SetMetrics wires the OTel instruments. nil (the default — config
+// metrics.enabled=false) keeps every instrument call a no-op.
 func (k *Killer) SetMetrics(m *metrics.Metrics) { k.metrics = m }
 
 // KillSession tries the MySQL registry first, then the PostgreSQL registry,
@@ -123,11 +118,10 @@ func (k *Killer) KillSession(id string) bool {
 }
 
 // KillQuery tries to abort the in-flight query of the session on any plane,
-// WITHOUT touching the session itself (Task 8.3). Reports whether any plane
-// accepted the kill-query — i.e. the session exists, has a captured thread
-// id, and the backend acknowledged the abort. Failure reasons are logged by
-// the plane's KillQuery (the MSSQL plane refuses until Task 9.4 wires the
-// ATTENTION packet).
+// WITHOUT touching the session itself. Reports whether any plane accepted
+// the kill-query — i.e. the session exists, has a captured thread id, and
+// the backend acknowledged the abort. Failure reasons are logged by the
+// plane's KillQuery (the MSSQL plane refuses — no ATTENTION wiring).
 func (k *Killer) KillQuery(id string) bool {
 	killed := false
 	if k.mysql != nil && k.mysql.KillQuery(id) {
@@ -143,7 +137,7 @@ func (k *Killer) KillQuery(id string) bool {
 }
 
 // killPayload is the ctl:kill message shape: {session_id, mode}. mode is
-// optional — absent means KillModeConnection (Task 6.4 backward compat).
+// optional — absent means KillModeConnection.
 type killPayload struct {
 	SessionID string `json:"session_id"`
 	Mode      string `json:"mode"`
@@ -165,7 +159,7 @@ func parseKillPayload(msg []byte) (sid, mode string, ok bool) {
 }
 
 // HandleKill applies ONE ctl:kill message end to end: parse {session_id,
-// mode} (mode absent → connection, Task 6.4 backward compat), fan out to
+// mode} (mode absent → connection), fan out to
 // whichever plane holds the session, and return the outcome log line plus
 // the session id — the log vocabulary the ctl:kill subscriber uses:
 // "session killed" / "query killed" / "kill: unknown session" / "kill:
@@ -184,8 +178,8 @@ func (k *Killer) HandleKill(msg []byte) (line, sid string) {
 		}
 		return "kill: unknown session", sid
 	case KillModeConnection:
-		// Task 9.13: revoke the token FIRST (idempotent) — no reconnect
-		// can re-establish the session — then close the live conns. If
+		// Revoke the token FIRST (idempotent) — no reconnect can
+		// re-establish the session — then close the live conns. If
 		// the session vanished between lookup and kill, the sweeper
 		// closes the straggler within one poll interval anyway.
 		if tok, ok := k.TokenForSession(sid); ok && k.vs != nil {

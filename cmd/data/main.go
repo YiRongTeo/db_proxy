@@ -25,8 +25,8 @@ import (
 // storeOptions maps the valkey config block onto store.StoreOptions: mode
 // "sentinel" uses SentinelAddrs + MasterName, anything else is direct against
 // Addr; valkey.ssl.enabled loads the TLS files once here (fail fast) with the
-// ServerName taken from the first address' host — DIRECT MODE ONLY (review
-// 2026-08-17): in sentinel mode the MASTER's host is unknown until discovery,
+// ServerName taken from the first address' host — DIRECT MODE ONLY:
+// in sentinel mode the MASTER's host is unknown until discovery,
 // and the sentinel's hostname would be wrong for the master connections
 // (BuildClientOption wires the same TLS config to both), failing cert
 // verification when sentinel and master live on different hosts. Sentinel
@@ -59,8 +59,8 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 }
 
 // buildCredResolver constructs the backend-password resolver from the data
-// config (Task 8.7): credentials_source "config" wraps the committed
-// credentials list in a ConfigCredResolver (pre-8.7 behavior); "api" builds
+// config: credentials_source "config" wraps the committed
+// credentials list in a ConfigCredResolver; "api" builds
 // an APICredResolver against credentials_api (vault contract: GET
 // ?db_type&db_user&db_ip&db_port with X-Api-Key → {"password"}). The
 // config layer already fail-fasts on source=api with an empty URL; the
@@ -101,10 +101,8 @@ func warnCredAPITLS(cfg *config.DataConfig, log *slog.Logger) {
 }
 
 // buildSessionCallbacks constructs the session-status callback client from
-// the session_callback block (node-integration Task 3). url empty (the
-// committed default) → (nil, nil): the feature is DISABLED and the proxies'
-// notify calls become no-ops. A non-empty url fails fast here on a malformed
-// value — a plane configured to report must never start silently broken.
+// the session_callback block. Empty url → (nil, nil): disabled, every
+// notify a no-op. A non-empty malformed url fails fast at boot.
 func buildSessionCallbacks(cfg *config.DataConfig, log *slog.Logger) (*proxy.SessionCallbacks, error) {
 	sc := cfg.SessionCallback
 	return proxy.NewSessionCallbacks(
@@ -140,12 +138,12 @@ func main() {
 	}
 	defer vs.Close()
 
-	// Both proxies share one listener: the Dispatcher detects the protocol per
-	// connection (PG client-first, MySQL server-first) and routes accordingly.
-	// The proxies are also handed to the kill switch below: the ctl:kill
-	// subscriber fans out to both registries (Task 6.4).
+	// All proxies share one listener: the Dispatcher detects the protocol
+	// per connection (PG client-first, MySQL server-first) and routes
+	// accordingly. They are also handed to the kill switch below: the
+	// ctl:kill subscriber fans out to all registries.
 	//
-	// Client-side TLS (Tasks 7.4 + 7.5): when tls.enabled, load the cert/key
+	// Client-side TLS: when tls.enabled, load the cert/key
 	// pair (the config layer already fail-fasts on enabled+missing/unreadable)
 	// and hand the SAME tls.Config to both proxies — MySQL advertises
 	// CLIENT_SSL and answers SSLRequests, PostgreSQL answers SSLRequest with
@@ -160,9 +158,9 @@ func main() {
 		}
 		dataTLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
-	// Task 8.7: the backend-password source is a CredResolver — config list
-	// (default) or per-connect credential API. The password is never stored
-	// or logged.
+	// The backend-password source is a CredResolver — config list
+	// (default) or per-connect credential API. The password is never
+	// stored or logged.
 	credResolver, err := buildCredResolver(cfg)
 	if err != nil {
 		log.Error("credentials", "err", err)
@@ -171,30 +169,30 @@ func main() {
 	warnCredAPITLS(cfg, log)
 	mysqlProxy := proxy.NewMySQLProxy(log, vs, credResolver, dataTLS)
 	pgProxy := proxy.NewPGProxy(log, vs, credResolver, dataTLS)
-	// Task 9.2: the TDS (SQL Server) proxy shares the listener; the
-	// Dispatcher detects it client-first (first byte 0x12 = PRELOGIN) and
+	// The TDS (SQL Server) proxy shares the listener; the Dispatcher
+	// detects it client-first (first byte 0x12 = PRELOGIN) and
 	// routes here. Client-side TLS (same dataTLS): the proxy answers the
 	// client PRELOGIN with ENCRYPT_ON and upgrades through the 0x12-wrapped
 	// TDS 8.0 wiring; nil keeps the plaintext ENCRYPT_NOT_SUP path (sqlcmd
 	// needs -N o then).
 	mssqlProxy := proxy.NewMSSQLProxy(log, vs, credResolver, dataTLS)
-	// Task 9.14 Oracle (Phase 1): dedicated listener, terminate-then-relay.
+	// Oracle: dedicated listener, terminate-then-relay.
 	oracleProxy := proxy.NewOracleProxy(log, vs, credResolver)
-	// Task 8.8 query logging: every query is ALWAYS logged with context;
-	// the captured result payload (columns/rows/row_count/truncated) is
-	// added only when log_query_output is on (configs/data.yaml,
+	// Query logging: every query is ALWAYS logged with context; the
+	// captured result payload (columns/rows/row_count/truncated) is added
+	// only when log_query_output is on (configs/data.yaml,
 	// ZT_LOG_QUERY_OUTPUT).
 	mysqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	pgProxy.SetLogQueryOutput(cfg.LogQueryOutput)
 	mssqlProxy.SetLogQueryOutput(cfg.LogQueryOutput)
-	// Task 8.13 maker write-gate grace hold: blocked SQL commands on an
-	// unwatched write session wait up to gate_wait_seconds for a checker
-	// instead of failing instantly (0 = reject immediately, the pre-8.13
-	// behavior; configs/data.yaml, ZT_GATE_WAIT_SECONDS).
+	// Maker write-gate grace hold: blocked SQL commands on an unwatched
+	// write session wait up to gate_wait_seconds for a checker instead of
+	// failing instantly (0 = reject immediately; configs/data.yaml,
+	// ZT_GATE_WAIT_SECONDS).
 	mysqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	pgProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	mssqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
-	// Task 9.8 OTel metrics: enabled (configs/data.yaml metrics block,
+	// OTel metrics: enabled (configs/data.yaml metrics block,
 	// ZT_METRICS_ENABLED) builds the Prometheus-backed meter wrapper and
 	// wires it into every instrumented site; disabled (default) leaves the
 	// wrapper nil and every call site a no-op.
@@ -208,11 +206,9 @@ func main() {
 	pgProxy.SetMetrics(m)
 	mssqlProxy.SetMetrics(m)
 	oracleProxy.SetMetrics(m)
-	// node-integration Task 3: session-status callbacks to the main
-	// application — ONE client wired into the SHARED session lifecycle
-	// funnel of all four proxies (started at connect success, ended from
-	// every close path). Disabled (nil) while session_callback.url is
-	// empty — the committed default.
+	// One callback client wired into the shared session lifecycle funnel
+	// of all four proxies; disabled (nil) while session_callback.url is
+	// empty.
 	sessionCallbacks, err := buildSessionCallbacks(cfg, log)
 	if err != nil {
 		log.Error("session callback", "err", err)
@@ -231,8 +227,8 @@ func main() {
 	killer.SetMetrics(m)
 	killer.SetStore(vs)
 
-	// Task 9.8 metrics endpoint: when enabled, serve the Prometheus scrape
-	// on its own goroutine (configs/data.yaml metrics block,
+	// Metrics endpoint: when enabled, serve the Prometheus scrape on its
+	// own goroutine (configs/data.yaml metrics block,
 	// ZT_METRICS_LISTEN + ZT_METRICS_PATH; defaults 0.0.0.0:9464
 	// /metrics). The config layer already fail-fasted on a malformed
 	// listen address; a bind failure here is fatal too — a configured
@@ -255,7 +251,7 @@ func main() {
 		log,
 		mysqlProxy,
 		pgProxy,
-		mssqlProxy, // TDS proxy wired in Task 9.2 — detected TDS clients are served
+		mssqlProxy, // detected TDS clients are served
 		time.Duration(cfg.DetectDelayMS)*time.Millisecond,
 		int64(cfg.MaxConns),
 	)
@@ -270,9 +266,8 @@ func main() {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- d.Serve(l, ctx) }()
 
-	// Task 9.14 Oracle: DEDICATED listener (user decision 2026-09-01 —
-	// protocol isolation; mysql/pg/mssql keep the shared :3306). Empty
-	// oracle_addr = the listener is not started.
+	// Oracle: DEDICATED listener (protocol isolation; mysql/pg/mssql keep
+	// the shared :3306). Empty oracle_addr = the listener is not started.
 	if cfg.ListenOracleAddr != "" {
 		ol, err := net.Listen("tcp", cfg.ListenOracleAddr)
 		if err != nil {
@@ -301,10 +296,10 @@ func main() {
 		}()
 	}
 
-	// Kill switch (Task 6.4 + Task 8.3 two-level kill): subscribe to the
-	// ctl:kill channel — the ONLY coupling between planes (no HTTP). Each
-	// message carries {"session_id": "...", "mode": "query"|"connection"}
-	// (mode absent = connection, Task 6.4 backward compat); the combined
+	// Kill switch: subscribe to the ctl:kill channel — the ONLY coupling
+	// between planes (no HTTP). Each message carries
+	// {"session_id": "...", "mode": "query"|"connection"}
+	// (mode absent = connection); the combined
 	// killer fans out to whichever plane holds the session. HandleKill
 	// returns the outcome log line ("session killed" / "query killed" /
 	// "kill: unknown session" / "kill: unknown mode") plus the session id;
@@ -334,7 +329,7 @@ func main() {
 		}
 	}()
 
-	// Task 9.13 session tokens — LIVE revocation, two cooperating paths:
+	// Session tokens — LIVE revocation, two cooperating paths:
 	//
 	// 1. Poll backstop (always on): the sweeper re-checks every session
 	//    token's key every session.revoke_poll_seconds and closes the

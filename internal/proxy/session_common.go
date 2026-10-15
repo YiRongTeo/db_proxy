@@ -10,28 +10,22 @@ import (
 	"zerotrust-proxy/internal/models"
 )
 
-// Task 9.12 — shared session/publish machinery (de-triplication).
-//
-// The three protocol mirrors (MySQL / PostgreSQL / MSSQL) once carried
-// ~380 lines of near-verbatim session/publish helpers — publishEvent,
-// publishLifecycle, refreshSessionLive, finishSession, flushPendingOnClose,
-// publishPending, publishBlocked (+ PG's publishPendingOnReady safety net).
-// This file owns that machinery ONCE, parameterized by the per-protocol
-// bits: the session types (mysqlSession/pgSession/mssqlSession, via the
-// sessionCommon surface below) and the result captures (via captureResult).
-// The proxies embed sessionPublisher, so every existing call site
+// Shared session/publish machinery: the session/publish helpers
+// (publishEvent, publishLifecycle, refreshSessionLive, finishSession,
+// flushPendingOnClose, publishPending, publishBlocked — plus PG's
+// publishPendingOnReady safety net) live here ONCE, parameterized by the
+// per-protocol bits: the session types (mysqlSession/pgSession/mssqlSession,
+// via the sessionCommon surface below) and the result captures (via
+// captureResult). The proxies embed sessionPublisher, so every call site
 // (p.publishEvent(s, ev), p.publishPending(s, c), …) resolves to these
-// shared methods unchanged — the wire bytes and event payloads are
-// identical to the pre-refactor mirrors.
+// shared methods unchanged.
 
-// sessionPublisher is the shared session/publish state, embedded by all
-// three proxies (MySQLProxy, PGProxy, MSSQLProxy). The fields were once
-// duplicated per proxy: log/vs (session + lifecycle publishing),
-// logQueryOutput (Task 8.8 captured-result payload on query log lines) and
-// metrics (Task 9.8 OTel instruments; nil = disabled, every call a no-op).
-// callbacks (node-integration Task 3) is the session-status callback client
-// (nil = disabled — every notify a no-op); wired once from cmd/data via
-// SetSessionCallbacks, consumed by publishLifecycle/finishSession below.
+// sessionPublisher is the shared session/publish state, embedded by every
+// proxy: log/vs (session + lifecycle publishing), logQueryOutput (captured
+// result payload on query log lines), metrics (OTel instruments; nil =
+// disabled, every call a no-op) and callbacks (the session-status callback
+// client; nil = disabled — every notify a no-op), wired once from cmd/data
+// via SetSessionCallbacks and consumed by publishLifecycle below.
 type sessionPublisher struct {
 	log            *slog.Logger
 	vs             Store
@@ -41,7 +35,7 @@ type sessionPublisher struct {
 }
 
 // storeCallTimeout bounds every store call made from the relay/gate hot
-// paths (review 2026-08-17): a hung valkey must stall a session for at
+// paths: a hung valkey must stall a session for at
 // most this long — gate checks fail closed (the command is blocked exactly
 // like an absent watcher), publish paths log-and-continue — never for the
 // lifetime of a TCP retransmit. A var (not const) so tests can shrink it.
@@ -81,9 +75,8 @@ type capturedResult struct {
 	truncated bool
 }
 
-// captureResult is the response-capture surface the shared publisher needs.
-// done/finish already existed on all three captures; snapshot and isNil are
-// the Task 9.12 additions (one-liners on each capture type).
+// captureResult is the response-capture surface the shared publisher needs;
+// every capture type carries one-liner implementations.
 type captureResult interface {
 	done() bool
 	finish()
@@ -158,8 +151,8 @@ func (c *mssqlResultCapture) isNil() bool { return c == nil }
 // --- shared session/publish helpers ----------------------------------------
 
 // publishEvent publishes a QueryEvent to queries:<username>,
-// queries:ticket:<ticket_id> (when present) AND — Task 8.2 — the session's
-// own channel queries:sess:<session_id>. It also re-arms the session-directory
+// queries:ticket:<ticket_id> (when present) AND the session's own
+// channel queries:sess:<session_id>. It also re-arms the session-directory
 // heartbeat (SetSessionLive with a fresh last_seen), so an active session
 // stays listed while its queries flow. Best-effort: failures are logged by
 // the store, never fatal to the relay. Lifecycle events (started/ended) go
@@ -167,9 +160,8 @@ func (c *mssqlResultCapture) isNil() bool { return c == nil }
 // after DelSessionLive, and they deliberately skip the ticket channel.
 func (pub *sessionPublisher) publishEvent(s sessionCommon, ev *models.QueryEvent) {
 	raw, _ := json.Marshal(ev)
-	// One bounded ctx for the WHOLE publish (review 2026-08-17): a hung
-	// valkey stalls the relay pipe at most storeCallTimeout — never per
-	// call (3 publishes + heartbeat would be 4 × timeout).
+	// One bounded ctx for the WHOLE publish: a hung valkey stalls the
+	// relay pipe at most storeCallTimeout, never per call.
 	ctx, cancel := storeCallCtx()
 	defer cancel()
 	_ = pub.vs.Publish(ctx, "queries:"+ev.Username, raw)
@@ -183,13 +175,13 @@ func (pub *sessionPublisher) publishEvent(s sessionCommon, ev *models.QueryEvent
 	rec := buildSessionRecord(id, ev.Username, ev.DBUser, ev.DBType, db, threadID, startedAt, lastSeen, "active")
 	s.unlockSession()
 	_ = pub.vs.SetSessionLive(ctx, id, rec, sessionLiveTTL)
-	// Task 8.8 query logging: every published query event is logged with
-	// full context (never the token value — the event carries no token).
-	// The captured result payload (columns/row_count/rows/truncated) is
-	// added ONLY when log_query_output is on; rows are already capped by
-	// the capture (100 rows/512 chars/64KB). Blocked write-gate events
-	// (Task 8.6) flow through here too, carrying status=error + the gating
-	// message — the audit trail shows the block in the log as well.
+	// Query logging: every published query event is logged with full
+	// context (never the token value — the event carries no token). The
+	// captured result payload (columns/row_count/rows/truncated) is added
+	// ONLY when log_query_output is on; rows are already capped by the
+	// capture. Blocked write-gate events flow through here too, carrying
+	// status=error + the gating message — the audit trail shows the block
+	// in the log as well.
 	attrs := []any{
 		"username", ev.Username, "ticket_id", ev.TicketID,
 		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType,
@@ -214,7 +206,7 @@ func (pub *sessionPublisher) refreshSessionLive(s sessionCommon, tok *models.Tok
 	id, db, threadID, startedAt, lastSeen := s.sessionMeta()
 	rec := buildSessionRecord(id, tok.Username, tok.DBUser, tok.DBType, db, threadID, startedAt, lastSeen, "active")
 	s.unlockSession()
-	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store call
+	ctx, cancel := storeCallCtx() // bounded store call
 	defer cancel()
 	_ = pub.vs.SetSessionLive(ctx, id, rec, sessionLiveTTL)
 }
@@ -238,24 +230,19 @@ func (pub *sessionPublisher) publishLifecycle(s sessionCommon, tok *models.Token
 		ClientAddr: clientAddr,
 	}
 	raw, _ := json.Marshal(ev)
-	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store calls
+	ctx, cancel := storeCallCtx() // bounded store calls
 	defer cancel()
 	_ = pub.vs.Publish(ctx, "queries:"+ev.Username, raw)
 	_ = pub.vs.Publish(ctx, "queries:sess:"+id, raw)
-	// node-integration Task 3: session-status callback to the main
-	// application — the SAME funnel serves all four protocols (one wiring,
-	// not per-protocol copies). The nil-receiver no-op (feature disabled,
-	// the default) costs nothing; fire-and-forget: the HTTP round trip
-	// runs on the callback client's own recovered goroutine, never the
-	// relay. tok carries the authoritative session id (the one the mint
-	// response returned, 0ac5768).
+	// Session-status callback to the main application — one funnel
+	// serves all protocols; fire-and-forget (the HTTP round trip runs on
+	// the callback client's own goroutine, never the relay). tok carries
+	// the authoritative session id.
 	pub.callbacks.NotifySession(s, tok, action)
-	// Task 8.8 lifecycle logging: same context fields as the query line,
-	// minus sql (lifecycle events carry none). ticket_id comes from the
-	// TOKEN directly — the lifecycle WIRE event deliberately carries no
-	// ticket id (Task 8.2: ticket grouping is query activity only), but
-	// the log line is part of the query-logging context. No credentials,
-	// ever.
+	// Lifecycle logging: same context fields as the query line, minus
+	// sql. ticket_id comes from the TOKEN directly — the wire event
+	// deliberately carries none (ticket grouping is query activity only).
+	// No credentials, ever.
 	pub.log.Info("session "+action, "username", ev.Username, "ticket_id", tok.TicketID,
 		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType, "session_id", ev.SessionID)
 }
@@ -267,15 +254,15 @@ func (pub *sessionPublisher) publishLifecycle(s sessionCommon, tok *models.Token
 // re-armed the heartbeat.
 func (pub *sessionPublisher) finishSession(s sessionCommon, tok *models.TokenPayload, clientAddr string) {
 	id, _, _, _, _ := s.sessionMeta()
-	ctx, cancel := storeCallCtx() // review 2026-08-17: bounded store call
+	ctx, cancel := storeCallCtx() // bounded store call
 	defer cancel()
 	_ = pub.vs.DelSessionLive(ctx, id)
 	pub.publishLifecycle(s, tok, "ended", clientAddr)
 }
 
 // flushPendingOnClose publishes any still-pending event as failed when the
-// session dies before the backend answered (both relay exit paths; invoked
-// via defer in handleConn, and so also on a Task 6.4 kill).
+// session dies before the backend answered (invoked via defer in
+// handleConn, and so also on a kill).
 func (pub *sessionPublisher) flushPendingOnClose(s sessionCommon) {
 	s.lockSession()
 	ev := s.pendingEvent()
@@ -315,23 +302,22 @@ func (pub *sessionPublisher) publishPending(s sessionCommon, capture captureResu
 	}
 	s.unlockSession()
 	if ev != nil {
-		// Task 9.8: one query event = one queries.total increment, with
-		// the command's latency (sniffed → response completed) recorded
-		// on the query.duration histogram.
+		// One query event = one queries.total increment, with the
+		// command's latency (sniffed → response completed) recorded on
+		// the query.duration histogram.
 		pub.metrics.QueriesTotal(ev.DBType, ev.StmtType, ev.Status)
 		pub.metrics.QueryDuration(ev.DBType, time.Since(ev.Ts))
 		pub.publishEvent(s, ev)
 	}
 }
 
-// publishPendingOnReady is the PG ReadyForQuery safety net (Task 9.12: the
-// one session/publish helper that is protocol-specific — only the PG relay
+// publishPendingOnReady is the PG ReadyForQuery safety net — the one
+// session/publish helper that is protocol-specific (only the PG relay
 // calls it, at a statement boundary): a command still pending at a
 // ReadyForQuery (defensive — every real response ends in CommandComplete /
 // ErrorResponse / EmptyQueryResponse, all of which complete the capture) is
 // finished as ok and published, so no event is ever left dangling across
-// statements. Task 9.10: metrics parity with publishPending — one
-// queries.total increment + query.duration per published event.
+// statements. Metrics parity with publishPending.
 func (pub *sessionPublisher) publishPendingOnReady(s sessionCommon) {
 	s.lockSession()
 	ev := s.pendingEvent()
@@ -359,7 +345,7 @@ func (pub *sessionPublisher) publishPendingOnReady(s sessionCommon) {
 }
 
 // publishBlocked publishes the session's pending event immediately with
-// status=error and the gating message (Task 8.6): a command blocked by the
+// status=error and the gating message: a command blocked by the
 // maker write-gate never reaches the backend, so no backend response will
 // ever complete the pending capture — the audit trail must still show the
 // block. The pending slot is cleared so the next command starts fresh.
@@ -381,7 +367,7 @@ func (pub *sessionPublisher) publishBlocked(s sessionCommon, msg string) {
 
 // clearPendingCapture clears the session's pending/capture slots. The gate
 // drain paths call it so the teardown path cannot publish a duplicate
-// "connection closed" event (Task 8.13).
+// "connection closed" event.
 func (pub *sessionPublisher) clearPendingCapture(s sessionCommon) {
 	s.lockSession()
 	s.clearPending()
@@ -390,8 +376,8 @@ func (pub *sessionPublisher) clearPendingCapture(s sessionCommon) {
 }
 
 // publishGateAudits publishes each held entry's audit event as status=error
-// with the given drain message (the Task 8.13 drain audit tail, shared by
-// the three gate reject paths). Entries without an event — and later
+// with the given drain message (the drain audit tail, shared by the gate
+// reject paths). Entries without an event — and later
 // packets/frames of the same multi-packet command (pointer-identity dedup,
 // the pre-refactor loop semantics) — are skipped.
 func (pub *sessionPublisher) publishGateAudits(s sessionCommon, evs []*models.QueryEvent, msg string) {
