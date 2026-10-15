@@ -20,6 +20,22 @@ const maxBodyBytes = 1 << 20
 // sessionLiveTTL heartbeat so pending and active records share one cadence.
 const sessionPendingTTL = 60 * time.Second
 
+// dbPortDefaults is the SINGLE SOURCE OF TRUTH for default backend ports on
+// POST /api/token (node-integration Task 1): db_type → db_subtype → port.
+// It resolves an omitted db_port after type validation; an explicit db_port
+// always wins (G3). Canonical ports: mysql→3306, postgres→5432, mssql→1433,
+// oracle→1521; an absent db_subtype is looked up under the key "default".
+// Subtypes beyond "default" (e.g. "master", "slave") are supported by the
+// STRUCTURE — no extra entries ship yet, so a subtype with no entry (and no
+// explicit db_port) fails with 422. FUTURE DB_TYPES AND SUBTYPES ARE ADDED
+// HERE — nowhere else in the codebase needs touching.
+var dbPortDefaults = map[string]map[string]string{
+	"mysql":    {"default": "3306"},
+	"postgres": {"default": "5432"},
+	"mssql":    {"default": "1433"},
+	"oracle":   {"default": "1521"},
+}
+
 // handleHealth reports Control Plane + Valkey liveness.
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := a.vs.Ping(r.Context()); err != nil {
@@ -65,9 +81,18 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		DBUser   string `json:"db_user"`
 		DBIP     string `json:"db_ip"`
-		DBPort   string `json:"db_port"`
-		DBType   string `json:"db_type"`
-		TicketID string `json:"ticket_id,omitempty"`
+		// DBPort is OPTIONAL (node-integration Task 1): an explicit value is
+		// stored verbatim; when absent the port is resolved from
+		// dbPortDefaults via db_type + DBSubtype (default "default").
+		DBPort string `json:"db_port"`
+		DBType string `json:"db_type"`
+		// DBSubtype (node-integration Task 1) refines the default-port
+		// lookup (e.g. "master"/"slave" — structure only today). Free-form
+		// but trimmed, ≤64 chars, no control chars; absent = subtype
+		// "default". It never reaches the payload or credentials key — the
+		// port is resolved before either is built.
+		DBSubtype string `json:"db_subtype,omitempty"`
+		TicketID  string `json:"ticket_id,omitempty"`
 		// Mode (Task 9.13) requests a token flavor: "single-use" (default)
 		// or "session". Absent → the target preset's token_mode, then the
 		// api.token_mode config default.
@@ -96,7 +121,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		req.Username = sess.Username
 	}
 	req.Username = strings.TrimSpace(req.Username)
-	if req.Username == "" || req.DBUser == "" || req.DBIP == "" || req.DBPort == "" {
+	// node-integration Task 1: db_port is no longer a required field — the
+	// required set is username/db_user/db_ip (+ ticket_id below). The port
+	// is resolved AFTER db_type validation, so an absent db_port here is
+	// filled by the dbPortDefaults map or rejected 422 there.
+	if req.Username == "" || req.DBUser == "" || req.DBIP == "" {
 		http.Error(w, `{"error":"missing required fields"}`, http.StatusBadRequest)
 		return
 	}
@@ -114,9 +143,39 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.TicketID = tid
+	// node-integration Task 1: db_subtype shape validation, same review
+	// hygiene as ticket_id/session_id — it feeds the dbPortDefaults map
+	// lookup, so it is trimmed first (a padded subtype must behave as its
+	// bare form) and rejected 400 when overlong or carrying control
+	// characters.
+	req.DBSubtype = strings.TrimSpace(req.DBSubtype)
+	if len(req.DBSubtype) > 64 || strings.ContainsFunc(req.DBSubtype, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid db_subtype"})
+		return
+	}
 	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" && req.DBType != "oracle" {
 		http.Error(w, `{"error":"db_type must be mysql, postgres, mssql or oracle"}`, http.StatusUnprocessableEntity)
 		return
+	}
+	// node-integration Task 1: port resolution — an explicit db_port is
+	// stored VERBATIM (existing validation unchanged, explicit wins — G3);
+	// only when absent does the dbPortDefaults map supply the port from
+	// db_type + db_subtype (absent subtype = "default"). A type-valid
+	// request whose type+subtype has no map entry fails 422 with the
+	// documented message — never a guessed port.
+	if req.DBPort == "" {
+		subtype := req.DBSubtype
+		if subtype == "" {
+			subtype = "default"
+		}
+		port, ok := dbPortDefaults[req.DBType][subtype]
+		if !ok {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "no default port for db_type/db_subtype; pass db_port explicitly",
+			})
+			return
+		}
+		req.DBPort = port
 	}
 	// Task 9.13: token mode resolution — request mode wins, then the
 	// target preset's token_mode, then the api.token_mode default.
