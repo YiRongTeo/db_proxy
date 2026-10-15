@@ -39,7 +39,7 @@ type OracleProxy struct {
 func NewOracleProxy(log *slog.Logger, vs Store, creds CredResolver) *OracleProxy {
 	return &OracleProxy{
 		sessionPublisher: sessionPublisher{log: log, vs: vs},
-		creds:            creds,
+		creds:            WrapCredResolver(creds, vs, log),
 		sessions:         map[string]*oracleSession{},
 	}
 }
@@ -192,7 +192,10 @@ func (p *OracleProxy) handleConn(client net.Conn) {
 		return
 	}
 	ctx, cancel = storeCallCtx()
-	password, err := p.creds.Password(ctx, backendKey(tok))
+	// OverrideCreds: a CredOverride token resolves its password from
+	// ztcred:<sid> first (node-integration Task 4), falling back to the
+	// configured chain — same contract as the other three protocols.
+	password, err := OverrideCreds(p.creds, tok).Password(ctx, backendKey(tok))
 	cancel()
 	if err != nil {
 		p.log.Warn("oracle: backend credential lookup failed", "db_user", tok.DBUser, "err", err)

@@ -95,7 +95,7 @@ type MSSQLProxy struct {
 func NewMSSQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MSSQLProxy {
 	return &MSSQLProxy{
 		sessionPublisher: sessionPublisher{log: log, vs: vs},
-		creds:            creds,
+		creds:            WrapCredResolver(creds, vs, log),
 		tlsCfg:           tlsCfg,
 		sessions:         make(map[string]*mssqlSession),
 	}
@@ -444,7 +444,9 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// a REWRITTEN login7 (real db_user, resolver password under the
 	// derived obfuscation, client-requested database kept). The backend
 	// leg is TLS when the data plane is (the backend accepts both).
-	backend, backendBR, loginResp, loginOK, envDB, err := connectMSSQLBackend(ctx, tok, p.creds, li, p.tlsCfg != nil)
+	// OverrideCreds: a CredOverride token resolves its password from
+	// ztcred:<sid> first (node-integration Task 4).
+	backend, backendBR, loginResp, loginOK, envDB, err := connectMSSQLBackend(ctx, tok, OverrideCreds(p.creds, tok), li, p.tlsCfg != nil)
 	if err != nil {
 		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)

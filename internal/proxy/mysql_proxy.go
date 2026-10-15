@@ -93,7 +93,7 @@ type MySQLProxy struct {
 func NewMySQLProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
 		sessionPublisher: sessionPublisher{log: log, vs: vs},
-		creds:            creds,
+		creds:            WrapCredResolver(creds, vs, log),
 		tlsCfg:           tlsCfg,
 		sessions:         make(map[string]*mysqlSession),
 	}
@@ -204,7 +204,9 @@ func (p *MySQLProxy) KillQuery(id string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), killQueryTimeout)
 	defer cancel()
-	backend, err := connectMySQLBackend(ctx, s.tok, p.creds, s.db)
+	// OverrideCreds: the kill-query second connect resolves the credential
+	// through the same override-first chain as the session's own connect.
+	backend, err := connectMySQLBackend(ctx, s.tok, OverrideCreds(p.creds, s.tok), s.db)
 	if err != nil {
 		p.log.Warn("kill query: backend connect failed", "session_id", id, "err", err)
 		return false
@@ -358,8 +360,11 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	p.metrics.TokensValidated()
 
-	// 4. backend connection (real credentials, client-requested database)
-	backend, err := connectMySQLBackend(ctx, tok, p.creds, database)
+	// 4. backend connection (real credentials, client-requested database).
+	// OverrideCreds: a CredOverride token resolves its password from
+	// ztcred:<sid> first (node-integration Task 4), falling back to the
+	// configured chain on miss/expiry — see cred_chain.go.
+	backend, err := connectMySQLBackend(ctx, tok, OverrideCreds(p.creds, tok), database)
 	if err != nil {
 		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)

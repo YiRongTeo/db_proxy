@@ -110,7 +110,7 @@ type PGProxy struct {
 func NewPGProxy(log *slog.Logger, vs Store, creds CredResolver, tlsCfg *tls.Config) *PGProxy {
 	return &PGProxy{
 		sessionPublisher: sessionPublisher{log: log, vs: vs},
-		creds:            creds,
+		creds:            WrapCredResolver(creds, vs, log),
 		tlsCfg:           tlsCfg,
 		sessions:         make(map[string]*pgSession),
 		cancels:          make(map[uint32]*pgSession),
@@ -423,7 +423,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// 4. backend session with the CLIENT-requested database (PG clients send
 	// it in the STARTUP message — mirror of the MySQL CONNECT_WITH_DB flow);
 	// an empty/missing value falls back to the default backend database.
-	front, err := connectPostgresBackend(ctx, tok, p.creds, sm.Parameters["database"])
+	front, err := connectPostgresBackend(ctx, tok, OverrideCreds(p.creds, tok), sm.Parameters["database"])
 	if err != nil {
 		p.metrics.ConnectionsTotal("postgres", "rejected")
 		p.log.Error("backend connect failed", "err", err, "client", clientAddr)

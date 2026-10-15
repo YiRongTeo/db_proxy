@@ -75,7 +75,9 @@ func capturePGThreadID(front *pgFrontend, log *slog.Logger) int64 {
 // KillQuery (Task 8.3) and the client CancelRequest path (review
 // 2026-08-17 — de-duplicated from KillQuery's inline exchange).
 func (p *PGProxy) cancelBackendExchange(ctx context.Context, s *pgSession) (bool, error) {
-	front, err := connectPostgresBackend(ctx, s.tok, p.creds, s.db)
+	// OverrideCreds: the cancel second connect resolves the credential
+	// through the same override-first chain as the session's own connect.
+	front, err := connectPostgresBackend(ctx, s.tok, OverrideCreds(p.creds, s.tok), s.db)
 	if err != nil {
 		return false, err
 	}

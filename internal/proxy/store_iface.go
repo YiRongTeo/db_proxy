@@ -24,4 +24,10 @@ type Store interface {
 	// kill path revokes a session by deleting its key so no new
 	// connection can re-establish it.
 	DeleteToken(ctx context.Context, token string) error
+	// GetCredOverride (node-integration Task 4) reads the at-mint
+	// password override ztcred:<sid> — ""/nil on a clean miss (missing or
+	// expired key). The override chain (cred_chain.go) consults it FIRST
+	// for tokens carrying CredOverride; ""/nil means "fall back to the
+	// configured resolver", never an error to the caller.
+	GetCredOverride(ctx context.Context, sid string) (string, error)
 }
