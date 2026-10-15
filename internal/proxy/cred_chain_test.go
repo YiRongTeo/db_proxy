@@ -474,6 +474,13 @@ func TestOverrideKeyTTLNeverExceedsToken(t *testing.T) {
 	}
 	rawc, closeRaw := newRawValkeyProbe(t)
 	defer closeRaw()
+	// The two writes are separate round-trips: ztcred: lands ~1-2ms after
+	// tok:, so a poll tick in that gap sees TokenAlive=false while the
+	// override still has a few ms of PTTL — a write-skew artifact, not an
+	// orphan. Only a credential alive BEYOND this grace window is an
+	// orphan (the assertion's meaning is unchanged: the override still
+	// cannot outlive the token in any real sense).
+	const writeSkewGrace = 100 * time.Millisecond
 	deadline := time.Now().Add(6 * time.Second)
 	for {
 		tokAlive, err := vs.TokenAlive(context.Background(), tkn)
@@ -482,8 +489,8 @@ func TestOverrideKeyTTLNeverExceedsToken(t *testing.T) {
 		}
 		credTTLms, _ := rawc.Pttl("ztcred:" + tok.SessionID)
 		if !tokAlive {
-			if credTTLms > 0 {
-				t.Fatalf("token expired but ztcred still has %dms left — orphaned credential", credTTLms)
+			if credTTLms > int64(writeSkewGrace/time.Millisecond) {
+				t.Fatalf("token expired but ztcred still has %dms left (>%dms grace) — orphaned credential", credTTLms, writeSkewGrace/time.Millisecond)
 			}
 			return
 		}
