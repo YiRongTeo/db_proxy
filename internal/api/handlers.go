@@ -108,6 +108,17 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// legitimate shapes (string / integer / null) can be told apart
 		// without interface{} boxing.
 		EndTime json.RawMessage `json:"end_time,omitempty"`
+		// Password (node-integration Task 4) is the OPTIONAL at-mint
+		// credential override: when present, the mint writes it to the
+		// SEPARATE Valkey key ztcred:<session_id> (TTL == the token's
+		// resolved TTL) and stamps payload.cred_override — the data plane
+		// then consults the override FIRST when connecting. HARD RULES
+		// (G2): the value is never logged, never echoed in the response,
+		// never written to audit rows or events; > 256 bytes and empty
+		// values are rejected 422 (an empty string is not a credential).
+		// Kept as a POINTER so "absent" (G3 — existing resolution) and
+		// "present but empty" (a client bug → 422) stay distinguishable.
+		Password *string `json:"password,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
@@ -183,6 +194,32 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.DBPort = port
+	}
+	// node-integration Task 4: the at-mint credential override — shape
+	// validation only here; the KEY write happens after the token is stored
+	// (the sid is generated below) with the token's own resolved TTL.
+	// G3: an absent password (or JSON null) leaves this block untouched.
+	// An explicit EMPTY string is refused (422): an override carrying
+	// nothing would flip the data plane onto a dead key. 256 bytes is the
+	// cap (inclusive) — beyond it the value is rejected, never truncated
+	// (a silently-shortened credential would fail the backend connect
+	// opaquely). The value NEVER appears in any error message or log line
+	// here (G2).
+	hasPassword := false
+	if req.Password != nil {
+		if *req.Password == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "password must not be empty",
+			})
+			return
+		}
+		if len(*req.Password) > 256 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "password exceeds 256 bytes",
+			})
+			return
+		}
+		hasPassword = true
 	}
 	// Task 9.13: token mode resolution — request mode wins, then the
 	// target preset's token_mode, then the api.token_mode default.
@@ -308,6 +345,12 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// stamped ONLY when the mint carried one (absent end_time → payload
 	// and response stay free of expires_at — G3). Informational: the
 	// enforcement is the key TTL below.
+	// node-integration Task 4: stamp the override flag so the data plane
+	// consults ztcred:<sid> FIRST. The password itself NEVER rides the
+	// payload (G2) — it lives only in the ztcred: key written below.
+	if hasPassword {
+		payload.CredOverride = true
+	}
 	if hasEndTime {
 		payload.ExpiresAt = endTime.Unix()
 	}
@@ -353,6 +396,23 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		a.log.Error("token store", "err", err)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
+	}
+	// node-integration Task 4: the at-mint credential override. The TTL is
+	// the token's own resolved value (the SAME `ttl` just used for tok: —
+	// end_time- and mode-aware, so the override can never outlive the
+	// session it belongs to; G2). The write happens AFTER SetToken because
+	// the payload needs the session id — but a failed override write fails
+	// the MINT (500): shipping a cred_override-stamped token without its
+	// credential would leave the data plane to fall back to credentials
+	// the client explicitly overrode. The session is still cleaned up:
+	// SetToken wrote tok:, so it is deleted here before the 500.
+	if hasPassword {
+		if err := a.vs.SetCredOverride(r.Context(), payload.SessionID, *req.Password, ttl); err != nil {
+			a.log.Error("cred override store", "err", err, "session_id", payload.SessionID)
+			_ = a.vs.DeleteToken(r.Context(), token)
+			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+			return
+		}
 	}
 	// Task 9.13: -1 signals an infinite session token to the client (the
 	// token never expires — revocation is explicit). node-integration
