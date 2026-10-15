@@ -227,7 +227,7 @@ func main() {
 	pgProxy.SetSessionCallbacks(sessionCallbacks)
 	mssqlProxy.SetSessionCallbacks(sessionCallbacks)
 	oracleProxy.SetSessionCallbacks(sessionCallbacks)
-	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy)
+	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
 	killer.SetMetrics(m)
 	killer.SetStore(vs)
 

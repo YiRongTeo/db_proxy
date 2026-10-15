@@ -98,7 +98,7 @@ func TestPGProxySessionRegistryKillClosesBothConns(t *testing.T) {
 func TestKillerKillsOnEitherPlane(t *testing.T) {
 	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
 	pg := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil)
-	k := NewKiller(mysql, pg, nil)
+	k := NewKiller(mysql, pg, nil, nil)
 
 	mc, mcPeer := net.Pipe()
 	mb, mbPeer := net.Pipe()
@@ -141,6 +141,63 @@ func TestKillerKillsOnEitherPlane(t *testing.T) {
 	// Unknown id: false on both planes.
 	if k.KillSession("sid-neither") {
 		t.Fatal("kill of an unknown id returned true")
+	}
+}
+
+// TestKillerKillsOracleSession: the killer reaches the Oracle plane too —
+// the ctl:kill subscriber does not know which protocol a session id belongs
+// to, and an Oracle session that is invisible to the Killer reports
+// "kill: unknown session" while the live client keeps querying (the
+// node-integration gap). KillSession must close BOTH the client and backend
+// conns (the closer semantics shared by every plane) and return true;
+// unknown ids still return false.
+func TestKillerKillsOracleSession(t *testing.T) {
+	oracle := NewOracleProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{})
+	k := NewKiller(nil, nil, nil, oracle)
+
+	oc, ocPeer := net.Pipe()
+	ob, obPeer := net.Pipe()
+	defer oc.Close()
+	defer ob.Close()
+	oracle.mu.Lock()
+	oracle.sessions["sid-oracle"] = &oracleSession{
+		id:      "sid-oracle",
+		client:  oc,
+		backend: ob,
+	}
+	oracle.mu.Unlock()
+
+	if !k.KillSession("sid-oracle") {
+		t.Fatal("Killer.KillSession missed an Oracle-plane session (the node-integration kill gap)")
+	}
+	for name, peer := range map[string]net.Conn{"client": ocPeer, "backend": obPeer} {
+		if _, err := peer.Read(make([]byte, 1)); err == nil {
+			t.Errorf("oracle %s conn still readable after kill", name)
+		}
+	}
+	if k.KillSession("sid-neither") {
+		t.Fatal("kill of an unknown id returned true")
+	}
+}
+
+// TestKillerTokenForSessionOraclePlane: TokenForSession must consult the
+// Oracle registry — the connection-mode kill deletes the session token's
+// key first (Task 9.13 revocation-before-close), and an Oracle session the
+// Killer cannot see leaves that key alive for reconnects.
+func TestKillerTokenForSessionOraclePlane(t *testing.T) {
+	oracle := NewOracleProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{})
+	k := NewKiller(nil, nil, nil, oracle)
+
+	oracle.mu.Lock()
+	oracle.sessions["sid-oracle"] = &oracleSession{id: "sid-oracle", token: "tok-oracle"}
+	oracle.mu.Unlock()
+
+	tok, ok := k.TokenForSession("sid-oracle")
+	if !ok || tok != "tok-oracle" {
+		t.Fatalf("TokenForSession(oracle session) = %q/%v, want tok-oracle/true", tok, ok)
+	}
+	if _, ok := k.TokenForSession("sid-neither"); ok {
+		t.Fatal("TokenForSession(unknown) returned true")
 	}
 }
 
@@ -520,7 +577,7 @@ func TestKillIsolationLive(t *testing.T) {
 // (("", "")), and an unknown mode is ignored ("kill: unknown mode"), never a
 // crash. With nil planes every real dispatch reports the session unknown.
 func TestHandleKillPayloadParse(t *testing.T) {
-	k := NewKiller(nil, nil, nil)
+	k := NewKiller(nil, nil, nil, nil)
 	cases := []struct {
 		name string
 		msg  string
@@ -627,7 +684,7 @@ func TestKillerKillQueryFanOut(t *testing.T) {
 	var mysqlLog, pgLog bytes.Buffer
 	mysql := NewMySQLProxy(slog.New(slog.NewTextHandler(&mysqlLog, nil)), nil, &ConfigCredResolver{}, nil)
 	pg := NewPGProxy(slog.New(slog.NewTextHandler(&pgLog, nil)), nil, &ConfigCredResolver{}, nil)
-	k := NewKiller(mysql, pg, nil)
+	k := NewKiller(mysql, pg, nil, nil)
 
 	pg.registerSession(&pgSession{id: "sid-pg", threadID: 0})
 
@@ -829,7 +886,7 @@ func TestMySQLKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil)
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil, nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	clientA, sidA := killTestConnect(t, ln, tokenA, outA)
@@ -1022,7 +1079,7 @@ func TestMySQLKillConnectionLive(t *testing.T) {
 	var logBuf bytes.Buffer
 	ln, p := startKillTestProxyAny(t, vs, &logBuf)
 	addr := killTestAddr(ln)
-	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil)
+	k := NewKiller(p, NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), nil, nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	// Bystander B: connects and round-trips BEFORE the kill.
@@ -1126,7 +1183,7 @@ func TestPGKillQueryLive(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	ln, p, done := startPGKillTestProxy(t, vs, &logBuf)
-	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), p, nil)
+	k := NewKiller(NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, &ConfigCredResolver{}, nil), p, nil, nil)
 	killOut := startKillSwitch(t, vs, k)
 
 	token := pgLiveToken(t, vs)

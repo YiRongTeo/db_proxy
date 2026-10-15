@@ -9,10 +9,12 @@ import (
 
 // The data-plane kill contract (Task 8.3 two-level kill): force-close a
 // live session by id, reporting whether a session was found, or abort ONLY
-// its in-flight query, leaving the session alive. MySQLProxy, PGProxy and
-// MSSQLProxy all implement KillSession/KillQuery through their per-session
-// registries (the closer closes the client AND backend conns, so the relay
-// pipes exit and handleConn tears the session down). Review 2026-08-16:
+// its in-flight query, leaving the session alive. MySQLProxy, PGProxy,
+// MSSQLProxy and OracleProxy all implement KillSession through their
+// per-session registries (the closer closes the client AND backend conns,
+// so the relay pipes exit and handleConn tears the session down); KillQuery
+// exists on the MySQL/PG/MSSQL planes (Oracle capture is Phase 1 — no
+// in-flight query abort yet). Review 2026-08-16:
 // the one-method mssqlProxy-style interface was removed as unnecessary —
 // the Killer now holds the concrete proxy types directly.
 
@@ -36,17 +38,18 @@ const killQueryTimeout = 10 * time.Second
 // DONE_ATTN swallow for the rest of the session.
 const mssqlAttnTimeout = 10 * time.Second
 
-// Killer fans a ctl:kill request out to the MySQL, PostgreSQL and MSSQL
-// proxies' registries. Session ids are generated per proxy ("sid-" + random
+// Killer fans a ctl:kill request out to the MySQL, PostgreSQL, MSSQL and
+// Oracle proxies' registries. Session ids are generated per proxy ("sid-" + random
 // hex), so a live session lives on exactly one plane — but the ctl:kill
 // subscriber (Task 6.4) does not know which protocol a session uses, so it
 // asks all of them. All are always tried so an (astronomically unlikely) id
 // collision on another plane cannot leave a session alive;
 // KillSession/KillQuery are fast mutex-guarded map lookups on a miss.
 type Killer struct {
-	mysql *MySQLProxy
-	pg    *PGProxy
-	mssql *MSSQLProxy // Task 9.2: TDS sessions (kill-query N/A until 9.4)
+	mysql  *MySQLProxy
+	pg     *PGProxy
+	mssql  *MSSQLProxy  // Task 9.2: TDS sessions (kill-query N/A until 9.4)
+	oracle *OracleProxy // node-integration: TNS sessions (kill-query N/A — Phase 1 capture)
 
 	// vs (Task 9.13) is the store used to DELETE the session token's key
 	// when a connection-mode kill lands — revocation converges on "no key
@@ -83,11 +86,16 @@ func (k *Killer) TokenForSession(id string) (string, bool) {
 			return tok, true
 		}
 	}
+	if k.oracle != nil {
+		if tok, ok := k.oracle.TokenForSession(id); ok && tok != "" {
+			return tok, true
+		}
+	}
 	return "", false
 }
 
-func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy) *Killer {
-	return &Killer{mysql: mysql, pg: pg, mssql: mssql}
+func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy, oracle *OracleProxy) *Killer {
+	return &Killer{mysql: mysql, pg: pg, mssql: mssql, oracle: oracle}
 }
 
 // SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
@@ -95,7 +103,8 @@ func NewKiller(mysql *MySQLProxy, pg *PGProxy, mssql *MSSQLProxy) *Killer {
 func (k *Killer) SetMetrics(m *metrics.Metrics) { k.metrics = m }
 
 // KillSession tries the MySQL registry first, then the PostgreSQL registry,
-// then the MSSQL registry, and reports whether any plane had the session.
+// then the MSSQL registry, then the Oracle registry, and reports whether any
+// plane had the session.
 func (k *Killer) KillSession(id string) bool {
 	killed := false
 	if k.mysql != nil && k.mysql.KillSession(id) {
@@ -105,6 +114,9 @@ func (k *Killer) KillSession(id string) bool {
 		killed = true
 	}
 	if k.mssql != nil && k.mssql.KillSession(id) {
+		killed = true
+	}
+	if k.oracle != nil && k.oracle.KillSession(id) {
 		killed = true
 	}
 	return killed

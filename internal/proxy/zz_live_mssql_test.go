@@ -953,7 +953,7 @@ func TestMSSQLLiveKillRevokesSessionToken(t *testing.T) {
 	c := holdToken(t, token, ln)
 	defer c.close()
 
-	killer := NewKiller(nil, nil, p)
+	killer := NewKiller(nil, nil, p, nil)
 	killer.SetStore(vs)
 	msg := []byte(fmt.Sprintf(`{"session_id":%q,"mode":"connection"}`, tok.SessionID))
 	if line, sid := killer.HandleKill(msg); line != "session killed" || sid != tok.SessionID {
