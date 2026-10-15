@@ -449,3 +449,72 @@ func (s *ValkeyStore) ListSessionsParsed(ctx context.Context) ([]SessionInfo, er
 	}
 	return out, nil
 }
+
+// credOverridePrefix keys the at-mint credential overrides (node-integration
+// Task 4): ztcred:<session_id> = JSON {"password":"…"}, written by the mint
+// when POST /api/token carried a password. The key is SEPARATE from tok: (a
+// leaked payload must not drag the credential with it) and dies by its own
+// TTL — the token's resolved TTL — so the override can never outlive the
+// session it belongs to.
+const credOverridePrefix = "ztcred:"
+
+// SetCredOverride stores the at-mint password override for sid with a TTL.
+// The value is exactly {"password":<pw>} — the shape the data plane's
+// override chain decodes. Hard refusals (caller bugs): an empty sid, an
+// empty password (an override that carries nothing must never be written —
+// absent means absent), and a non-positive ttl (an eternal credential is
+// exactly what G2 forbids). The password appears in NO error path here.
+func (s *ValkeyStore) SetCredOverride(ctx context.Context, sid, pw string, ttl time.Duration) error {
+	if sid == "" {
+		return errors.New("cred override: empty session id")
+	}
+	if pw == "" {
+		return errors.New("cred override: empty password")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("cred override: ttl must be > 0, got %v", ttl)
+	}
+	data, err := json.Marshal(struct {
+		Password string `json:"password"`
+	}{Password: pw})
+	if err != nil {
+		return errors.New("cred override: marshal failed")
+	}
+	return s.client.Do(ctx, s.client.B().Set().
+		Key(credOverridePrefix+sid).
+		Value(string(data)).
+		Ex(ttl).Build()).Error()
+}
+
+// GetCredOverride reads the override password for sid. GET, deliberately NOT
+// GETDEL: session-mode reconnects may need the override more than once; its
+// life is bounded by the TTL, not by consumption. A missing/expired key is a
+// clean MISS ("" , nil) — the caller falls back to the normal resolver
+// chain. A stored value that fails to decode is a FIXED error string: the
+// message must never embed the stored bytes, because it can reach a WARN log
+// line. All error paths here are constant — the password cannot leak.
+func (s *ValkeyStore) GetCredOverride(ctx context.Context, sid string) (string, error) {
+	if sid == "" {
+		return "", errors.New("cred override: empty session id")
+	}
+	raw, err := s.client.Do(ctx, s.client.B().Get().Key(credOverridePrefix+sid).Build()).ToString()
+	if errors.Is(err, valkey.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", errors.New("cred override: read failed")
+	}
+	var v struct {
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return "", errors.New("cred override: stored value undecodable")
+	}
+	return v.Password, nil
+}
+
+// DelCredOverride removes the override key (test/ops support; the key's
+// lifecycle is the TTL). Missing key is not an error.
+func (s *ValkeyStore) DelCredOverride(ctx context.Context, sid string) error {
+	return s.client.Do(ctx, s.client.B().Del().Key(credOverridePrefix+sid).Build()).Error()
+}

@@ -60,6 +60,15 @@ type TokenPayload struct {
 	// expires the existing revoke path (poll + keyspace fast path) closes
 	// running sessions — same as any other key deletion.
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// CredOverride (node-integration Task 4) marks a token whose mint
+	// carried a `password`: the data plane must consult the ztcred:<sid>
+	// override key FIRST when resolving the backend credential, falling
+	// back to the normal config/api chain when the key is missing or
+	// expired (a WARN with the reason only — never a value). Absent/false
+	// (G3): the chain behaves exactly as before — the store is never
+	// consulted. The password itself NEVER rides the payload; it lives in
+	// the separate ztcred:<sid> key with the token's own TTL.
+	CredOverride bool `json:"cred_override,omitempty"`
 }
 
 // NormalizeIP canonicalizes a client address host for session-token IP
