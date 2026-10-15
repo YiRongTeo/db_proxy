@@ -240,6 +240,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		"session_id", payload.SessionID)
 	writeJSON(w, http.StatusOK, models.TokenResponse{
 		Token:     token,
+		SessionID: payload.SessionID,
 		Host:      a.cfg.DataPlaneHost,
 		Port:      a.cfg.DataPlanePort,
 		ExpiresIn: expiresIn,

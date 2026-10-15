@@ -106,6 +106,7 @@ func NewEventID() string {
 // TokenResponse is returned by POST /api/token.
 type TokenResponse struct {
 	Token     string `json:"token"`
+	SessionID string `json:"session_id"`
 	Host      string `json:"host"`
 	Port      string `json:"port"`
 	ExpiresIn int    `json:"expires_in"` // seconds
