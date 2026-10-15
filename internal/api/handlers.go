@@ -392,6 +392,19 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 			payload.MaxUses = 1
 		}
 	}
+	// Final-review blocker fix: an at-mint PASSWORD needs a FINITE ttl —
+	// SetCredOverride hard-refuses ttl<=0 (an eternal credential is
+	// exactly what G2 forbids), so a mint that resolves ttl=0 (session
+	// mode with api.session_token_ttl_seconds=0 — the committed default —
+	// and no end_time) would otherwise 500 AFTER a tok: write+delete
+	// round-trip. Refuse it HERE, before any write: 422 with the remedy
+	// in the message.
+	if hasPassword && ttl <= 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "password requires a finite token ttl — supply end_time or set api.session_token_ttl_seconds",
+		})
+		return
+	}
 	if err := a.vs.SetToken(r.Context(), token, payload, ttl); err != nil {
 		a.log.Error("token store", "err", err)
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
