@@ -84,9 +84,9 @@ Optional per-mint field that turns the token (and any session it opens) off at a
 
 | Aspect | Behavior |
 |---|---|
-| Accepted shapes | RFC3339 string — UTC `Z` is the documented form (`"2026-10-15T18:00:00Z"`); numeric offsets (`+02:00`) are **accepted and normalized** to the same instant — or an **integer epoch seconds** (`1760512345`) |
+| Accepted shapes | A string or integer epoch seconds (`1760512345`). String shapes, tried in order: **RFC3339** (UTC `Z` is the documented form, `"2026-10-15T18:00:00Z"`; numeric offsets `+02:00` are accepted and an offset, when present, is **authoritative** — never re-zoned) — then, when RFC3339 fails, the **naive (no-timezone) shapes**: `"2026-10-21 23:59:00"` (space-separated — the client main-app's shape), `"2026-10-21T23:59:00"` (naive ISO), `"2026-10-21"` (date-only → local midnight), `"2026-10-21 23:59"` (minute precision). Naive timestamps are interpreted in the **gateway's local timezone** (wall-clock intent) |
 | Absent / `null` | Feature off — no `expires_at` in the payload or response (existing clients unaffected) |
-| Malformed value | `400 invalid end_time` (a non-integer number, bool, object, array, bad RFC3339) |
+| Malformed value | `400 invalid end_time` (a non-integer number, bool, object, array, or a string matching no accepted shape) |
 | Past instant | `422 end_time is in the past` |
 | Beyond the ceiling | `422 end_time exceeds max session duration` when `api.max_session_seconds` > 0 and `end_time − now` exceeds it; **exactly at the ceiling is accepted** (config: [§11.9](#119-config-knobs)) |
 | Token TTL | `ttl = min(end_time − now, existing TTL rules)` — the end_time never *extends* a token past its mode's configured TTL; for session mode with an infinite configured TTL it becomes the finite key lifetime |
@@ -192,7 +192,7 @@ Node-integration messages are **verbatim** — match them exactly in the client.
 | `400` | `{"error":"ticket_id required"}` | `ticket_id` absent/empty |
 | `400` | `{"error":"invalid ticket_id"}` | > 128 chars, whitespace or control characters |
 | `400` | `{"error":"invalid db_subtype"}` | **NEW** — > 64 chars or control characters (after trim) |
-| `400` | `{"error":"invalid end_time"}` | **NEW** — not RFC3339, not integer epoch seconds (null/absent is fine) |
+| `400` | `{"error":"invalid end_time"}` | **NEW** — a string matching no accepted shape (RFC3339 / naive datetime, ISO, date-only, minute-precision — naive = gateway-local), or a non-integer number (null/absent is fine) |
 | `400` | `{"error":"mode must be single-use or session"}` | Unknown `mode` |
 | `400` | `{"error":"idle_seconds must be >= 0"}` | Negative idle override |
 | `422` | `{"error":"db_type must be mysql, postgres, mssql or oracle"}` | Unknown `db_type` |

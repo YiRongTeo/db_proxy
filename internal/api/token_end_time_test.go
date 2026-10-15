@@ -277,6 +277,108 @@ func TestTokenEndTimeAbsentUnchanged(t *testing.T) {
 	}
 }
 
+// TestTokenEndTimeNaiveFormats: the client main-app sends end_time as a
+// NAIVE "YYYY-MM-DD HH:MM:SS" string (no timezone, space-separated).
+// User-approved ruling: naive timestamps are interpreted in the GATEWAY'S
+// LOCAL timezone (wall-clock intent); RFC3339-with-offset stays
+// authoritative and is tried FIRST; epoch seconds are unchanged. Accepted
+// naive layouts, in try order after RFC3339 fails:
+//   - "2006-01-02 15:04:05"  naive datetime (the client's exact shape)
+//   - "2006-01-02T15:04:05"  naive ISO
+//   - "2006-01-02"           date-only → local midnight
+//   - "2006-01-02 15:04"     minute precision
+//
+// A string matching NO layout is still 400; the downstream semantics (past
+// → 422, ceiling → 422, ttl = min) operate on the parsed instant untouched.
+func TestTokenEndTimeNaiveFormats(t *testing.T) {
+	srv, client, vs, cfg := newModeTestAPIServer(t, "single-use", 0)
+	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
+
+	// localNaive is the EXPECTED instant for a naive string: the same
+	// fields read back through time.Local, exactly what
+	// time.ParseInLocation(layout, s, time.Local) must yield.
+	localNaive := func(ts time.Time) time.Time {
+		return time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), ts.Minute(), ts.Second(), 0, time.Local)
+	}
+	in30s := time.Now().Add(30 * time.Second).Truncate(time.Second)
+	tomorrow := time.Now().In(time.Local).AddDate(0, 0, 1)
+	tomorrowMidnight := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 0, 0, 0, 0, time.Local)
+	minutePrec := time.Now().Add(90 * time.Second).Truncate(time.Minute)
+
+	for _, tc := range []struct {
+		name string
+		val  string    // JSON-encoded end_time value
+		want time.Time // exact expected instant
+	}{
+		{"naive datetime (client shape)", fmt.Sprintf("%q", in30s.Local().Format("2006-01-02 15:04:05")), localNaive(in30s)},
+		{"naive ISO", fmt.Sprintf("%q", in30s.Local().Format("2006-01-02T15:04:05")), localNaive(in30s)},
+		{"date-only → local midnight", fmt.Sprintf("%q", tomorrow.Format("2006-01-02")), tomorrowMidnight},
+		{"minute precision", fmt.Sprintf("%q", minutePrec.Local().Format("2006-01-02 15:04")), localNaive(minutePrec)},
+		// The client's literal documented example, pinned verbatim.
+		{"client literal", `"2026-10-21 23:59:00"`, time.Date(2026, 10, 21, 23, 59, 0, 0, time.Local)},
+		// RFC3339 with a numeric offset still wins — tried first, and the
+		// offset (not the gateway zone) determines the instant.
+		{"rfc3339 offset authoritative", fmt.Sprintf("%q", in30s.UTC().In(time.FixedZone("UTC+2", 2*3600)).Format(time.RFC3339)), in30s},
+		// Epoch seconds unchanged.
+		{"epoch seconds", fmt.Sprintf("%d", time.Now().Unix()+30), time.Now().Add(30 * time.Second).Truncate(time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.want.Before(time.Now()) {
+				t.Skipf("dated fixture %s already in the past", tc.want)
+			}
+			token, expiresIn, expiresAt, status, raw := issueEndTime(t, client, srv.URL, endBody("", tc.val))
+			if status != http.StatusOK {
+				t.Fatalf("status %d, want 200 (body %s)", status, raw)
+			}
+			if expiresAt != tc.want.Unix() {
+				t.Errorf("expires_at = %d, want exactly %d (the gateway-local parsed instant)", expiresAt, tc.want.Unix())
+			}
+			wantIn := int(time.Until(tc.want).Seconds())
+			if wantIn > 60 {
+				wantIn = 60 // ttl = min(end_time − now, mode TTL rules): the fixture's 60s TTL clamps a FARTHER end_time
+			}
+			if expiresIn < wantIn-2 || expiresIn > wantIn+2 {
+				t.Errorf("expires_in = %d, want %d (±2s)", expiresIn, wantIn)
+			}
+			p := fetchPayload(t, vs, token)
+			got, _ := p["expires_at"].(float64)
+			if int64(got) != tc.want.Unix() {
+				t.Errorf("payload expires_at = %v, want %d", p["expires_at"], tc.want.Unix())
+			}
+		})
+	}
+
+	// Past naive → 422, same downstream semantics as RFC3339 (the ceiling
+	// is armed only AFTER the table above, which needs it uncapped).
+	past := time.Now().Add(-time.Minute).Truncate(time.Second)
+	_, _, _, status, raw := issueEndTime(t, client, srv.URL,
+		endBody("", fmt.Sprintf("%q", past.Local().Format("2006-01-02 15:04:05"))))
+	if status != http.StatusUnprocessableEntity || !strings.Contains(raw, "end_time is in the past") {
+		t.Errorf("past naive: status %d body %s, want 422 past-end_time", status, raw)
+	}
+
+	cfg.MaxSessionSeconds = 120
+	far := time.Now().Add(10 * time.Minute).Truncate(time.Minute)
+	_, _, _, status, raw = issueEndTime(t, client, srv.URL,
+		endBody("", fmt.Sprintf("%q", far.Local().Format("2006-01-02 15:04"))))
+	if status != http.StatusUnprocessableEntity || !strings.Contains(raw, "end_time exceeds max session duration") {
+		t.Errorf("naive beyond ceiling: status %d body %s, want 422 ceiling", status, raw)
+	}
+
+	// Strings matching NO layout (RFC3339, naive, date-only, epoch) → 400.
+	for _, bad := range []string{
+		"next tuesday",
+		"2026-10",
+		"21-10-2026 23:59:00",
+		"2026/10/21 23:59:00",
+	} {
+		_, _, _, status, raw := issueEndTime(t, client, srv.URL, endBody("", fmt.Sprintf("%q", bad)))
+		if status != http.StatusBadRequest || !strings.Contains(raw, "invalid end_time") {
+			t.Errorf("garbage %q: status %d body %s, want 400 invalid end_time", bad, status, raw)
+		}
+	}
+}
+
 // TestTokenEndTimeAcceptsUTCTOffsets: RFC3339 with a numeric UTC offset
 // (e.g. "+02:00") denotes the same instant as its Z-spelling and is
 // ACCEPTED — the mint resolves identically for both spellings.

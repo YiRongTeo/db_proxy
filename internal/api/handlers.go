@@ -92,9 +92,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// timeout for THIS token. 0/absent = the data plane's
 		// session.idle_seconds default (applies to every token mode).
 		IdleSeconds int `json:"idle_seconds,omitempty"`
-		// EndTime is the OPTIONAL end_time raw JSON value — RFC3339 UTC
-		// string OR integer epoch seconds. json.RawMessage so the three
-		// legitimate shapes (string / integer / null) stay distinguishable.
+		// EndTime is the OPTIONAL end_time raw JSON value — RFC3339 string
+		// (offset authoritative), a naive datetime/ISO/date-only string
+		// (interpreted in the gateway's LOCAL timezone), OR integer epoch
+		// seconds. json.RawMessage so the three legitimate shapes (string /
+		// integer / null) stay distinguishable.
 		EndTime json.RawMessage `json:"end_time,omitempty"`
 		// Password is the OPTIONAL at-mint credential override: the mint
 		// writes it to the SEPARATE Valkey key ztcred:<session_id> (TTL ==
@@ -211,17 +213,40 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// OPTIONAL end_time — the instant this token (and any session it
-	// opens) must die. RFC3339 UTC string or integer epoch seconds; null
+	// opens) must die. RFC3339 string (an offset, when present, is
+	// authoritative), a naive datetime/ISO/date-only string (interpreted
+	// in the gateway's LOCAL timezone), or integer epoch seconds; null
 	// or absent means none; anything else is a client bug → 400.
 	var endTime time.Time
 	hasEndTime := false
 	if len(req.EndTime) > 0 && string(req.EndTime) != "null" {
 		raw := strings.TrimSpace(string(req.EndTime))
 		if len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
-			// RFC3339 shape; numeric UTC offsets are ACCEPTED and
-			// normalize to the same instant (rejecting them breaks
-			// integrations for no security gain).
-			parsed, err := time.Parse(time.RFC3339, raw[1:len(raw)-1])
+			s := raw[1 : len(raw)-1]
+			// RFC3339 first (unchanged): numeric UTC offsets are
+			// ACCEPTED and normalize to the same instant (rejecting
+			// them breaks integrations for no security gain). When an
+			// offset IS present it is authoritative — the gateway
+			// never re-zones it.
+			parsed, err := time.Parse(time.RFC3339, s)
+			if err != nil {
+				// Defensive shapes for clients that send NAIVE
+				// timestamps (no timezone): the gateway's LOCAL
+				// timezone supplies it — wall-clock intent. Tried in
+				// order after RFC3339 fails; only if ALL fail is it
+				// a client bug → 400.
+				for _, layout := range []string{
+					"2006-01-02 15:04:05", // naive datetime (client main-app's shape)
+					"2006-01-02T15:04:05", // naive ISO
+					"2006-01-02",          // date-only → local midnight
+					"2006-01-02 15:04",    // minute precision
+				} {
+					if t2, e2 := time.ParseInLocation(layout, s, time.Local); e2 == nil {
+						parsed, err = t2, nil
+						break
+					}
+				}
+			}
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid end_time"})
 				return

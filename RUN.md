@@ -1076,7 +1076,9 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
 #    - omit "db_port" → resolved from the default-port map (3306 above);
 #      "db_subtype" refines the lookup but no non-default subtypes ship yet —
 #      pass db_port explicitly for those or the mint is 422.
-#    - add  "end_time":"2026-10-15T18:00:00Z"  (or integer epoch seconds) → the
+#    - add  "end_time":"2026-10-15T18:00:00Z"  (RFC3339, naive
+#      "2026-10-21 23:59:00" / date-only interpreted in the gateway's local
+#      timezone, or integer epoch seconds) → the
 #      token dies at that instant; response then carries "expires_at" too.
 #      Ceiling: api.max_session_seconds (0 = uncapped).
 #    - add  "password":"<backend-password>" → at-mint credential override
