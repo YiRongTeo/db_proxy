@@ -51,6 +51,15 @@ type TokenPayload struct {
 	// plane's session.idle_seconds default (which applies to EVERY token
 	// mode). >0 overrides the default for sessions opened with this token.
 	IdleSeconds int `json:"idle_seconds,omitempty"`
+	// ExpiresAt (node-integration Task 2) is the end_time instant the mint
+	// was asked to honor, unix seconds — stamped at issue when the request
+	// carried end_time, absent otherwise. INFORMATIONAL: it lets the data
+	// plane log remaining life; force-close does NOT depend on it. The
+	// enforcement is the tok: key TTL (the mint stores the token with
+	// ttl = min(end_time − now, existing TTL rules)), and when that key
+	// expires the existing revoke path (poll + keyspace fast path) closes
+	// running sessions — same as any other key deletion.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // NormalizeIP canonicalizes a client address host for session-token IP
@@ -110,6 +119,11 @@ type TokenResponse struct {
 	Host      string `json:"host"`
 	Port      string `json:"port"`
 	ExpiresIn int    `json:"expires_in"` // seconds
+	// ExpiresAt (node-integration Task 2) is the absolute token expiry as
+	// unix seconds — present only when the mint carried end_time (the
+	// endTime instant); 0/omitempty otherwise, keeping the response
+	// byte-identical to the pre-end_time shape for existing clients (G3).
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // QueryEvent is published to Valkey Pub/Sub by the Data Plane

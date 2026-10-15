@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,6 +102,12 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// idle timeout for THIS token. 0/absent = the data plane's
 		// session.idle_seconds default (applies to every token mode).
 		IdleSeconds int `json:"idle_seconds,omitempty"`
+		// EndTime (node-integration Task 2) is the OPTIONAL end_time raw
+		// JSON value — RFC3339 UTC string OR integer epoch seconds (see
+		// the parse block below). Kept as json.RawMessage so the three
+		// legitimate shapes (string / integer / null) can be told apart
+		// without interface{} boxing.
+		EndTime json.RawMessage `json:"end_time,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
@@ -200,6 +207,56 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "idle_seconds must be >= 0"})
 		return
 	}
+	// node-integration Task 2: OPTIONAL end_time — the instant this token
+	// (and any session it opens) must die. Accepted shapes: RFC3339 UTC
+	// string OR integer epoch seconds. JSON null / absent → no end_time
+	// (G3: existing clients unaffected). Everything else — a malformed
+	// string, a non-integer number, a bool/object/array — is a client bug
+	// → 400 "invalid end_time".
+	var endTime time.Time
+	hasEndTime := false
+	if len(req.EndTime) > 0 && string(req.EndTime) != "null" {
+		raw := strings.TrimSpace(string(req.EndTime))
+		if len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+			// RFC3339 shape. Numeric UTC offsets (e.g. "+02:00") are
+			// ACCEPTED and normalize to the same instant — rejecting a
+			// client clock's local-offset spelling would break
+			// integrations for no security gain; "Z" is the documented
+			// contract.
+			parsed, err := time.Parse(time.RFC3339, raw[1:len(raw)-1])
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid end_time"})
+				return
+			}
+			endTime = parsed
+		} else {
+			// Integer epoch seconds — strconv.ParseInt rules out floats,
+			// exponents, and out-of-int64-range values.
+			secs, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid end_time"})
+				return
+			}
+			endTime = time.Unix(secs, 0)
+		}
+		hasEndTime = true
+	}
+	if hasEndTime {
+		// Spec decision: end_time ≤ now is already expired → 422.
+		if !endTime.After(time.Now()) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "end_time is in the past"})
+			return
+		}
+		// api.max_session_seconds > 0 caps the end_time horizon; 0 =
+		// uncapped. A mint at exactly the ceiling is accepted.
+		if a.cfg.MaxSessionSeconds > 0 {
+			maxEnd := time.Now().Add(time.Duration(a.cfg.MaxSessionSeconds) * time.Second)
+			if endTime.After(maxEnd) {
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "end_time exceeds max session duration"})
+				return
+			}
+		}
+	}
 	// Review 9.9 MINOR: issuance throttle — bound token minting. Every
 	// request is bearer-authenticated (Task 7) and the username is bound to
 	// the principal, so the username is ALWAYS the throttle key (the
@@ -247,7 +304,29 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// for sessions opened with this token.
 		IdleSeconds: req.IdleSeconds,
 	}
+	// node-integration Task 2: the end_time instant, unix seconds —
+	// stamped ONLY when the mint carried one (absent end_time → payload
+	// and response stay free of expires_at — G3). Informational: the
+	// enforcement is the key TTL below.
+	if hasEndTime {
+		payload.ExpiresAt = endTime.Unix()
+	}
+	// node-integration Task 2: ttl = min(end_time − now, existing TTL
+	// rules). The end_time deadline is computed FIRST and the mode's own
+	// rule below takes min with it — a longer end_time never extends a
+	// token past its configured TTL. (For session mode with an INFINITE
+	// configured TTL the end_time-derived value becomes the finite key
+	// lifetime; the data plane's idle/max-lifetime machinery applies on
+	// top, unchanged. When the tok: key expires, the existing revoke path
+	// — poll + keyspace fast path — closes running sessions.)
+	endTimeTTL := time.Duration(0)
+	if hasEndTime {
+		endTimeTTL = time.Until(endTime)
+	}
 	ttl := time.Duration(a.cfg.TokenTTL) * time.Second
+	if endTimeTTL > 0 && (ttl <= 0 || endTimeTTL < ttl) {
+		ttl = endTimeTTL
+	}
 	if mode == "session" {
 		// Task 9.13 session tokens: TTL from api.session_token_ttl_seconds
 		// (0 = INFINITE — the token lives until revoked), stamped issue IP
@@ -255,6 +334,9 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// anchor). MaxUses is meaningless here — session tokens are not
 		// consumed — so it stays absent.
 		ttl = time.Duration(a.cfg.SessionTokenTTL) * time.Second
+		if endTimeTTL > 0 && (ttl <= 0 || endTimeTTL < ttl) {
+			ttl = endTimeTTL
+		}
 		payload.IP = models.NormalizeIP(clientIP(r))
 		payload.IssuedAt = time.Now().UTC().Unix()
 	} else {
@@ -273,9 +355,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Task 9.13: -1 signals an infinite session token to the client (the
-	// token never expires — revocation is explicit).
+	// token never expires — revocation is explicit). node-integration
+	// Task 2: an end_time turns the infinite token finite — report the
+	// endTime-derived TTL instead of −1.
 	expiresIn := int(ttl.Seconds())
-	if mode == "session" && a.cfg.SessionTokenTTL <= 0 {
+	if mode == "session" && a.cfg.SessionTokenTTL <= 0 && endTimeTTL <= 0 {
 		expiresIn = -1
 	}
 	a.issueLimiter.hit(issueKey, time.Now())
@@ -303,6 +387,9 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		Host:      a.cfg.DataPlaneHost,
 		Port:      a.cfg.DataPlanePort,
 		ExpiresIn: expiresIn,
+		// node-integration Task 2: the absolute expiry (unix seconds) —
+		// the end_time instant when one was given; 0/omitted otherwise.
+		ExpiresAt: payload.ExpiresAt,
 	})
 }
 

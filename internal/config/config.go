@@ -104,10 +104,18 @@ type ControlConfig struct {
 	// (key deleted) or the data plane's idle/max-lifetime enforcement.
 	// Single-use tokens keep api.token_ttl_seconds.
 	SessionTokenTTL int
-	DataPlaneHost   string
-	DataPlanePort   string
-	AuthUser        string
-	AuthPassword    string
+	// MaxSessionSeconds (node-integration Task 2; yaml
+	// api.max_session_seconds, env ZT_API_MAX_SESSION_SECONDS) is the
+	// OPTIONAL CEILING on an end_time-derived token lifetime: when > 0, a
+	// mint whose end_time − now exceeds it is rejected 422 ("end_time
+	// exceeds max session duration"); a value exactly at the ceiling is
+	// accepted. 0 (default) = UNCAPPED. It bounds ONLY the end_time
+	// mechanism — mints without end_time are untouched (G3).
+	MaxSessionSeconds int
+	DataPlaneHost     string
+	DataPlanePort     string
+	AuthUser          string
+	AuthPassword      string
 	// AuthRole (yaml auth.role, env ZT_AUTH_ROLE; JWT conversion Task 2) is
 	// the PRIMARY account's role: "maker" or "checker". REQUIRED whenever
 	// auth.jwt.login_enabled is true — explicit over default, no silent
@@ -437,6 +445,9 @@ func LoadControl(path string) (*ControlConfig, error) {
 		// Task 9.13 session tokens: default issue mode single-use; session
 		// TTL 0 = infinite (revocation is explicit, never timer-based).
 		"api.token_mode": "single-use", "api.session_token_ttl_seconds": 0,
+		// node-integration Task 2: the end_time mint ceiling — 0 (default)
+		// = uncapped; >0 rejects end_time-derived lifetimes beyond it 422.
+		"api.max_session_seconds": 0,
 		// JWT conversion (Task 2): the bearer-JWT block defaults ON —
 		// auth.jwt.enabled ABSENT = true (JWT is the mode going forward; an
 		// explicit false disables JWT verification — guarded routes fail
@@ -472,18 +483,19 @@ func LoadControl(path string) (*ControlConfig, error) {
 		return nil, err
 	}
 	cfg := &ControlConfig{
-		HTTPAddr:        v.GetString("http.addr"),
-		StaticDir:       v.GetString("http.static_dir"),
-		TokenTTL:        v.GetInt("api.token_ttl_seconds"),
-		TokenMaxUses:    v.GetInt("api.token_max_uses"),
-		TokenMode:       v.GetString("api.token_mode"),
-		SessionTokenTTL: v.GetInt("api.session_token_ttl_seconds"),
-		DataPlaneHost:   v.GetString("api.data_plane_host"),
-		DataPlanePort:   v.GetString("api.data_plane_port"),
-		AuthUser:        v.GetString("auth.username"),
-		AuthPassword:    v.GetString("auth.password"),
-		AuthRole:        v.GetString("auth.role"),
-		AllowMakerWatch: v.GetBool("auth.allow_maker_watch"),
+		HTTPAddr:          v.GetString("http.addr"),
+		StaticDir:         v.GetString("http.static_dir"),
+		TokenTTL:          v.GetInt("api.token_ttl_seconds"),
+		TokenMaxUses:      v.GetInt("api.token_max_uses"),
+		TokenMode:         v.GetString("api.token_mode"),
+		SessionTokenTTL:   v.GetInt("api.session_token_ttl_seconds"),
+		MaxSessionSeconds: v.GetInt("api.max_session_seconds"),
+		DataPlaneHost:     v.GetString("api.data_plane_host"),
+		DataPlanePort:     v.GetString("api.data_plane_port"),
+		AuthUser:          v.GetString("auth.username"),
+		AuthPassword:      v.GetString("auth.password"),
+		AuthRole:          v.GetString("auth.role"),
+		AllowMakerWatch:   v.GetBool("auth.allow_maker_watch"),
 		JWT: JWTConfig{
 			Enabled:        v.GetBool("auth.jwt.enabled"),
 			LoginEnabled:   v.GetBool("auth.jwt.login_enabled"),

@@ -24,6 +24,13 @@ api:
   # usable; the TTL still bounds the window and each use is atomic, so a
   # stolen token can open at most this many connections.
   token_max_uses: 4
+  # max_session_seconds (node-integration Task 2; env
+  # ZT_API_MAX_SESSION_SECONDS): OPTIONAL ceiling on a mint's end_time —
+  # a POST /api/token whose end_time − now exceeds this many seconds is
+  # rejected 422 ("end_time exceeds max session duration"); exactly at the
+  # ceiling is accepted. 0 (default) = UNCAPPED. Bounds ONLY the end_time
+  # mechanism — mints without end_time are unaffected.
+  max_session_seconds: 0
   data_plane_host: "127.0.0.1"
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
