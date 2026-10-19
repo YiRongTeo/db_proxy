@@ -157,7 +157,7 @@ func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 	s := newTestSession()
 	cleanupLiveRecord(t, vs, s.id)
 	tok := &models.TokenPayload{Username: "test-user", TicketID: "T-3-4",
-		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307"}
+		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307", DBType: "mysql"}
 
 	cases := []struct {
 		cmd  byte

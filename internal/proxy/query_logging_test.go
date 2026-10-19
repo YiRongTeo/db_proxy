@@ -86,7 +86,7 @@ func TestMySQLQueryLoggingContextAlways(t *testing.T) {
 	p := NewMySQLProxy(cap.logger(), vs, &ConfigCredResolver{}, nil) // flag off (default)
 	s := &mysqlSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
 	cleanupLiveRecord(t, vs, s.id)
-	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user"}
+	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user", DBType: "mysql"}
 
 	p.sniffCommand(s, cmdQuery, []byte("SELECT id FROM demo_items"), tok, "127.0.0.1:1")
 	s.mu.Lock()
@@ -118,7 +118,7 @@ func TestMySQLQueryLoggingOutputFlag(t *testing.T) {
 	p.SetLogQueryOutput(true)
 	s := &mysqlSession{id: "sid-" + newEventID(), db: "appdb", closer: func() {}}
 	cleanupLiveRecord(t, vs, s.id)
-	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user"}
+	tok := &models.TokenPayload{Username: "alice", TicketID: "T-8-8", DBUser: "ro_user", DBType: "mysql"}
 
 	p.sniffCommand(s, cmdQuery, []byte("SELECT id FROM demo_items"), tok, "127.0.0.1:1")
 	s.mu.Lock()

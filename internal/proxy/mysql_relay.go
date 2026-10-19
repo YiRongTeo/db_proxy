@@ -127,7 +127,7 @@ func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *m
 		DBUser:     tok.DBUser,
 		DBIP:       tok.DBIP,
 		DBPort:     tok.DBPort,
-		DBType:     "mysql",
+		DBType:     tok.DBType, // verbatim from the session's token: mysql OR mariadb
 		DB:         s.db,
 		SQL:        sql,
 		ClientAddr: clientAddr,
