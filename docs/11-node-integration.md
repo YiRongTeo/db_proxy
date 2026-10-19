@@ -34,11 +34,12 @@
 | `db_type` | string | **yes** | — | `mysql` \| `postgres` \| `mssql` \| `oracle` |
 | `db_user` | string | **yes** | — | Backend DB user |
 | `db_ip` | string | **yes** | — | Backend DB host |
-| `db_port` | string | no | resolved from `db_type` + `db_subtype` (table below) | **Node-integration change: now OPTIONAL.** An explicit value is stored verbatim and always wins; when absent, the port is looked up in the default-port map |
+| `db_port` | integer \| string | no | resolved from `db_type` + `db_subtype` (table below) | **Node-integration change: now OPTIONAL, and accepts a JSON NUMBER or a numeric STRING** — `3306` and `"3306"` are the same port (normalized to the canonical decimal string; whitespace trimmed). A fractional number (`3306.5`) or non-numeric value → `400 db_port must be an integer or numeric string`. An explicit value is stored verbatim and always wins; when absent (or `null`), the port is looked up in the default-port map |
 | `db_subtype` | string | no | `"default"` | **NEW.** Refines the default-port lookup (e.g. `master`/`slave`). Trimmed, ≤ 64 chars, no control characters; it never appears in the payload, the credentials key, or the response — it is consumed by the port lookup |
 | `mode` | string | no | preset's `token_mode`, then `api.token_mode` | `single-use` \| `session` |
 | `idle_seconds` | int | no | 0 = data-plane `session.idle_seconds` | Per-token idle override (≥ 0) |
 | `end_time` | string \| int | no | absent = no deadline | **NEW.** Absolute kill time for the token and any session it opens — see [§11.3](#113-end_time---the-absolute-deadline) |
+| `endTime` | string \| int | no | — | **ALIAS of `end_time`** (the node client's camelCase contract spelling). Both keys are accepted; setting **both** with different values → `400 end_time and endTime are both set with different values`; identical values (or `null` on one side) are fine. No other field has a camelCase alias |
 | `password` | string | no | absent = unchanged | **NEW.** At-mint backend-credential override — see [§11.4](#114-password---the-at-mint-credential-override) |
 
 ### Default-port map (used when `db_port` is omitted)
@@ -186,7 +187,9 @@ Node-integration messages are **verbatim** — match them exactly in the client.
 
 | Status | Body | When |
 |---|---|---|
-| `400` | `{"error":"bad request"}` | Body not decodable JSON, an **unknown field**, or > 1 MB |
+| `400` | `{"error":"bad request: <first json decode error>"}` | Body not decodable JSON, an **unknown field**, or > 1 MB — the stdlib decode error is passed through and **names the offending field/type** (e.g. `bad request: json: unknown field "bogus_field"`). Replaces the old opaque `{"error":"bad request"}` |
+| `400` | `{"error":"db_port must be an integer or numeric string"}` | **NEW** — `db_port` as a fractional number (`3306.5`) or a non-numeric value (`"db"`, `true`); `3306` / `"3306"` / `" 3306 "` all pass |
+| `400` | `{"error":"end_time and endTime are both set with different values"}` | **NEW** — both the `end_time` key and its `endTime` alias set with non-null, textually different values; identical values (or `null` on one side) mint fine |
 | `400` | `{"error":"missing required fields"}` | `username` / `db_user` / `db_ip` empty after binding |
 | `400` | `{"error":"username does not match session"}` | Body `username` ≠ bearer subject |
 | `400` | `{"error":"ticket_id required"}` | `ticket_id` absent/empty |

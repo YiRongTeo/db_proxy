@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +15,34 @@ import (
 
 // maxBodyBytes caps JSON request bodies at 1 MB.
 const maxBodyBytes = 1 << 20
+
+// compatDBPortNormalizes a decoded db_port JSON value (kept as RawMessage
+// so number, string, and null stay distinguishable) into the canonical
+// DECIMAL STRING the port map and payload expect: a JSON integer and a
+// numeric string are the same port (3306 == "3306"); whitespace is
+// trimmed. A fractional number or any non-numeric shape is a client error
+// — the returned message NAMES the field.
+func compatDBPort(raw json.RawMessage) (string, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", ""
+	}
+	s := strings.TrimSpace(string(raw))
+	if len(s) > 1 && s[0] == '"' && s[len(s)-1] == '"' {
+		unq, err := strconv.Unquote(s)
+		if err != nil {
+			return "", "db_port must be an integer or numeric string"
+		}
+		s = unq
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "db_port must be an integer or numeric string"
+	}
+	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+		return "", "db_port must be an integer or numeric string"
+	}
+	return s, ""
+}
 
 // sessionPendingTTL is the lifetime of a sess:live:<sid> record written at
 // TOKEN ISSUE time: a token whose maker never connects expires from the
@@ -50,6 +79,12 @@ func (a *api) handleDBPresets(w http.ResponseWriter, r *http.Request) {
 // MaxBytesReader is bound to the ResponseWriter so an oversized body aborts
 // the connection instead of dribbling, and unknown fields are REJECTED —
 // a misspelled field is a client bug, not a silently-ignored field.
+//
+// The returned error is the raw stdlib decode error (it names the
+// offending field/type — e.g. "json: cannot unmarshal number into Go
+// struct field .db_port of type string" — and carries no secrets);
+// callers surface it verbatim in the 400 body instead of an opaque
+// "bad request".
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
@@ -77,8 +112,11 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		DBIP     string `json:"db_ip"`
 		// DBPort is OPTIONAL: an explicit value is stored verbatim; an
 		// absent one resolves from dbPortDefaults via db_type + DBSubtype.
-		DBPort string `json:"db_port"`
-		DBType string `json:"db_type"`
+		// RawMessage so a JSON NUMBER and a numeric STRING both decode —
+		// the node client sends numbers; compatDBPort normalizes either
+		// to the canonical decimal string ("3306" == 3306).
+		DBPort json.RawMessage `json:"db_port,omitempty"`
+		DBType string          `json:"db_type"`
 		// DBSubtype refines the default-port lookup (e.g. "master"/"slave",
 		// structure only today); trimmed, ≤64 chars, no control chars,
 		// absent = "default". Never reaches the payload or credentials key.
@@ -97,7 +135,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// (interpreted in the gateway's LOCAL timezone), OR integer epoch
 		// seconds. json.RawMessage so the three legitimate shapes (string /
 		// integer / null) stay distinguishable.
-		EndTime json.RawMessage `json:"end_time,omitempty"`
+		//
+		// ENDTIME CAMPEX ALIAS: the node client's contract spells the key
+		// endTime (camelCase). EndTimeCamel is the EXACT alias of
+		// end_time — the only camelCase alias in this API. Both raw keys
+		// are read; null counts as absent on either side; both present
+		// with non-null, textually different values → 400 (below).
+		EndTime      json.RawMessage `json:"end_time,omitempty"`
+		EndTimeCamel json.RawMessage `json:"endTime,omitempty"`
 		// Password is the OPTIONAL at-mint credential override: the mint
 		// writes it to the SEPARATE Valkey key ztcred:<session_id> (TTL ==
 		// the token's) and stamps payload.cred_override, so the data plane
@@ -107,8 +152,29 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		Password *string `json:"password,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":"bad request: %s"}`, err), http.StatusBadRequest)
 		return
+	}
+	// db_port compat: the JSON number-or-string value decodes here into
+	// the canonical decimal string. Absent/null stays "" → the existing
+	// dbPortDefaults resolution below (unchanged). A fractional number or
+	// non-numeric garbage is a 400 that NAMES the field.
+	dbPort, portErr := compatDBPort(req.DBPort)
+	if portErr != "" {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, portErr), http.StatusBadRequest)
+		return
+	}
+	req.DBPort = json.RawMessage(dbPort)
+	// endTime alias reconciliation: the camelCase key IS end_time. Null
+	// counts as absent on both sides; both set with non-null values that
+	// differ TEXTUALLY → 400 naming both spellings; identical → fine.
+	if len(req.EndTimeCamel) > 0 && string(req.EndTimeCamel) != "null" {
+		if len(req.EndTime) > 0 && string(req.EndTime) != "null" &&
+			string(req.EndTime) != string(req.EndTimeCamel) {
+			http.Error(w, `{"error":"end_time and endTime are both set with different values"}`, http.StatusBadRequest)
+			return
+		}
+		req.EndTime = req.EndTimeCamel
 	}
 	// The requester's username is BOUND to the bearer principal: the body
 	// username (if present) must match the principal's sub — otherwise the
@@ -153,8 +219,9 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 	// Port resolution: an explicit db_port is stored verbatim; only an
 	// absent one falls back to dbPortDefaults. A type+subtype with no map
-	// entry is a 422 — never a guessed port.
-	if req.DBPort == "" {
+	// entry is a 422 — never a guessed port. (DBPort is the compat-
+	// normalized canonical decimal string by this point; "" = absent.)
+	if string(req.DBPort) == "" {
 		subtype := req.DBSubtype
 		if subtype == "" {
 			subtype = "default"
@@ -166,7 +233,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		req.DBPort = port
+		req.DBPort = json.RawMessage(port)
 	}
 	// At-mint credential override: shape validation only — the key write
 	// happens after SetToken (it needs the sid), with the token's own TTL.
@@ -194,7 +261,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// the two known flavors is a client error.
 	mode := req.Mode
 	if mode == "" {
-		mode = a.modeForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort)
+		mode = a.modeForPreset(req.DBType, req.DBUser, req.DBIP, string(req.DBPort))
 	}
 	if mode == "" {
 		mode = a.cfg.TokenMode
@@ -293,7 +360,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Stamp the session id at ISSUE time so the session is visible to
 	// checkers (status "pending") before the maker connects; the data
 	// plane adopts this id on connect.
-	access := a.accessForPreset(req.DBType, req.DBUser, req.DBIP, req.DBPort)
+	access := a.accessForPreset(req.DBType, req.DBUser, req.DBIP, string(req.DBPort))
 	// Role gate (SoD): a checker-role principal may mint only read-access
 	// (or ungated ad-hoc) tokens — a write token would let a checker open
 	// a write session and watch itself, bypassing the write gate (a
@@ -310,7 +377,7 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 	payload := models.TokenPayload{
 		Username: req.Username, DBUser: req.DBUser, DBIP: req.DBIP,
-		DBPort: req.DBPort, DBType: req.DBType, TicketID: req.TicketID,
+		DBPort: string(req.DBPort), DBType: req.DBType, TicketID: req.TicketID,
 		Access:    access,
 		SessionID: models.NewSessionID(),
 		Mode:      mode,
