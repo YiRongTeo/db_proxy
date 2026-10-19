@@ -342,7 +342,12 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "invalid or expired token"))
 		return
 	}
-	if tok.DBType != "mysql" {
+	// MariaDB speaks the MySQL wire protocol, so this plane serves BOTH
+	// db_types: a "mariadb" token is accepted here exactly like "mysql".
+	// (The credential key stays verbatim mariadb:<user>@<ip>:<port> — the
+	// plane does NOT alias it to a mysql: key.) Every other plane accepts
+	// only its own db_type.
+	if tok.DBType != "mysql" && tok.DBType != "mariadb" {
 		p.metrics.TokensRejected("wrong_db_type")
 		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Warn("token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)

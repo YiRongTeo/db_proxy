@@ -1076,7 +1076,8 @@ JWT=$(curl -s -X POST http://127.0.0.1:8080/api/login \
 # 2) mint with the JWT. The body username (optional) must match the JWT's
 #    subject or be omitted — the token is always issued for the principal.
 #    Node-integration: db_port is OPTIONAL now (resolved from db_type +
-#    db_subtype defaults: mysql 3306 / postgres 5432 / mssql 1433 / oracle 1521;
+#    db_subtype defaults: mysql 3306 / mariadb 6603 / postgres 5432 /
+#    mssql 1433 / oracle 1521;
 #    an explicit db_port always wins), and the OPTIONAL end_time / password
 #    fields are shown commented:
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
@@ -1112,6 +1113,12 @@ and then `expires_in` is the end_time-derived TTL even in the infinite-TTL
 session case).
 
 For PostgreSQL swap `"db_type":"postgres"` and the backend port `"db_port":"5433"` (user `ro_user`).
+For MariaDB: `db_type` `"mariadb"` is first-class (NOT an alias of mysql) — it rides the same
+MySQL-wire-protocol plane, defaults to port `6603` when `db_port` is omitted, and its backend
+credential key is verbatim `mariadb:<user>@<ip>:<port>` (own `credentials:` entries in
+`configs/data.yaml`; no `mysql:` fallback). Backend service accounts must use
+`mysql_native_password` or `caching_sha2_password` (NOT `ed25519`); `caching_sha2_password`
+full auth needs the TLS plane. Details: docs/11 §11.11.
 
 > Mint without a bearer → `401`; unknown `db_type` → `422`; missing fields → `400`;
 > a **checker**-role principal minting a write-access token → `403` (checkers are

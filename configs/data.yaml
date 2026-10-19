@@ -66,6 +66,16 @@ credentials:                  # Data Plane owns DB credentials (zero-trust); key
     password: "${ZT_CRED_ORACLE_RO_PASSWORD}"
   - key: "oracle:rw_user@127.0.0.1:1521"
     password: "${ZT_CRED_ORACLE_RW_PASSWORD}"
+  # MariaDB (db_type "mariadb", first-class since node-integration): keys are
+  # VERBATIM mariadb:... — NO aliasing to mysql: keys. A mariadb mint resolves
+  # ONLY a mariadb: entry, so a MariaDB backend needs its own entries. Commented
+  # EXAMPLES ONLY (no live backend yet; enabling one requires a real ${VAR} in
+  # .env, and the backend service account must use mysql_native_password or
+  # caching_sha2_password — NOT ed25519):
+  # - key: "mariadb:ro_user@127.0.0.1:6603"
+  #   password: "${ZT_CRED_MARIADB_RO_PASSWORD}"
+  # - key: "mariadb:rw_user@127.0.0.1:6603"
+  #   password: "${ZT_CRED_MARIADB_RW_PASSWORD}"
 # Task 8.8 query logging (user directive 2026-08-13): every query passing
 # through the proxy is ALWAYS logged with full context (username, ticket_id,
 # db_user, db, db_type, stmt_type, status, session_id, sql). log_query_output

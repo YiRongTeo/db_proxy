@@ -174,7 +174,7 @@ func TestTokenRejectsInvalidDBType(t *testing.T) {
 		t.Fatalf("POST /api/token: status %d, want 422 (body %s)", resp.StatusCode, body)
 	}
 	got, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(got), "db_type must be mysql, postgres, mssql or oracle") {
+	if !strings.Contains(string(got), "db_type must be mysql, mariadb, postgres, mssql or oracle") {
 		t.Errorf("error body = %s, want the canonical db_type message", got)
 	}
 }

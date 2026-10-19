@@ -56,6 +56,7 @@ const sessionPendingTTL = 60 * time.Second
 // subtypes are added HERE and nowhere else.
 var dbPortDefaults = map[string]map[string]string{
 	"mysql":    {"default": "3306"},
+	"mariadb":  {"default": "6603"},
 	"postgres": {"default": "5432"},
 	"mssql":    {"default": "1433"},
 	"oracle":   {"default": "1521"},
@@ -213,8 +214,8 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid db_subtype"})
 		return
 	}
-	if req.DBType != "mysql" && req.DBType != "postgres" && req.DBType != "mssql" && req.DBType != "oracle" {
-		http.Error(w, `{"error":"db_type must be mysql, postgres, mssql or oracle"}`, http.StatusUnprocessableEntity)
+	if req.DBType != "mysql" && req.DBType != "mariadb" && req.DBType != "postgres" && req.DBType != "mssql" && req.DBType != "oracle" {
+		http.Error(w, `{"error":"db_type must be mysql, mariadb, postgres, mssql or oracle"}`, http.StatusUnprocessableEntity)
 		return
 	}
 	// Port resolution: an explicit db_port is stored verbatim; only an

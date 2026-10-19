@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | `username` | string | no | bearer subject | Must match the JWT's subject or be omitted — the token is always issued for the authenticated principal |
 | `ticket_id` | string | **yes** | — | Approval/change ticket; trimmed, ≤ 128 chars, no whitespace/control chars |
-| `db_type` | string | **yes** | — | `mysql` \| `postgres` \| `mssql` \| `oracle` |
+| `db_type` | string | **yes** | — | `mysql` \| `mariadb` \| `postgres` \| `mssql` \| `oracle` — stored **verbatim** in the token payload (MariaDB is a first-class type, never normalized to `mysql`) |
 | `db_user` | string | **yes** | — | Backend DB user |
 | `db_ip` | string | **yes** | — | Backend DB host |
 | `db_port` | integer \| string | no | resolved from `db_type` + `db_subtype` (table below) | **Node-integration change: now OPTIONAL, and accepts a JSON NUMBER or a numeric STRING** — `3306` and `"3306"` are the same port (normalized to the canonical decimal string; whitespace trimmed). A fractional number (`3306.5`) or non-numeric value → `400 db_port must be an integer or numeric string`. An explicit value is stored verbatim and always wins; when absent (or `null`), the port is looked up in the default-port map |
@@ -47,6 +47,7 @@
 | `db_type` | `db_subtype` absent / `"default"` | Any other subtype without an entry |
 |---|---|---|
 | `mysql` | `3306` | `422` — no guessed port |
+| `mariadb` | `6603` | `422` — no guessed port |
 | `postgres` | `5432` | `422` |
 | `mssql` | `1433` | `422` |
 | `oracle` | `1521` | `422` |
@@ -198,7 +199,7 @@ Node-integration messages are **verbatim** — match them exactly in the client.
 | `400` | `{"error":"invalid end_time"}` | **NEW** — a string matching no accepted shape (RFC3339 / naive datetime, ISO, date-only, minute-precision — naive = gateway-local), or a non-integer number (null/absent is fine) |
 | `400` | `{"error":"mode must be single-use or session"}` | Unknown `mode` |
 | `400` | `{"error":"idle_seconds must be >= 0"}` | Negative idle override |
-| `422` | `{"error":"db_type must be mysql, postgres, mssql or oracle"}` | Unknown `db_type` |
+| `422` | `{"error":"db_type must be mysql, mariadb, postgres, mssql or oracle"}` | Unknown `db_type` |
 | `422` | `{"error":"no default port for db_type/db_subtype; pass db_port explicitly"}` | **NEW** — `db_port` omitted and the type+subtype pair has no map entry |
 | `422` | `{"error":"end_time is in the past"}` | **NEW** — `end_time ≤ now` |
 | `422` | `{"error":"end_time exceeds max session duration"}` | **NEW** — `end_time − now` > `api.max_session_seconds` (> 0 configured); exactly at the ceiling passes |
@@ -233,7 +234,7 @@ authenticated route — see RUN.md §2.1.4 for server-side diagnosis.
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|
-| `session.ip_lock` | `ZT_SESSION_IP_LOCK` | `true` (the committed value) | Binds every session-mode token to the address it was minted for — a connection from any other address is rejected at login like an invalid token, on **all four planes** (mysql/postgres/mssql/oracle). `false` **disables a security control**: session tokens open connections from ANY address, and the data plane boots a loud WARN. The env override is a **strict allowlist**: only `true`/`1`/`false`/`0` (case-insensitive); set-but-empty = the yaml decides; anything else (`yes`, `on`, `2`, a typo) is **ignored with a boot WARN** and the lock stays as the yaml/default — a typo'd env var can never disable the lock |
+| `session.ip_lock` | `ZT_SESSION_IP_LOCK` | `true` (the committed value) | Binds every session-mode token to the address it was minted for — a connection from any other address is rejected at login like an invalid token, on **all five planes** (mysql/mariadb/postgres/mssql/oracle). `false` **disables a security control**: session tokens open connections from ANY address, and the data plane boots a loud WARN. The env override is a **strict allowlist**: only `true`/`1`/`false`/`0` (case-insensitive); set-but-empty = the yaml decides; anything else (`yes`, `on`, `2`, a typo) is **ignored with a boot WARN** and the lock stays as the yaml/default — a typo'd env var can never disable the lock |
 
 ## 11.10 Operator notes
 
@@ -272,3 +273,26 @@ The env override is parsed against a **strict allowlist** so a typo can never di
 | Kill / revoke | Deletes `tok:` **only** — `ztcred:` lingers until its own TTL expiry. It is **unusable** without the token: the override is read only during a connect that presented and validated the matching token. (Defense in depth, not a scrub mechanism.) |
 | Manual scrub | `DEL ztcred:<sid>` (e.g. `valkey-cli`) — safe at any time; the data plane then falls back to the configured chain with a WARN |
 | Fallback | Override-first with the normal chain on miss/error; the WARN carries the **reason only** (`cred override miss; falling back…` / `cred override read failed; falling back…`) — never a value |
+
+## 11.11 MariaDB (`db_type: "mariadb"`)
+
+MariaDB is a **first-class `db_type`** — accepted explicitly, never mapped to `mysql`.
+
+- **Wire protocol:** MariaDB speaks the MySQL wire protocol, so a `mariadb` token is served by the
+  **same data-plane listener as `mysql`** (the shared `:3306` plane; protocol detection is
+  unchanged). The plane's type gate accepts both `mysql` and `mariadb` tokens; every other plane
+  (postgres/mssql/oracle) still rejects a `mariadb` token.
+- **Default port:** `6603` when `db_port` is omitted at mint (an explicit `db_port` always wins) —
+  the MariaDB convention, deliberately distinct from MySQL's 3306.
+- **Credential keys:** the backend credential key is **verbatim** `mariadb:<db_user>@<db_ip>:<db_port>`
+  (e.g. `mariadb:ro_user@127.0.0.1:6603`). There is **no aliasing** to `mysql:` keys — a `mariadb`
+  mint will not resolve a `mysql:` credentials entry, so every MariaDB backend needs its **own**
+  `credentials:` entries (the payload's `db_type` and all audit/query events also carry the literal
+  string `mariadb`).
+- **Auth plugins:** the backend service accounts must use `mysql_native_password` or
+  `caching_sha2_password` — **not `ed25519`** (MariaDB-specific; the proxy's MySQL client stack
+  cannot perform its handshake). `caching_sha2_password` **full authentication** (first connect /
+  after a server RSA-key rotation) requires a secure channel: connect over the **TLS plane**
+  (`tls.enabled: true`); over plaintext the full-auth exchange cannot complete.
+- **Live backend:** a dedicated MariaDB test container is an explicit follow-up — until it lands,
+  MariaDB sessions are covered by the fake-backend acceptance tests.

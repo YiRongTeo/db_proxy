@@ -15,7 +15,7 @@ type TokenPayload struct {
 	DBUser   string `json:"db_user"`             // backend DB user
 	DBIP     string `json:"db_ip"`               // backend DB host
 	DBPort   string `json:"db_port"`             // backend DB port
-	DBType   string `json:"db_type"`             // "mysql" | "postgres" | "mssql"
+	DBType   string `json:"db_type"`             // "mysql" | "mariadb" | "postgres" | "mssql"
 	TicketID string `json:"ticket_id,omitempty"` // optional maker-checker grouping
 	Access   string `json:"access,omitempty"`    // "read" | "write"; absent = read
 	// SessionID is the session directory id stamped by the CONTROL PLANE
@@ -135,7 +135,7 @@ type QueryEvent struct {
 	DBUser     string    `json:"db_user"`
 	DBIP       string    `json:"db_ip"`
 	DBPort     string    `json:"db_port"`
-	DBType     string    `json:"db_type"` // mysql | postgres | mssql
+	DBType     string    `json:"db_type"` // mysql | mariadb | postgres | mssql
 	SQL        string    `json:"sql"`
 	ClientAddr string    `json:"client_addr"`
 	// Query-result fields — all omitempty for wire backward compatibility.

@@ -157,7 +157,7 @@ func TestTokenInvalidDBTypeWithoutPort(t *testing.T) {
 	if status != http.StatusUnprocessableEntity {
 		t.Fatalf("unknown db_type without db_port: status %d, want 422 (body %s)", status, raw)
 	}
-	if !strings.Contains(raw, "db_type must be mysql, postgres, mssql or oracle") {
+	if !strings.Contains(raw, "db_type must be mysql, mariadb, postgres, mssql or oracle") {
 		t.Errorf("error body = %s, want the canonical db_type message", raw)
 	}
 }
