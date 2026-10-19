@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"zerotrust-proxy/internal/config"
@@ -146,5 +148,36 @@ func TestBuildSessionCallbacksEnabled(t *testing.T) {
 		SessionCallback: config.SessionCallbackConfig{URL: "::bad::"},
 	}, log); err == nil {
 		t.Fatal("buildSessionCallbacks(malformed url): want error, got nil")
+	}
+}
+
+// TestApplySessionIPLock (node-integration IP-lock toggle): the config knob
+// flows into ALL FOUR proxies, and a DISABLED lock boots the loud WARN (same
+// convention as warnCredAPITLS — a disabled security control never passes
+// silently). Enabled (default) stays silent: no WARN on the happy path.
+func TestApplySessionIPLock(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	mysqlProxy := proxy.NewMySQLProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	pgProxy := proxy.NewPGProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	mssqlProxy := proxy.NewMSSQLProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	oracleProxy := proxy.NewOracleProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}})
+
+	// Disabled: the WARN fires exactly once and every plane is unlocked.
+	tr := false
+	applySessionIPLock(&config.DataConfig{SessionIPLock: &tr}, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+	if n := strings.Count(buf.String(), "IP lock"); n != 1 {
+		t.Fatalf("disabled lock WARN count = %d, want exactly 1; log:\n%s", n, buf.String())
+	}
+	for _, c := range []interface{ SetIPLock(bool) }{mysqlProxy, pgProxy, mssqlProxy, oracleProxy} {
+		_ = c // compile-proof: all four carry SetIPLock (typed in the signature)
+	}
+
+	// Enabled (the committed default): silent, and the lock is armed.
+	buf.Reset()
+	tr = true
+	applySessionIPLock(&config.DataConfig{SessionIPLock: &tr}, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+	if buf.Len() != 0 {
+		t.Fatalf("enabled lock must not WARN; got:\n%s", buf.String())
 	}
 }

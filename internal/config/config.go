@@ -42,6 +42,11 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 	return nil
 }
 
+// boolPtr returns a pointer to b — the *bool idiom for the config fields
+// whose ABSENT state must stay distinguishable from an explicit value
+// (SessionIPLock here; the JWT require_* flags use the same shape).
+func boolPtr(b bool) *bool { return &b }
+
 // CertConfig carries the optional plane TLS certificate/key pair.
 // TLS is EXPLICITLY opt-in via Enabled (binding user directive 2026-08-12):
 // there is NO implicit file-based toggle. Enabled=false (or absent) keeps
@@ -921,6 +926,16 @@ type DataConfig struct {
 	// keyspace-notification fast path (when the server publishes del/
 	// expired events) revokes instantly regardless.
 	RevokePollSeconds int
+	// SessionIPLock (yaml session.ip_lock, env ZT_SESSION_IP_LOCK) toggles
+	// the session-token IP lock (checkSessionTokenIP): a session-mode token
+	// only opens connections from the normalized address stamped at issue.
+	// A *bool, same pattern as the JWT require_* flags: ABSENT (nil) is
+	// distinguishable from an EXPLICIT false, and the committed default is
+	// TRUE (secure default — zero change for existing deployments; the
+	// viper defaults map materializes it before LoadData returns). An
+	// explicit false disables the check on ALL FOUR planes (a pass-through)
+	// and the data plane boots a loud WARN — it weakens a security control.
+	SessionIPLock *bool
 	// SessionCallback (yaml session_callback.*, env ZT_SESSION_CALLBACK_*)
 	// is the session-status callback block: on session START and END the
 	// data plane POSTs {url}/dbpxy/session/{sessionId}/status to the main
@@ -985,6 +1000,11 @@ func LoadData(path string) (*DataConfig, error) {
 		"session.idle_seconds":         1800,
 		"session.max_lifetime_seconds": 0,
 		"session.revoke_poll_seconds":  1,
+		// node-integration IP-lock toggle: the session-token IP lock is
+		// ON by default (the pre-toggle behavior — zero change for
+		// existing deployments). Only an explicit session.ip_lock: false
+		// (or env ZT_SESSION_IP_LOCK=false) disables it, with a boot WARN.
+		"session.ip_lock": true,
 		// Task 8.13: the maker write-gate grace window — blocked SQL
 		// commands on an unwatched write session wait this long for a
 		// checker instead of failing instantly (default 20; 0 = reject
@@ -1076,6 +1096,11 @@ func LoadData(path string) (*DataConfig, error) {
 		SessionIdleSeconds:        v.GetInt("session.idle_seconds"),
 		SessionMaxLifetimeSeconds: v.GetInt("session.max_lifetime_seconds"),
 		RevokePollSeconds:         v.GetInt("session.revoke_poll_seconds"),
+		// Materialize ip_lock as a *bool: GetBool resolves the defaults
+		// map (true), the yaml value and the ZT_SESSION_IP_LOCK override
+		// through the SAME viper instance, so an explicit false (env or
+		// file) and the absent=true default land here pre-resolved.
+		SessionIPLock: boolPtr(v.GetBool("session.ip_lock")),
 		SessionCallback: SessionCallbackConfig{
 			URL:              v.GetString("session_callback.url"),
 			TimeoutSeconds:   v.GetInt("session_callback.timeout_seconds"),

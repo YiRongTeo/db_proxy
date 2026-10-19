@@ -226,6 +226,12 @@ authenticated route — see RUN.md §2.1.4 for server-side diagnosis.
 | `session_callback.shared_secret` | `ZT_SESSION_CALLBACK_SHARED_SECRET` | `""` (no header) | Sent as `X-Session-Callback-Key` when set. **Deliberately no committed `${VAR}` placeholder** — an unset variable fails the boot, which would force every deployment to define the secret even with callbacks disabled; set it via env when enabling |
 | `session_callback.control_plane_addr` | — | `127.0.0.1:8080` | The control plane's own address, seeded into the callback **loop-protection set** ([§11.10](#1110-operator-notes)) |
 
+### Data Plane — `configs/data.yaml` `session.ip_lock`
+
+| Key | Env | Default | Meaning |
+|---|---|---|---|
+| `session.ip_lock` | `ZT_SESSION_IP_LOCK` | `true` (the committed value) | Binds every session-mode token to the address it was minted for — a connection from any other address is rejected at login like an invalid token, on **all four planes** (mysql/postgres/mssql/oracle). `false` **disables a security control**: session tokens open connections from ANY address, and the data plane boots a loud WARN |
+
 ## 11.10 Operator notes
 
 

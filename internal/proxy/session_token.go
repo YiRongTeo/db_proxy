@@ -5,6 +5,9 @@ package proxy
 //
 //   - IP lock at login: a session-mode token only opens connections from
 //     the normalized address stamped at issue time (payload.IP).
+//     Configurable (node-integration): session.ip_lock / ZT_SESSION_IP_LOCK,
+//     default ON — false turns the check into a pass-through on ALL FOUR
+//     planes (the data plane boots a loud WARN when disabled).
 //   - Continuous liveness: the session sweeper re-checks tok:<token>
 //     every policy.Poll; the valkey keyspace-notification consumer
 //     (cmd/data) revokes instantly on del/expired events when the server
@@ -27,19 +30,28 @@ import (
 
 // SessionPolicy is the data-plane enforcement set for session-mode tokens.
 // All durations are configurable; 0 disables the respective check. Poll
-// (revoke liveness interval) defaults to 1s when zero.
+// (revoke liveness interval) defaults to 1s when zero. IPLock is a *bool so
+// ABSENT (nil) is distinguishable from an explicit false: withDefaults()
+// materializes nil to TRUE (secure default — a zero-config boot stays
+// locked); only an explicit false disables the login-time IP check.
 type SessionPolicy struct {
 	Idle        time.Duration
 	MaxLifetime time.Duration
 	Poll        time.Duration
+	IPLock      *bool
 }
 
 // withDefaults normalizes a policy: Poll < 500ms is clamped to 1s (the
 // liveness poll must not hammer valkey; a 500ms-1s revocation latency is
-// the worst case, and the keyspace fast path is instant when available).
+// the worst case, and the keyspace fast path is instant when available),
+// and a nil IPLock materializes to TRUE.
 func (p SessionPolicy) withDefaults() SessionPolicy {
 	if p.Poll < 500*time.Millisecond {
 		p.Poll = time.Second
+	}
+	if p.IPLock == nil {
+		tr := true
+		p.IPLock = &tr
 	}
 	return p
 }
@@ -50,7 +62,17 @@ func (p SessionPolicy) withDefaults() SessionPolicy {
 // connection is allowed, otherwise the rejection reason (the caller writes
 // it into the protocol-appropriate login-error packet). Single-use tokens
 // (mode "") skip the check entirely — their consumption is the gate.
-func checkSessionTokenIP(tok *models.TokenPayload, clientAddr string) string {
+//
+// It is a sessionPublisher method so the flag is SHARED STATE: the proxies
+// embed the publisher, so every plane's call site (mysql_proxy.go,
+// pg_proxy.go, mssql_proxy.go, oracle_proxy.go) resolves to this method and
+// honors the ONE knob. ipLock is true in every constructor (secure default);
+// SetIPLock — promoted onto all four proxies — flips it. When DISABLED the
+// check is a pass-through ("" immediately) on all four planes alike.
+func (pub *sessionPublisher) checkSessionTokenIP(tok *models.TokenPayload, clientAddr string) string {
+	if pub.ipLockDisabled {
+		return ""
+	}
 	if tok == nil || tok.Mode != "session" {
 		return ""
 	}

@@ -430,7 +430,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// Task 9.13 session tokens: IP lock. A session token only opens
 	// connections from the address stamped at issue time; anything else is
 	// rejected like an invalid token (uniform wire error, fail-closed).
-	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+	if reason := p.checkSessionTokenIP(tok, clientAddr); reason != "" {
 		p.metrics.TokensRejected("ip_mismatch")
 		p.metrics.ConnectionsTotal("mssql", "rejected")
 		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)

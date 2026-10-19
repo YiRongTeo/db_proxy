@@ -32,7 +32,21 @@ type sessionPublisher struct {
 	logQueryOutput bool
 	metrics        *metrics.Metrics
 	callbacks      *SessionCallbacks
+
+	// ipLockDisabled flips the session-token IP lock (checkSessionTokenIP
+	// above) into a pass-through on every plane embedding this publisher.
+	// The ZERO VALUE is false = LOCKED: constructors never set it and a
+	// hand-built publisher keeps the secure default; only SetIPLock(false)
+	// — wired from session.ip_lock / ZT_SESSION_IP_LOCK — disables the
+	// check (the data plane boots a loud WARN when it does).
+	ipLockDisabled bool
 }
+
+// SetIPLock enables/disables the session-token IP lock on this proxy (the
+// publisher is embedded, so the setter is promoted onto all four planes and
+// one config knob reaches every connect path). true (the default) enforces
+// the check; false turns it into a pass-through.
+func (pub *sessionPublisher) SetIPLock(on bool) { pub.ipLockDisabled = !on }
 
 // storeCallTimeout bounds every store call made from the relay/gate hot
 // paths: a hung valkey must stall a session for at

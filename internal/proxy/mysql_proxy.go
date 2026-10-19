@@ -350,7 +350,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		return
 	}
 	// Task 9.13 session tokens: IP lock (see checkSessionTokenIP).
-	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+	if reason := p.checkSessionTokenIP(tok, clientAddr); reason != "" {
 		p.metrics.TokensRejected("ip_mismatch")
 		p.metrics.ConnectionsTotal("mysql", "rejected")
 		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)

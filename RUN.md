@@ -1043,6 +1043,12 @@ default) is:
   included), `max_lifetime_seconds` (0 = off), and `revoke_poll_seconds`
   (1). A mint request can carry `"idle_seconds": N` to override the
   default for that token (0/absent = follow the data-plane default).
+- **IP-locked by default** (data.yaml `session.ip_lock`, env
+  `ZT_SESSION_IP_LOCK`, default `true`) — see the IP-lock bullet above.
+  `false` disables the check on **all four planes** (session tokens then
+  open connections from ANY address) and the data plane boots a loud
+  WARN: this weakens a security control; use it only inside a trusted
+  network segment (e.g. the node's own NAT'd backend subnet).
 
 Security posture: a stolen session token grants at most the maker's own
 address and time window; revocation is explicit and converges on one

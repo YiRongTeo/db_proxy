@@ -186,7 +186,7 @@ func (p *OracleProxy) handleConn(client net.Conn) {
 		p.log.Warn("oracle: token for wrong protocol", "db_type", tok.DBType, "client", clientAddr)
 		return
 	}
-	if msg := checkSessionTokenIP(tok, clientAddr); msg != "" {
+	if msg := p.checkSessionTokenIP(tok, clientAddr); msg != "" {
 		p.log.Warn("oracle: "+msg, "client", clientAddr)
 		return
 	}

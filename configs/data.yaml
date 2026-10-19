@@ -95,10 +95,18 @@ gate_wait_seconds: 20
 #     sessions within this many seconds (default 1). The keyspace-notification
 #     fast path revokes instantly when the server publishes del/expired
 #     events (notify-keyspace-events KEx). Env: ZT_SESSION_REVOKE_POLL_SECONDS.
+#   ip_lock: bind every session-mode token to the address it was minted for —
+#     a connection from any other address is rejected at login like an
+#     invalid token, on ALL FOUR planes (mysql/postgres/mssql/oracle).
+#     Default TRUE (the committed value — zero change for existing
+#     deployments). FALSE DISABLES A SECURITY CONTROL: session tokens open
+#     connections from ANY address; the data plane boots a loud WARN when
+#     disabled. Env override: ZT_SESSION_IP_LOCK (accepts true/false).
 session:
   idle_seconds: 1800
   max_lifetime_seconds: 0
   revoke_poll_seconds: 1
+  ip_lock: true
 # node-integration Task 3: session-status callbacks to the main application.
 # On Maker session START (backend connect success) and END (any close reason)
 # the data plane POSTs {url}/dbpxy/session/{sessionId}/status with body

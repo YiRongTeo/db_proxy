@@ -100,6 +100,22 @@ func warnCredAPITLS(cfg *config.DataConfig, log *slog.Logger) {
 	}
 }
 
+// applySessionIPLock wires the session-token IP-lock knob (node-integration
+// IP-lock toggle: yaml session.ip_lock, env ZT_SESSION_IP_LOCK, default
+// TRUE) into every plane via SetIPLock and logs the ONE warning that must
+// never pass silently: a DISABLED lock weakens a security control —
+// session-mode tokens stop being bound to their issuing address. Same
+// convention as warnCredAPITLS; the enabled default is silent.
+func applySessionIPLock(cfg *config.DataConfig, log *slog.Logger, proxies ...interface{ SetIPLock(bool) }) {
+	on := cfg.SessionIPLock == nil || *cfg.SessionIPLock
+	for _, p := range proxies {
+		p.SetIPLock(on)
+	}
+	if !on {
+		log.Warn("session IP lock is DISABLED (session.ip_lock / ZT_SESSION_IP_LOCK) — session-mode tokens open connections from ANY address; a security control is off")
+	}
+}
+
 // buildSessionCallbacks constructs the session-status callback client from
 // the session_callback block. Empty url → (nil, nil): disabled, every
 // notify a no-op. A non-empty malformed url fails fast at boot.
@@ -178,6 +194,10 @@ func main() {
 	mssqlProxy := proxy.NewMSSQLProxy(log, vs, credResolver, dataTLS)
 	// Oracle: dedicated listener, terminate-then-relay.
 	oracleProxy := proxy.NewOracleProxy(log, vs, credResolver)
+	// Session-token IP lock (node-integration toggle): ONE knob, all four
+	// planes (yaml session.ip_lock, env ZT_SESSION_IP_LOCK, default TRUE;
+	// disabled boots the WARN inside applySessionIPLock).
+	applySessionIPLock(cfg, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
 	// Query logging: every query is ALWAYS logged with context; the
 	// captured result payload (columns/rows/row_count/truncated) is added
 	// only when log_query_output is on (configs/data.yaml,

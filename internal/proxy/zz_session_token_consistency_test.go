@@ -328,3 +328,58 @@ func TestLiveIdlePerTokenOverride(t *testing.T) {
 		SessionPolicy{Poll: 300 * time.Millisecond}, p)
 	assertSessionClosesSoon(t, "per-token idle override", c.conn)
 }
+
+// node-integration IP-lock toggle — the DISABLE path per plane. The lock-ON
+// rejection is pinned above (TestLiveSessionTokenMySQL/PG step 2: a
+// foreign-IP token is rejected at login) and for TDS in zz_live_mssql_test.go
+// (TestMSSQLLiveSessionTokenLifecycle step 2). These prove the SAME
+// foreign-IP session login SUCCEEDS once SetIPLock(false) flips the shared
+// sessionPublisher flag, and that SetIPLock(true) re-arms the lock on the
+// SAME running proxy — one knob, uniform on every plane the harness reaches.
+
+// TestLiveSessionTokenMySQLIPLockDisabled: flag off → the foreign-IP login
+// passes; flag back on → the identical login is rejected again.
+func TestLiveSessionTokenMySQLIPLockDisabled(t *testing.T) {
+	vs := proxyTestStore(t)
+	foreign := sessionTokenFor(t, vs, fmt.Sprintf("mysql-ipoff-%d", time.Now().UnixNano()), "mysql", "3307")
+	if err := vs.SetToken(context.Background(), foreign, models.TokenPayload{
+		Username: "alice", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "3307",
+		DBType: "mysql", SessionID: "sid-" + foreign[len("sess_"):],
+		Mode: "session", IP: "192.0.2.1", IssuedAt: time.Now().Unix(),
+	}, time.Hour); err != nil {
+		t.Fatalf("SetToken(foreign): %v", err)
+	}
+	var logBuf bytes.Buffer
+	ln, p := startMySQLProxyLoopP(t, vs, &logBuf)
+	p.SetIPLock(false)
+	if !mysqlLoginOnce(t, ln, foreign) {
+		t.Fatal("foreign-IP login REJECTED with the IP lock disabled — pass-through broken")
+	}
+	p.SetIPLock(true)
+	if mysqlLoginOnce(t, ln, foreign) {
+		t.Fatal("foreign-IP login SUCCEEDED after SetIPLock(true) — the lock did not re-arm")
+	}
+}
+
+// TestLiveSessionTokenPGIPLockDisabled is the PG mirror.
+func TestLiveSessionTokenPGIPLockDisabled(t *testing.T) {
+	vs := proxyTestStore(t)
+	foreign := sessionTokenFor(t, vs, fmt.Sprintf("pg-ipoff-%d", time.Now().UnixNano()), "postgres", "5433")
+	if err := vs.SetToken(context.Background(), foreign, models.TokenPayload{
+		Username: "alice", DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "5433",
+		DBType: "postgres", SessionID: "sid-" + foreign[len("sess_"):],
+		Mode: "session", IP: "192.0.2.1", IssuedAt: time.Now().Unix(),
+	}, time.Hour); err != nil {
+		t.Fatalf("SetToken(foreign): %v", err)
+	}
+	var logBuf bytes.Buffer
+	ln, p := startPGProxyLoopP(t, vs, &logBuf)
+	p.SetIPLock(false)
+	if !pgLoginOnce(t, ln, foreign) {
+		t.Fatal("foreign-IP login REJECTED with the IP lock disabled — pass-through broken")
+	}
+	p.SetIPLock(true)
+	if pgLoginOnce(t, ln, foreign) {
+		t.Fatal("foreign-IP login SUCCEEDED after SetIPLock(true) — the lock did not re-arm")
+	}
+}

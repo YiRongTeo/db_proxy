@@ -1479,6 +1479,68 @@ listen:
 	}
 }
 
+// TestSessionIPLockConfig (node-integration IP-lock toggle): the
+// session-token IP lock (checkSessionTokenIP, all four planes) is
+// configurable via session.ip_lock (env ZT_SESSION_IP_LOCK). DEFAULT TRUE —
+// the pre-toggle behavior: session-mode tokens only open connections from
+// the address stamped at issue. ABSENT must be indistinguishable from an
+// explicit true (a *bool, same pattern as the JWT require_* flags); only an
+// explicit false disables the check (a security control — the data plane
+// boots a loud WARN when disabled).
+func TestSessionIPLockConfig(t *testing.T) {
+	// 1. Default: both the yaml block and the env absent → LOCKED.
+	dataPath := writeTempConfig(t, "listen:\n  addr: \":3306\"\n")
+	dcfg, err := LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(default): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || !*dcfg.SessionIPLock {
+		t.Errorf("default SessionIPLock = %v, want non-nil true (secure default)", dcfg.SessionIPLock)
+	}
+
+	// 2. Explicit yaml false → disabled.
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: false\n")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(yaml false): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("explicit session.ip_lock: false → SessionIPLock = %v, want non-nil false", dcfg.SessionIPLock)
+	}
+
+	// 3. Env override flips an explicit yaml true → false.
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: true\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "false")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env false over yaml true): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=false over yaml true → SessionIPLock = %v, want non-nil false", dcfg.SessionIPLock)
+	}
+
+	// 4. Env override with NO yaml session block → disabled too.
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\n")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env false, no yaml): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=false with no yaml block → SessionIPLock = %v, want non-nil false", dcfg.SessionIPLock)
+	}
+
+	// 5. Env re-locks: yaml false + env true → enabled (env is the escape hatch).
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: false\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "true")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env true over yaml false): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || !*dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=true over yaml false → SessionIPLock = %v, want non-nil true", dcfg.SessionIPLock)
+	}
+}
+
 // TestAuthUsersParsing (Task 9.13 + JWT Task 2): the optional auth.users
 // list parses, ${VAR} password placeholders resolve from the environment,
 // and an empty password in ANY listed user fails fast (never a silently

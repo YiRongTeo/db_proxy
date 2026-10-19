@@ -973,3 +973,44 @@ func TestMSSQLLiveKillRevokesSessionToken(t *testing.T) {
 		t.Fatalf("TokenAlive after kill = %v %v, want false — kill must revoke the token", alive, err)
 	}
 }
+
+// TestMSSQLLiveSessionTokenIPLockDisabled (node-integration IP-lock toggle):
+// with SetIPLock(false) the foreign-IP session login that step 2 of
+// TestMSSQLLiveSessionTokenLifecycle rejects now SUCCEEDS on the real TDS
+// wire path, and SetIPLock(true) re-arms the lock on the SAME running proxy.
+func TestMSSQLLiveSessionTokenIPLockDisabled(t *testing.T) {
+	vs := proxyTestStore(t)
+	username := fmt.Sprintf("mssql-ipoff-%d", time.Now().UnixNano())
+	foreign, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	ftok := models.TokenPayload{Username: username, DBUser: "ro_user",
+		DBIP: "127.0.0.1", DBPort: "1434", DBType: "mssql", TicketID: "T-NI-IP",
+		SessionID: "sid-" + foreign[len("sess_"):],
+		Mode:      "session", IP: "192.0.2.1", IssuedAt: time.Now().Unix()}
+	if err := vs.SetToken(context.Background(), foreign, ftok, time.Hour); err != nil {
+		t.Fatalf("SetToken(foreign): %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelSessionLive(context.Background(), ftok.SessionID) })
+
+	var logBuf bytes.Buffer
+	ln, p := startMSSQLTestProxyLoopP(t, vs, &logBuf, nil)
+	p.SetIPLock(false)
+	loginOnce := func(token string) bool {
+		c := dialTDS(t, ln.Addr().String())
+		defer c.close()
+		if enc := c.prelogin(encryptNotSup); enc != encryptNotSup {
+			t.Fatalf("server encryption = %#x, want ENCRYPT_NOT_SUP", enc)
+		}
+		_, done, ok := c.login(token, "appdb")
+		return done && ok
+	}
+	if !loginOnce(foreign) {
+		t.Fatal("foreign-IP login REJECTED with the IP lock disabled — pass-through broken")
+	}
+	p.SetIPLock(true)
+	if loginOnce(foreign) {
+		t.Fatal("foreign-IP login SUCCEEDED after SetIPLock(true) — the lock did not re-arm")
+	}
+}

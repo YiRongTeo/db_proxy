@@ -404,7 +404,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		return
 	}
 	// Task 9.13 session tokens: IP lock (see checkSessionTokenIP).
-	if reason := checkSessionTokenIP(tok, clientAddr); reason != "" {
+	if reason := p.checkSessionTokenIP(tok, clientAddr); reason != "" {
 		p.metrics.TokensRejected("ip_mismatch")
 		p.metrics.ConnectionsTotal("postgres", "rejected")
 		p.log.Warn("session token IP mismatch", "client", clientAddr, "token_ip", tok.IP)
