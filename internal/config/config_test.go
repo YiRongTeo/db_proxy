@@ -1487,6 +1487,17 @@ listen:
 // explicit true (a *bool, same pattern as the JWT require_* flags); only an
 // explicit false disables the check (a security control — the data plane
 // boots a loud WARN when disabled).
+//
+// Fix round 1 (strict env parse, fail-locked): the ENV override is read as
+// a RAW STRING and checked against an allowlist — "true"/"1" enable,
+// "false"/"0" disable (case-insensitive); set-but-empty or ANY other value
+// ("yes", "on", "2", "garbage") is treated as UNSET for the lock (the yaml
+// value decides; yaml absent = the true default) and surfaces in
+// SessionIPLockEnvRejected for the boot WARN. cast.ToBool mapped every
+// unknown spelling — including human-plausible "yes"/"on" — to false, so a
+// typo'd env var silently DISABLED the lock on all four planes. The
+// invariant: no env combination disables the lock except an accepted
+// explicit false.
 func TestSessionIPLockConfig(t *testing.T) {
 	// 1. Default: both the yaml block and the env absent → LOCKED.
 	dataPath := writeTempConfig(t, "listen:\n  addr: \":3306\"\n")
@@ -1538,6 +1549,99 @@ func TestSessionIPLockConfig(t *testing.T) {
 	}
 	if dcfg.SessionIPLock == nil || !*dcfg.SessionIPLock {
 		t.Errorf("ZT_SESSION_IP_LOCK=true over yaml false → SessionIPLock = %v, want non-nil true", dcfg.SessionIPLock)
+	}
+
+	// 6-9. Fix round 1 FAIL-LOCKED: an unrecognized env spelling is
+	// REJECTED, never a disable. Base yaml has NO session block (the true
+	// default applies): the rejected value is ignored, the lock stays ON,
+	// and the offending value surfaces in SessionIPLockEnvRejected for the
+	// boot WARN. "yes"/"on" pin the human-plausible spellings cast.ToBool
+	// used to silently map to false.
+	for _, bad := range []string{"garbage", "yes", "on", "2"} {
+		dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\n")
+		t.Setenv("ZT_SESSION_IP_LOCK", bad)
+		dcfg, err = LoadData(dataPath)
+		if err != nil {
+			t.Fatalf("LoadData(env %q): %v", bad, err)
+		}
+		if dcfg.SessionIPLock == nil || !*dcfg.SessionIPLock {
+			t.Errorf("ZT_SESSION_IP_LOCK=%q → SessionIPLock = %v, want non-nil TRUE (fail-locked: a typo must never disable the lock)", bad, dcfg.SessionIPLock)
+		}
+		if dcfg.SessionIPLockEnvRejected != bad {
+			t.Errorf("ZT_SESSION_IP_LOCK=%q → SessionIPLockEnvRejected = %q, want %q (surfaces the boot WARN)", bad, dcfg.SessionIPLockEnvRejected, bad)
+		}
+	}
+
+	// 10. Rejected value over an explicit yaml false → yaml decides: still
+	// disabled (rejection means UNSET, not forced-lock — the reviewed yaml
+	// disabled it, the env didn't).
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: false\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "garbage")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env garbage over yaml false): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=garbage over yaml false → SessionIPLock = %v, want non-nil false (yaml decides)", dcfg.SessionIPLock)
+	}
+	if dcfg.SessionIPLockEnvRejected != "garbage" {
+		t.Errorf("rejected env value not surfaced: %q, want \"garbage\"", dcfg.SessionIPLockEnvRejected)
+	}
+
+	// 11. Accepted spellings still work, case-insensitively: "1" and
+	// "TRUE" re-lock over yaml false; "FALSE" disables over yaml true.
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"1", true}, {"TRUE", true}, {"True", true}, {"FALSE", false}, {"0", false},
+	} {
+		dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: false\n")
+		t.Setenv("ZT_SESSION_IP_LOCK", tc.env)
+		dcfg, err = LoadData(dataPath)
+		if err != nil {
+			t.Fatalf("LoadData(env %q over yaml false): %v", tc.env, err)
+		}
+		if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock != tc.want {
+			t.Errorf("ZT_SESSION_IP_LOCK=%q over yaml false → SessionIPLock = %v, want non-nil %v", tc.env, dcfg.SessionIPLock, tc.want)
+		}
+		if dcfg.SessionIPLockEnvRejected != "" {
+			t.Errorf("accepted spelling %q must not surface a rejection, got %q", tc.env, dcfg.SessionIPLockEnvRejected)
+		}
+	}
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: true\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "FALSE")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env FALSE over yaml true): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=FALSE over yaml true → SessionIPLock = %v, want non-nil false", dcfg.SessionIPLock)
+	}
+
+	// 12. Set-but-empty is NOT an override: the yaml value decides (yaml
+	// false stays disabled — empty must not silently re-lock a reviewed
+	// config; and with no yaml block the true default applies).
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\nsession:\n  ip_lock: false\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env empty over yaml false): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || *dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=\"\" over yaml false → SessionIPLock = %v, want non-nil false (yaml decides)", dcfg.SessionIPLock)
+	}
+	if dcfg.SessionIPLockEnvRejected != "" {
+		t.Errorf("empty env must not surface a rejection, got %q", dcfg.SessionIPLockEnvRejected)
+	}
+	dataPath = writeTempConfig(t, "listen:\n  addr: \":3306\"\n")
+	t.Setenv("ZT_SESSION_IP_LOCK", "")
+	dcfg, err = LoadData(dataPath)
+	if err != nil {
+		t.Fatalf("LoadData(env empty, no yaml): %v", err)
+	}
+	if dcfg.SessionIPLock == nil || !*dcfg.SessionIPLock {
+		t.Errorf("ZT_SESSION_IP_LOCK=\"\" with no yaml → SessionIPLock = %v, want non-nil true (default)", dcfg.SessionIPLock)
 	}
 }
 

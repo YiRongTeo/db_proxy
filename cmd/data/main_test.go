@@ -181,3 +181,55 @@ func TestApplySessionIPLock(t *testing.T) {
 		t.Fatalf("enabled lock must not WARN; got:\n%s", buf.String())
 	}
 }
+
+// TestApplySessionIPLockRejectedEnv (fix round 1, strict env parse): a
+// ZT_SESSION_IP_LOCK value that failed the config allowlist surfaces in
+// SessionIPLockEnvRejected and MUST boot a WARN naming the rejected value —
+// a typo'd override never passes silently. With the lock still ON (yaml
+// absent/default) it is the ONLY warning; when the yaml itself disables the
+// lock the rejected-value WARN fires IN ADDITION to the disabled-control
+// WARN (both facts matter to the operator).
+func TestApplySessionIPLockRejectedEnv(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	mysqlProxy := proxy.NewMySQLProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	pgProxy := proxy.NewPGProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	mssqlProxy := proxy.NewMSSQLProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}}, nil)
+	oracleProxy := proxy.NewOracleProxy(log, nil, &proxy.ConfigCredResolver{Creds: map[string]string{}})
+
+	// Rejected value, lock still ON (yaml decided = default true): exactly
+	// one rejected-value WARN carrying the offending value, NO disabled WARN.
+	tr := true
+	applySessionIPLock(&config.DataConfig{SessionIPLock: &tr, SessionIPLockEnvRejected: "yes"}, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+	out := buf.String()
+	if n := strings.Count(out, "not recognized"); n != 1 {
+		t.Fatalf("rejected-env WARN count = %d, want exactly 1; log:\n%s", n, out)
+	}
+	if !strings.Contains(out, "yes") {
+		t.Errorf("rejected-env WARN must name the offending value; log:\n%s", out)
+	}
+	if strings.Contains(out, "DISABLED") {
+		t.Errorf("lock is ON — no disabled-control WARN expected; log:\n%s", out)
+	}
+
+	// Rejected value over an explicit yaml false: BOTH warnings fire.
+	buf.Reset()
+	tr = false
+	applySessionIPLock(&config.DataConfig{SessionIPLock: &tr, SessionIPLockEnvRejected: "garbage"}, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+	out = buf.String()
+	if n := strings.Count(out, "not recognized"); n != 1 {
+		t.Fatalf("rejected-env WARN count = %d, want exactly 1; log:\n%s", n, out)
+	}
+	if n := strings.Count(out, "DISABLED"); n != 1 {
+		t.Errorf("disabled-lock WARN count = %d, want exactly 1; log:\n%s", n, out)
+	}
+
+	// No rejection → no rejected-value WARN (covered by TestApplySessionIPLock's
+	// silence assertions; pinned here for the empty-field path too).
+	buf.Reset()
+	tr = true
+	applySessionIPLock(&config.DataConfig{SessionIPLock: &tr}, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
+	if buf.Len() != 0 {
+		t.Fatalf("empty SessionIPLockEnvRejected must not WARN; got:\n%s", buf.String())
+	}
+}

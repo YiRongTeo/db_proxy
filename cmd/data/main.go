@@ -102,14 +102,22 @@ func warnCredAPITLS(cfg *config.DataConfig, log *slog.Logger) {
 
 // applySessionIPLock wires the session-token IP-lock knob (node-integration
 // IP-lock toggle: yaml session.ip_lock, env ZT_SESSION_IP_LOCK, default
-// TRUE) into every plane via SetIPLock and logs the ONE warning that must
-// never pass silently: a DISABLED lock weakens a security control —
-// session-mode tokens stop being bound to their issuing address. Same
-// convention as warnCredAPITLS; the enabled default is silent.
+// TRUE) into every plane via SetIPLock and logs the warnings that must never
+// pass silently (same convention as warnCredAPITLS; the enabled default is
+// silent):
+//   - a DISABLED lock weakens a security control — session-mode tokens stop
+//     being bound to their issuing address;
+//   - a REJECTED ZT_SESSION_IP_LOCK value (strict allowlist, fix round 1:
+//     only true/1/false/0 accepted, anything else ignored with the lock
+//     left to the yaml/default) — a typo'd override is fail-locked, never
+//     silently ignored.
 func applySessionIPLock(cfg *config.DataConfig, log *slog.Logger, proxies ...interface{ SetIPLock(bool) }) {
 	on := cfg.SessionIPLock == nil || *cfg.SessionIPLock
 	for _, p := range proxies {
 		p.SetIPLock(on)
+	}
+	if cfg.SessionIPLockEnvRejected != "" {
+		log.Warn("ZT_SESSION_IP_LOCK value not recognized (accepted: true/false/1/0, case-insensitive; empty = yaml decides) — ignored, lock stays as session.ip_lock/default", "rejected_value", cfg.SessionIPLockEnvRejected)
 	}
 	if !on {
 		log.Warn("session IP lock is DISABLED (session.ip_lock / ZT_SESSION_IP_LOCK) — session-mode tokens open connections from ANY address; a security control is off")
@@ -195,8 +203,9 @@ func main() {
 	// Oracle: dedicated listener, terminate-then-relay.
 	oracleProxy := proxy.NewOracleProxy(log, vs, credResolver)
 	// Session-token IP lock (node-integration toggle): ONE knob, all four
-	// planes (yaml session.ip_lock, env ZT_SESSION_IP_LOCK, default TRUE;
-	// disabled boots the WARN inside applySessionIPLock).
+	// planes (yaml session.ip_lock, env ZT_SESSION_IP_LOCK with the strict
+	// true/false/1/0 allowlist — default TRUE; a rejected env value and a
+	// disabled lock each boot their own WARN inside applySessionIPLock).
 	applySessionIPLock(cfg, log, mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
 	// Query logging: every query is ALWAYS logged with context; the
 	// captured result payload (columns/rows/row_count/truncated) is added

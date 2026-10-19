@@ -230,7 +230,7 @@ authenticated route — see RUN.md §2.1.4 for server-side diagnosis.
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|
-| `session.ip_lock` | `ZT_SESSION_IP_LOCK` | `true` (the committed value) | Binds every session-mode token to the address it was minted for — a connection from any other address is rejected at login like an invalid token, on **all four planes** (mysql/postgres/mssql/oracle). `false` **disables a security control**: session tokens open connections from ANY address, and the data plane boots a loud WARN |
+| `session.ip_lock` | `ZT_SESSION_IP_LOCK` | `true` (the committed value) | Binds every session-mode token to the address it was minted for — a connection from any other address is rejected at login like an invalid token, on **all four planes** (mysql/postgres/mssql/oracle). `false` **disables a security control**: session tokens open connections from ANY address, and the data plane boots a loud WARN. The env override is a **strict allowlist**: only `true`/`1`/`false`/`0` (case-insensitive); set-but-empty = the yaml decides; anything else (`yes`, `on`, `2`, a typo) is **ignored with a boot WARN** and the lock stays as the yaml/default — a typo'd env var can never disable the lock |
 
 ## 11.10 Operator notes
 
@@ -245,6 +245,20 @@ default `127.0.0.1:8080` protects the loopback endpoint while `control.yaml` `ht
 **update `session_callback.control_plane_addr` whenever the control plane moves** or is reached on
 a non-loopback address. A loop-protected target is **skipped with no attempt and no retry** (DEBUG
 log only).
+
+### IP-lock env spellings (`ZT_SESSION_IP_LOCK`)
+
+The env override is parsed against a **strict allowlist** so a typo can never disable the lock
+(fail-locked — only an accepted explicit `false`/`0` turns the control off):
+
+| Value | Effect |
+|---|---|
+| `true` / `1` (case-insensitive) | Lock ON — re-arms over a yaml `ip_lock: false` |
+| `false` / `0` (case-insensitive) | Lock OFF — disables a security control; boots a loud WARN |
+| Set-but-empty (`ZT_SESSION_IP_LOCK=""`) | Not an override — `session.ip_lock` in `data.yaml` decides (default `true`) |
+| Anything else (`yes`, `on`, `2`, typos) | **Ignored with a boot WARN naming the rejected value** — the yaml/default decides; the lock never silently opens |
+
+`yes` and `on` are deliberately NOT accepted spellings.
 
 ### `ztcred:` key semantics
 

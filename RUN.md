@@ -1048,7 +1048,12 @@ default) is:
   `false` disables the check on **all four planes** (session tokens then
   open connections from ANY address) and the data plane boots a loud
   WARN: this weakens a security control; use it only inside a trusted
-  network segment (e.g. the node's own NAT'd backend subnet).
+  network segment (e.g. the node's own NAT'd backend subnet). The env
+  override is a **strict allowlist**: `true`/`1`/`false`/`0`
+  (case-insensitive); set-but-empty = the yaml decides; anything else
+  (`yes`, `on`, `2`, a typo) is ignored with a boot WARN and the lock
+  stays as `session.ip_lock`/default — a typo'd env var can never
+  disable the lock.
 
 Security posture: a stolen session token grants at most the maker's own
 address and time window; revocation is explicit and converges on one

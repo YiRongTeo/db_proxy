@@ -47,6 +47,57 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 // (SessionIPLock here; the JWT require_* flags use the same shape).
 func boolPtr(b bool) *bool { return &b }
 
+// sessionIPLockEnv reads ZT_SESSION_IP_LOCK as a RAW STRING and applies a
+// strict allowlist (fix round 1, fail-locked):
+//
+//	"true"/"1"      → (true, false, nil)   — accepted enable
+//	"false"/"0"     → (false, false, nil)  — accepted disable
+//	set-but-empty   → (nil, false, nil)    — NOT an override: yaml decides
+//	anything else   → (nil, true, value)   — REJECTED: treated as unset, warn
+//
+// viper's cast.ToBool mapped every unrecognized spelling — including the
+// human-plausible "yes" and "on" — to false, so a typo'd env var silently
+// DISABLED a security control on all four planes. Here the only way the env
+// disables the lock is an accepted explicit false/0; a typo can never
+// disable what the operator didn't explicitly disable. Case-insensitive by
+// design (operators type these by hand). Read via os.Getenv, NOT viper: the
+// value must bypass the AutomaticEnv/cast path entirely.
+func sessionIPLockEnv() (override *bool, rejected bool, raw string) {
+	s := strings.TrimSpace(os.Getenv("ZT_SESSION_IP_LOCK"))
+	if s == "" {
+		return nil, false, ""
+	}
+	switch strings.ToLower(s) {
+	case "true", "1":
+		return boolPtr(true), false, s
+	case "false", "0":
+		return boolPtr(false), false, s
+	default:
+		return nil, true, s
+	}
+}
+
+// readYAMLSessionIPLock resolves session.ip_lock from the config FILE ONLY:
+// (*bool)(nil) when the yaml key is absent, otherwise its bool value. A
+// separate viper instance with AutomaticEnv disabled and NO defaults is
+// layered over the main one — the main instance would re-resolve the
+// (possibly rejected) ZT_SESSION_IP_LOCK through AutomaticEnv on every
+// GetBool, defeating the strict env allowlist, and its defaults map would
+// mask the yaml key's absence (breaking explicit-false detection).
+func readYAMLSessionIPLock(path string) (*bool, error) {
+	yv := viper.New()
+	yv.SetConfigFile(path)
+	yv.SetEnvPrefix("ZT")
+	yv.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	if err := yv.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	if !yv.IsSet("session.ip_lock") {
+		return nil, nil
+	}
+	return boolPtr(yv.GetBool("session.ip_lock")), nil
+}
+
 // CertConfig carries the optional plane TLS certificate/key pair.
 // TLS is EXPLICITLY opt-in via Enabled (binding user directive 2026-08-12):
 // there is NO implicit file-based toggle. Enabled=false (or absent) keeps
@@ -931,11 +982,22 @@ type DataConfig struct {
 	// only opens connections from the normalized address stamped at issue.
 	// A *bool, same pattern as the JWT require_* flags: ABSENT (nil) is
 	// distinguishable from an EXPLICIT false, and the committed default is
-	// TRUE (secure default — zero change for existing deployments; the
-	// viper defaults map materializes it before LoadData returns). An
-	// explicit false disables the check on ALL FOUR planes (a pass-through)
-	// and the data plane boots a loud WARN — it weakens a security control.
+	// TRUE (secure default — zero change for existing deployments; LoadData
+	// always returns non-nil). An explicit false disables the check on ALL
+	// FOUR planes (a pass-through) and the data plane boots a loud WARN —
+	// it weakens a security control.
+	//
+	// Fix round 1: the env override is parsed against a STRICT allowlist
+	// (see sessionIPLockEnv) — a value cast.ToBool would have silently
+	// mapped to false ("yes", "on", "2", typos) is treated as UNSET instead,
+	// so a typo'd env var can never disable the lock.
 	SessionIPLock *bool
+	// SessionIPLockEnvRejected carries the rejected ZT_SESSION_IP_LOCK
+	// value when the env override was set but failed the strict allowlist
+	// ("yes", "on", "2", "garbage", …): the value is ignored for the lock
+	// (yaml/default decide) and the data plane surfaces it in a boot WARN
+	// so the typo is never silent. Empty = nothing was rejected.
+	SessionIPLockEnvRejected string
 	// SessionCallback (yaml session_callback.*, env ZT_SESSION_CALLBACK_*)
 	// is the session-status callback block: on session START and END the
 	// data plane POSTs {url}/dbpxy/session/{sessionId}/status to the main
@@ -1000,11 +1062,14 @@ func LoadData(path string) (*DataConfig, error) {
 		"session.idle_seconds":         1800,
 		"session.max_lifetime_seconds": 0,
 		"session.revoke_poll_seconds":  1,
-		// node-integration IP-lock toggle: the session-token IP lock is
-		// ON by default (the pre-toggle behavior — zero change for
-		// existing deployments). Only an explicit session.ip_lock: false
-		// (or env ZT_SESSION_IP_LOCK=false) disables it, with a boot WARN.
-		"session.ip_lock": true,
+		// node-integration IP-lock toggle (fix round 1): the session-token
+		// IP lock is ON by default (the pre-toggle behavior — zero change
+		// for existing deployments). The default is deliberately NOT in
+		// this map: SessionIPLock resolves through sessionIPLockEnv (strict
+		// env allowlist) + readYAMLSessionIPLock (file-only fallback) below,
+		// because a viper GetBool here would re-resolve the raw
+		// ZT_SESSION_IP_LOCK through cast.ToBool — the exact fail-open path
+		// being fixed ("yes"/"on"/"garbage" → false).
 		// Task 8.13: the maker write-gate grace window — blocked SQL
 		// commands on an unwatched write session wait this long for a
 		// checker instead of failing instantly (default 20; 0 = reject
@@ -1082,6 +1147,30 @@ func LoadData(path string) (*DataConfig, error) {
 			return nil, fmt.Errorf("metrics.enabled=true requires metrics.path")
 		}
 	}
+	// Fix round 1 (strict env parse, fail-locked): resolve the IP lock
+	// BEFORE the struct literal — env via the raw-string allowlist (only
+	// true/1/false/0, case-insensitive; set-but-empty or anything else is
+	// treated as UNSET and surfaced in SessionIPLockEnvRejected for the
+	// boot WARN), else the yaml value read WITHOUT env interference, else
+	// the TRUE default. viper's cast.ToBool would have mapped "yes"/"on"/
+	// "garbage" to false — the fail-open this replaces.
+	ipLockEnv, ipLockRejected, ipLockRaw := sessionIPLockEnv()
+	sessionIPLock := ipLockEnv
+	if sessionIPLock == nil {
+		yamlLock, err := readYAMLSessionIPLock(path)
+		if err != nil {
+			return nil, err
+		}
+		if yamlLock != nil {
+			sessionIPLock = yamlLock
+		} else {
+			sessionIPLock = boolPtr(true)
+		}
+	}
+	ipLockEnvRejected := ""
+	if ipLockRejected {
+		ipLockEnvRejected = ipLockRaw
+	}
 	cfg := &DataConfig{
 		ListenAddr:                v.GetString("listen.addr"),
 		ListenOracleAddr:          v.GetString("listen.oracle_addr"),
@@ -1096,11 +1185,11 @@ func LoadData(path string) (*DataConfig, error) {
 		SessionIdleSeconds:        v.GetInt("session.idle_seconds"),
 		SessionMaxLifetimeSeconds: v.GetInt("session.max_lifetime_seconds"),
 		RevokePollSeconds:         v.GetInt("session.revoke_poll_seconds"),
-		// Materialize ip_lock as a *bool: GetBool resolves the defaults
-		// map (true), the yaml value and the ZT_SESSION_IP_LOCK override
-		// through the SAME viper instance, so an explicit false (env or
-		// file) and the absent=true default land here pre-resolved.
-		SessionIPLock: boolPtr(v.GetBool("session.ip_lock")),
+		// Fix round 1 (strict env parse, fail-locked): resolved above from
+		// sessionIPLockEnv (raw-string allowlist) with the yaml-only
+		// fallback — see the resolution block before this literal.
+		SessionIPLock:            sessionIPLock,
+		SessionIPLockEnvRejected: ipLockEnvRejected,
 		SessionCallback: SessionCallbackConfig{
 			URL:              v.GetString("session_callback.url"),
 			TimeoutSeconds:   v.GetInt("session_callback.timeout_seconds"),

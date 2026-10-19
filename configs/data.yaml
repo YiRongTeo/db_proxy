@@ -101,7 +101,11 @@ gate_wait_seconds: 20
 #     Default TRUE (the committed value — zero change for existing
 #     deployments). FALSE DISABLES A SECURITY CONTROL: session tokens open
 #     connections from ANY address; the data plane boots a loud WARN when
-#     disabled. Env override: ZT_SESSION_IP_LOCK (accepts true/false).
+#     disabled. Env override: ZT_SESSION_IP_LOCK — STRICT allowlist:
+#     true/false/1/0 only (case-insensitive); set-but-empty = the value
+#     here decides; ANYTHING else ("yes", "on", "2", a typo) is IGNORED
+#     with a boot WARN and the lock stays as configured here (fail-locked:
+#     a typo'd env var can never disable the lock).
 session:
   idle_seconds: 1800
   max_lifetime_seconds: 0
