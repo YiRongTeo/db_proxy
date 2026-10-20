@@ -110,7 +110,11 @@ func TestLoadControl(t *testing.T) {
 	if got := cfg.Valkey.Addr; got != "127.0.0.1:6379" {
 		t.Errorf("Valkey.Addr = %q, want %q", got, "127.0.0.1:6379")
 	}
-	assertTLSDisabled(t, cfg.TLS)
+	// Native control TLS (http.tls) is ABSENT in the committed config →
+	// plaintext (nil) — byte-identical to the historical default (G3).
+	if cfg.TLS != nil {
+		t.Fatalf("TLS = %+v, want nil (committed config has no http.tls block → plaintext)", cfg.TLS)
+	}
 	assertSSLDefaults(t, cfg.Valkey.SSL)
 
 	if got := len(cfg.DBPresets); got != 7 {
@@ -264,8 +268,11 @@ func TestLoadData(t *testing.T) {
 	if got := cfg.Valkey.DB; got != 0 {
 		t.Errorf("Valkey.DB = %d, want 0", got)
 	}
-	assertTLSDisabled(t, cfg.TLS)
-	assertSSLDefaults(t, cfg.Valkey.SSL)
+	// No http.tls block in this file → the DATA plane TLS stays nil
+	// (readTLS untouched by the native control TLS change).
+	if cfg.TLS != nil {
+		t.Errorf("TLS = %+v, want nil (no tls block in data.yaml)", cfg.TLS)
+	}
 
 	wantCreds := map[string]string{
 		"mysql:ro_user@127.0.0.1:3307":    "ro_pw",
@@ -294,14 +301,14 @@ func TestLoadData(t *testing.T) {
 	}
 }
 
-// assertTLSDisabled checks the plane TLS block is OFF in the committed
-// configs: tls.enabled: false → TLS stays nil and the cert/key paths are
-// never touched (no implicit file-based toggle — certs/ does not even exist
-// yet, which must not matter while disabled).
-func assertTLSDisabled(t *testing.T, tls *CertConfig) {
+// assertControlTLSPlaintext checks the control plane's TLS state is OFF:
+// (*CertConfig)(nil) → plaintext — byte-identical to the historical
+// HTTP-only listener (G3). The cert/key files are never touched in this
+// state (no implicit file-based toggle).
+func assertControlTLSPlaintext(t *testing.T, tlsCfg *CertConfig) {
 	t.Helper()
-	if tls != nil {
-		t.Fatalf("TLS = %+v, want nil (committed configs set tls.enabled: false → plaintext)", tls)
+	if tlsCfg != nil {
+		t.Fatalf("TLS = %+v, want nil (http.tls absent → plaintext)", tlsCfg)
 	}
 }
 
@@ -599,126 +606,157 @@ valkey:
 	}
 }
 
-// TestTLSOffState guards TLS state (a): tls.enabled: false with NO cert/key
-// files anywhere → Load succeeds and TLS is nil (plaintext). The cert/key
-// files must never be touched while the switch is off.
-func TestTLSOffState(t *testing.T) {
-	path := writeTempConfig(t, `
-http:
-  addr: ":8080"
-auth:
-  username: admin
-  password: secret
-  # jwt disabled (legacy cookie mode, JWT Task 2): fixture exercises the
-  # TLS off-state, not JWT.
-  jwt:
-    enabled: false
-tls:
-  enabled: false
-  cert_file: "certs/does-not-exist.crt"
-  key_file:  "certs/does-not-exist.key"
-`)
-	cfg, err := LoadControl(path)
-	if err != nil {
-		t.Fatalf("LoadControl(%q) error: %v (enabled:false must not touch files)", path, err)
-	}
-	if cfg.TLS != nil {
-		t.Fatalf("TLS = %+v, want nil (enabled: false → plaintext)", cfg.TLS)
-	}
-}
+// --- Native control-plane TLS: http.tls cert/key pair (path-driven) -------
+//
+// The control plane's TLS switch is the PRESENCE of the pair itself
+// (design 2026-10-21): BOTH http.tls.cert_file and http.tls.key_file set →
+// the control serves HTTPS/WSS on the SAME http.addr; NEITHER (or the whole
+// block absent) → plain HTTP, byte-identical behavior (G3); EXACTLY ONE →
+// load error naming the missing half. Env override: ZT_HTTP_TLS_CERT /
+// ZT_HTTP_TLS_KEY are PATHS (not secrets — no ${VAR} placeholder committed),
+// beating the yaml like every other viper ZT_ binding.
 
-// TestTLSOnMissingFiles guards TLS state (b): tls.enabled: true with
-// missing/unreadable cert or key → fail-fast Load ERROR naming the file.
-func TestTLSOnMissingFiles(t *testing.T) {
-	// (b1) cert missing.
-	path := writeTempConfig(t, `
-listen:
-  addr: ":3306"
-tls:
-  enabled: true
-  cert_file: "certs/nope.crt"
-  key_file:  "certs/nope.key"
-`)
-	_, err := LoadData(path)
-	if err == nil {
-		t.Fatal("LoadData: want error for enabled:true with missing cert/key, got nil")
-	}
-	if !strings.Contains(err.Error(), "certs/nope.crt") {
-		t.Errorf("error %q missing the missing cert path", err.Error())
-	}
-
-	// (b2) key missing while cert exists on disk.
+// writePairFiles creates throwaway cert/key files (contents irrelevant at
+// the config layer — readability is checked there, validity by the crypto
+// stack at ListenAndServeTLS) and returns their paths.
+func writePairFiles(t *testing.T) (string, string) {
+	t.Helper()
 	dir := t.TempDir()
-	certPath := filepath.Join(dir, "plane.crt")
-	if err := os.WriteFile(certPath, []byte("cert"), 0o600); err != nil {
-		t.Fatalf("write %s: %v", certPath, err)
-	}
-	path = writeTempConfig(t, fmt.Sprintf(`
-listen:
-  addr: ":3306"
-tls:
-  enabled: true
-  cert_file: %q
-  key_file:  "certs/nope.key"
-`, filepath.ToSlash(certPath)))
-	_, err = LoadData(path)
-	if err == nil {
-		t.Fatal("LoadData: want error for enabled:true with missing key, got nil")
-	}
-	if !strings.Contains(err.Error(), "certs/nope.key") {
-		t.Errorf("error %q missing the missing key path", err.Error())
-	}
-
-	// (b3) enabled:true with no cert_file at all → shape error naming the key.
-	path = writeTempConfig(t, `
-http:
-  addr: ":8080"
-tls:
-  enabled: true
-`)
-	_, err = LoadControl(path)
-	if err == nil {
-		t.Fatal("LoadControl: want error for enabled:true without cert_file, got nil")
-	}
-	if !strings.Contains(err.Error(), "tls.cert_file") {
-		t.Errorf("error %q missing tls.cert_file hint", err.Error())
-	}
-}
-
-// TestTLSOnWithFiles guards TLS state (c): tls.enabled: true with both files
-// present → Load succeeds and TLS is populated with Enabled + both paths.
-func TestTLSOnWithFiles(t *testing.T) {
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "plane.crt")
-	keyPath := filepath.Join(dir, "plane.key")
+	certPath := filepath.Join(dir, "localhost.crt")
+	keyPath := filepath.Join(dir, "localhost.key")
 	for _, f := range []string{certPath, keyPath} {
-		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		if err := os.WriteFile(f, []byte("pair"), 0o600); err != nil {
 			t.Fatalf("write %s: %v", f, err)
 		}
 	}
-	path := writeTempConfig(t, fmt.Sprintf(`
-listen:
-  addr: ":3306"
-tls:
-  enabled: true
-  cert_file: %q
-  key_file:  %q
-`, filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
-	cfg, err := LoadData(path)
+	return certPath, keyPath
+}
+
+// tlsFixture is the minimal control config every http.tls test loads: JWT
+// login mode with the fixed test values so the auth validation passes and
+// the test exercises ONLY the TLS block.
+func tlsFixture(cert, key string) string {
+	return fmt.Sprintf(`
+http:
+  addr: ":8443"
+  tls:
+    cert_file: %q
+    key_file: %q
+auth:
+  username: admin
+  password: secret
+  role: maker
+  jwt:
+    enabled: true
+    login_enabled: true
+    issuer: "zerotrust-proxy"
+    audience: "zt-api"
+    ttl_seconds: 28800
+    secret: "unit-tls-secret-0123456789abcdef"
+`, cert, key)
+}
+
+// TestControlTLSAbsentIsPlaintext guards the off states: an http block with
+// NO tls key anywhere → Load succeeds, TLS nil (plaintext), and the
+// cert/key files are never touched (G3 — the committed configs must keep
+// booting byte-identically without the block).
+func TestControlTLSAbsentIsPlaintext(t *testing.T) {
+	setSecretEnv(t)
+	path := writeTempConfig(t, tlsFixture("", ""))
+	cfg, err := LoadControl(path)
 	if err != nil {
-		t.Fatalf("LoadData(%q) error: %v", path, err)
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
+	}
+	assertControlTLSPlaintext(t, cfg.TLS)
+}
+
+// TestControlTLSBothSet configures BOTH paths → TLS present with Enabled
+// true and both files carried; a missing file still fails fast (readability
+// is checked at load, so a misconfigured TLS plane never boots).
+func TestControlTLSBothSet(t *testing.T) {
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+	path := writeTempConfig(t, tlsFixture(filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
 	}
 	if cfg.TLS == nil {
-		t.Fatal("TLS = nil, want populated (enabled: true with files present)")
+		t.Fatal("TLS = nil, want populated (both cert_file and key_file set)")
 	}
 	if !cfg.TLS.Enabled {
-		t.Error("TLS.Enabled = false, want true")
+		t.Error("TLS.Enabled = false, want true (pair complete)")
 	}
 	if got := cfg.TLS.CertFile; got != filepath.ToSlash(certPath) {
 		t.Errorf("TLS.CertFile = %q, want %q", got, filepath.ToSlash(certPath))
 	}
 	if got := cfg.TLS.KeyFile; got != filepath.ToSlash(keyPath) {
 		t.Errorf("TLS.KeyFile = %q, want %q", got, filepath.ToSlash(keyPath))
+	}
+
+	// Both set but the CERT file missing on disk → load error naming it.
+	_ = os.Remove(certPath)
+	bogus := filepath.ToSlash(certPath)
+	if _, err := LoadControl(writeTempConfig(t, tlsFixture(bogus, filepath.ToSlash(keyPath)))); err == nil {
+		t.Fatal("LoadControl: want error for unreadable cert_file, got nil")
+	} else if !strings.Contains(err.Error(), "missing") && !strings.Contains(err.Error(), "localhost.crt") {
+		t.Errorf("error %q does not name the missing cert file", err.Error())
+	}
+}
+
+// TestControlTLSExactlyOneIsError: exactly one of cert_file/key_file set is
+// a load error NAMING THE MISSING HALF — never a silent plaintext boot.
+func TestControlTLSExactlyOneIsError(t *testing.T) {
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+
+	// cert set, key empty → error names key_file.
+	if _, err := LoadControl(writeTempConfig(t, tlsFixture(filepath.ToSlash(certPath), ""))); err == nil {
+		t.Error("cert set without key: want error, got nil")
+	} else if !strings.Contains(err.Error(), "key_file") {
+		t.Errorf("cert-only error %q does not name key_file", err.Error())
+	}
+
+	// key set, cert empty → error names cert_file.
+	if _, err := LoadControl(writeTempConfig(t, tlsFixture("", filepath.ToSlash(keyPath)))); err == nil {
+		t.Error("key set without cert: want error, got nil")
+	} else if !strings.Contains(err.Error(), "cert_file") {
+		t.Errorf("key-only error %q does not name cert_file", err.Error())
+	}
+}
+
+// TestControlTLSEnvOverrides: ZT_HTTP_TLS_CERT / ZT_HTTP_TLS_KEY beat the
+// yaml and drive TLS on a config whose file carries no paths. These env
+// vars are PATHS, not secrets — no ${VAR} placeholder is committed.
+func TestControlTLSEnvOverrides(t *testing.T) {
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+	path := writeTempConfig(t, tlsFixture("", ""))
+	t.Setenv("ZT_HTTP_TLS_CERT", certPath)
+	t.Setenv("ZT_HTTP_TLS_KEY", keyPath)
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v", path, err)
+	}
+	if cfg.TLS == nil {
+		t.Fatal("TLS = nil, want populated (env paths set)")
+	}
+	if !cfg.TLS.Enabled {
+		t.Error("TLS.Enabled = false, want true (env pair complete)")
+	}
+	if got := cfg.TLS.CertFile; got != certPath {
+		t.Errorf("TLS.CertFile = %q, want %q (env wins)", got, certPath)
+	}
+	if got := cfg.TLS.KeyFile; got != keyPath {
+		t.Errorf("TLS.KeyFile = %q, want %q (env wins)", got, keyPath)
+	}
+
+	// Exactly one env var is the same half-configured error as yaml.
+	t.Setenv("ZT_HTTP_TLS_KEY", "")
+	if _, err := LoadControl(path); err == nil {
+		t.Error("env cert set without key: want error, got nil")
+	} else if !strings.Contains(err.Error(), "key_file") {
+		t.Errorf("env cert-only error %q does not name key_file", err.Error())
 	}
 }
 

@@ -383,6 +383,33 @@ AutomaticEnv still maps `ZT_AUTH_JWT_ALLOWED_ORIGINS`, comma-separated, if
 set). Empty (default) = same-origin only; entries are host globs — prefix
 `https://` to pin the scheme, and spell out any non-default port (§2.1.1).
 
+### 2.1.0 Native TLS on the control plane (https/wss directly against Go)
+
+The control plane serves **plain HTTP by default**. To have it speak TLS itself — required for
+**wss** when a browser reaches it from an https-served page (browsers force wss there) — set the
+`http.tls` cert/key pair (or the `ZT_HTTP_TLS_CERT` / `ZT_HTTP_TLS_KEY` env paths, which beat the
+yaml). The pair's PRESENCE is the switch; the SAME `http.addr` then serves HTTPS/WSS (health,
+SPA, REST, WS upgrade) and the boot log gains `tls=true`:
+
+```bash
+# one-time: self-signed dev pair for localhost (SANs localhost, 127.0.0.1, ::1; 10 years)
+bash scripts/gen-dev-cert.sh          # writes scripts/dev-cert/ (git-ignored); prints next steps
+
+# start with TLS via env paths (or set the same paths under http: tls: in control.yaml)
+ZT_HTTP_TLS_CERT=scripts/dev-cert/localhost.crt ZT_HTTP_TLS_KEY=scripts/dev-cert/localhost.key \
+  go run ./cmd/control
+# log: control plane listening addr=:8080 tls=true
+
+curl -k https://localhost:8080/api/health   # {"status":"ok","valkey":"up"} — -k: self-signed
+```
+
+One-time **browser trust** for the self-signed pair: open `https://localhost:8080/` and accept
+the warning (or import the crt into your trust store); afterwards the https-served SPA opens
+`wss://localhost:8080/ws/checker` directly. Exactly one of cert/key set = the plane **refuses to
+start**; a broken/unreadable pair is a boot error, never a plaintext fallback; TLS 1.2 floor is
+hardcoded. Production (LB topology): terminate TLS at the LB, leave `http.tls` unset — see
+docs/11-node-integration.md §11.12.
+
 ### 2.1.1 External JWT issuers (Phase 2 — `auth.jwt.external_issuers`)
 
 Since Phase 2, the plane trusts **third-party HS256 issuers** in addition to
@@ -1387,7 +1414,7 @@ plaintext, exactly the defaults committed in `configs/`):
 
 | Surface | Switch (env / config key) | Default |
 |---|---|---|
-| Control Plane HTTPS (REST + WS + SPA) | `ZT_TLS_ENABLED` / `tls.enabled` (`configs/control.yaml`) | off |
+| Control Plane HTTPS (REST + WS + SPA) | `ZT_HTTP_TLS_CERT` + `ZT_HTTP_TLS_KEY` / `http.tls.cert_file`+`key_file` (`configs/control.yaml`) — pair presence is the switch (§2.1.0) | off |
 | Data Plane wire TLS (MySQL SSL + PG SSLRequest handshakes) | `ZT_TLS_ENABLED` / `tls.enabled` (`configs/data.yaml`) | off |
 | Valkey client TLS (tokens/sessions/PubSub) | `ZT_VALKEY_SSL_ENABLED` / `valkey.ssl.enabled` | off |
 
@@ -1397,12 +1424,15 @@ plaintext, exactly the defaults committed in `configs/`):
 ### 6.1 Certificates (one-time)
 
 ```bash
-bash scripts/gen-certs.sh   # idempotent; writes certs/control.{crt,key} + certs/data.{crt,key}
+bash scripts/gen-certs.sh       # idempotent; writes certs/data.{crt,key} (data plane + valkey TLS)
+bash scripts/gen-dev-cert.sh    # control plane's NATIVE https/wss pair — scripts/dev-cert/ (§2.1.0)
 ```
 
-Self-signed rsa:2048, 365 days, `CN=127.0.0.1`, SAN `IP:127.0.0.1,DNS:localhost` (the cert doubles as
-its own CA). `configs/*.yaml` already point `tls.cert_file`/`tls.key_file` and `valkey.ssl.ca_file`
-at these files. Production must use real CA-signed certs.
+`gen-certs.sh`: self-signed rsa:2048, 365 days, `CN=127.0.0.1`, SAN `IP:127.0.0.1,DNS:localhost`
+(the cert doubles as its own CA). `configs/data.yaml` still points `tls.cert_file`/`tls.key_file`
+and `valkey.ssl.ca_file` at these files. The CONTROL plane no longer reads `certs/control.*` —
+its native TLS is the presence-driven `http.tls` pair (§2.1.0, dev pair from `gen-dev-cert.sh`).
+Production must use real CA-signed certs.
 
 ### 6.2 Valkey with TLS (`valkey-tls`, host port 6380)
 

@@ -296,3 +296,76 @@ MariaDB is a **first-class `db_type`** — accepted explicitly, never mapped to 
   (`tls.enabled: true`); over plaintext the full-auth exchange cannot complete.
 - **Live backend:** a dedicated MariaDB test container is an explicit follow-up — until it lands,
   MariaDB sessions are covered by the fake-backend acceptance tests.
+
+## 11.12 WSS — native control-plane TLS (`http.tls`)
+
+### When wss is required
+
+Browsers **force `wss://` whenever the page itself is served over `https://`** — a mixed-content
+`ws://` upgrade from an https origin is blocked outright. When the Angular SPA (or the main app's
+UI) is served over https, the checker live-query socket can therefore only reach this control
+plane as **wss**, which requires the control plane to speak TLS itself:
+
+- **SPA served over http** (the dev default): `ws://` works — no TLS needed.
+- **SPA served over https**: `wss://` is mandatory → enable `http.tls` below (or terminate TLS at
+  a load balancer in front of the control plane — see "LB termination" at the end).
+
+### Config — `http.tls` in `configs/control.yaml`
+
+The **presence of the pair is the switch** — there is no `enabled` flag:
+
+- BOTH `cert_file` and `key_file` set → the control plane serves **HTTPS/WSS via
+  `ListenAndServeTLS` on the SAME `http.addr`** (health, SPA, REST, and the WS upgrade all move
+  to TLS together; the port no longer answers plain HTTP).
+- NEITHER set (or the whole block absent) → **plain HTTP**, byte-identical to the historical
+  listener.
+- EXACTLY ONE set → the plane **refuses to start** (load error naming the missing half).
+- Files must be readable at boot — a broken pair is a load error (fail fast), and the TLS floor
+  is **TLS 1.2** (hardcoded; no knob).
+
+```yaml
+http:
+  addr: ":8080"
+  tls:
+    cert_file: "scripts/dev-cert/localhost.crt"
+    key_file:  "scripts/dev-cert/localhost.key"
+```
+
+The boot log states the mode: `control plane listening addr=:8080 tls=true|false`.
+
+### Env overrides — `ZT_HTTP_TLS_CERT` / `ZT_HTTP_TLS_KEY`
+
+These carry **paths, not secrets** (so unlike the `${VAR}` secret placeholders there is nothing
+committed in `configs/` and no `.env` entry is required). They beat the yaml like every other
+`ZT_` binding:
+
+```bash
+ZT_HTTP_TLS_CERT=scripts/dev-cert/localhost.crt
+ZT_HTTP_TLS_KEY=scripts/dev-cert/localhost.key
+```
+
+### Development certificates
+
+```bash
+bash scripts/gen-dev-cert.sh     # idempotent; -f regenerates
+```
+
+Writes `scripts/dev-cert/localhost.crt` + `localhost.key` (**git-ignored**): self-signed
+rsa:2048, **10-year** validity, SANs `DNS:localhost, IP:127.0.0.1, IP:::1`. The script prints the
+post-generation steps itself; the short form:
+
+1. Point `http.tls` (or the two env vars) at the pair.
+2. **Browser trust** — visit `https://localhost:8080/` once and accept the warning (or import
+   `localhost.crt` into your OS/browser trust store). After that the https-served SPA opens
+   `wss://localhost:8080/ws/checker` directly against this process.
+3. Smoke probe without the trust step: `curl -k https://localhost:8080/api/health`.
+
+### LB termination — the 8-control production topology
+
+In the production topology (eight control instances behind a load balancer) TLS **terminates at
+the LB**: the LB owns the CA-signed certificate for the public hostname, speaks https/wss to
+browsers, and forwards **plain HTTP to the controls** — the control plane keeps
+`http.tls` unset (nil) and needs no certificates at all. Enable native `http.tls` only where the
+browser reaches the Go process **directly** (single-node deployments, dev, or an LB pass-through
+mode); between the LB and the controls, network-level isolation is the trust boundary, exactly
+as for the existing plaintext data-plane hops.

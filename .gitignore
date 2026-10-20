@@ -1,5 +1,6 @@
 bin/
 certs/
+scripts/dev-cert/
 web/node_modules/
 web/dist/
 *.exe

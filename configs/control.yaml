@@ -229,10 +229,20 @@ db_presets:
     db_ip: "127.0.0.1"
     db_port: "1521"
     access: "write"
-tls:                      # explicit switch (user directive): enabled: true REQUIRES readable cert_file+key_file (fail-fast at load); false/absent = plaintext
-  enabled: false
-  cert_file: "certs/control.crt"
-  key_file:  "certs/control.key"
+# Native control-plane TLS (http.tls): the PRESENCE of BOTH cert_file and
+# key_file switches the control plane to HTTPS/WSS via ListenAndServeTLS on
+# the SAME addr — browsers served the SPA over https can then open wss
+# directly against this process. NEITHER set (or the block absent) = plain
+# HTTP, byte-identical to the historical listener. EXACTLY ONE set = the
+# plane REFUSES to start (load error naming the missing half). Files must be
+# readable at boot (fail fast). TLS 1.2 is the hardcoded floor. Dev certs:
+#   bash scripts/gen-dev-cert.sh   → scripts/dev-cert/localhost.{crt,key}
+# Env overrides (PATHS, not secrets — beat this file):
+#   ZT_HTTP_TLS_CERT / ZT_HTTP_TLS_KEY
+#http:
+#  tls:
+#    cert_file: "scripts/dev-cert/localhost.crt"
+#    key_file:  "scripts/dev-cert/localhost.key"
 valkey:
   mode: direct            # direct | sentinel
   addr: "127.0.0.1:6379"  # direct mode

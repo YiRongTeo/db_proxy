@@ -36,6 +36,13 @@ func load(v *viper.Viper, path string, defaults map[string]any) error {
 	// the config file). Without BindEnv, ZT_TOKEN_MAX_USES would silently
 	// not map and the budget would silently stay 1.
 	v.BindEnv("api.token_max_uses", "ZT_API_TOKEN_MAX_USES", "ZT_TOKEN_MAX_USES")
+	// Native control TLS (http.tls): the env PATH overrides must reach the
+	// keys even when configs/control.yaml carries no http.tls block at all
+	// (AutomaticEnv resolves only keys viper already knows). Explicit
+	// BindEnv mirrors the api.token_max_uses pattern above. These are PATHS,
+	// not secrets — no ${VAR} placeholder is committed anywhere.
+	v.BindEnv("http.tls.cert_file", "ZT_HTTP_TLS_CERT")
+	v.BindEnv("http.tls.key_file", "ZT_HTTP_TLS_KEY")
 	if err := v.ReadInConfig(); err != nil {
 		return fmt.Errorf("read config %s: %w", path, err)
 	}
@@ -450,6 +457,44 @@ func readTLS(v *viper.Viper) (*CertConfig, error) {
 	return &CertConfig{Enabled: true, CertFile: cert, KeyFile: key}, nil
 }
 
+// readControlTLS resolves the CONTROL plane's native TLS from the
+// presence-driven http.tls pair (design 2026-10-21): BOTH cert_file and
+// key_file set → the control serves HTTPS/WSS via ListenAndServeTLS on the
+// SAME http.addr (Enabled forced true — the pair IS the switch, there is no
+// separate enabled flag); NEITHER set (or the whole block absent) →
+// (*CertConfig)(nil), plain HTTP — byte-identical to the pre-TLS listener
+// (G3); EXACTLY ONE set → a load error naming the missing half, so a
+// half-configured plane never boots silently into plaintext. The env paths
+// ZT_HTTP_TLS_CERT / ZT_HTTP_TLS_KEY beat the yaml via viper binding
+// (AutomaticEnv + the http.tls key path) and are PATHS, not secrets —
+// nothing is ${VAR}-expanded and nothing is committed in configs/.
+//
+// When TLS is on, BOTH files must be readable AT LOAD (fail fast) — a
+// broken cert/key surfaces at boot, never at the first browser handshake.
+// The shared readTLS (tls.enabled-gated, still used by the DATA plane)
+// is deliberately untouched: different contract, different consumer.
+func readControlTLS(v *viper.Viper) (*CertConfig, error) {
+	cert := v.GetString("http.tls.cert_file")
+	key := v.GetString("http.tls.key_file")
+	switch {
+	case cert != "" && key != "":
+		for _, f := range []string{cert, key} {
+			h, err := os.Open(f)
+			if err != nil {
+				return nil, fmt.Errorf("http.tls enabled: %s: %w", f, err)
+			}
+			h.Close()
+		}
+		return &CertConfig{Enabled: true, CertFile: cert, KeyFile: key}, nil
+	case cert == "" && key == "":
+		return nil, nil // pair absent → plaintext (G3)
+	case cert == "":
+		return nil, fmt.Errorf("http.tls.key_file is set but http.tls.cert_file is missing — set both (or neither for plaintext)")
+	default:
+		return nil, fmt.Errorf("http.tls.cert_file is set but http.tls.key_file is missing — set both (or neither for plaintext)")
+	}
+}
+
 // readAudit reads the audit block through the same viper instance that read
 // the file (env overrides + defaults resolve consistently). When
 // audit.mysql.enabled is true, ALL connection fields must be present —
@@ -527,7 +572,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 	}); err != nil {
 		return nil, err
 	}
-	tlsCfg, err := readTLS(v)
+	tlsCfg, err := readControlTLS(v) // native control TLS: http.tls pair presence (G3: absent → nil → plaintext)
 	if err != nil {
 		return nil, err
 	}
