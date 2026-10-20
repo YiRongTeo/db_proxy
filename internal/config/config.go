@@ -457,6 +457,31 @@ func readTLS(v *viper.Viper) (*CertConfig, error) {
 	return &CertConfig{Enabled: true, CertFile: cert, KeyFile: key}, nil
 }
 
+// legacyTLSKeyFromFile reports which legacy control tls key (tls.enabled /
+// tls.cert_file / tls.key_file) is present in the config FILE at path, or
+// "" when none is (fix round 2). It parses the yaml into a FRESH viper
+// instance (the readYAMLSessionIPLock pattern) with NO AutomaticEnv and NO
+// BindEnv: viper's IsSet consults the environment only through those two
+// mechanisms, so on this instance IsSet reads the parsed file and nothing
+// else. The round-1 guard instead tested IsSet on the MAIN env-aware
+// instance, which resolves ZT_<KEY> for ANY key it is asked about — the
+// DATA plane's ZT_TLS_ENABLED env var therefore made IsSet("tls.enabled")
+// true and the guard refused every control config with no legacy block at
+// all (live-reproduced). A file-only source can never see the environment.
+func legacyTLSKeyFromFile(path string) (string, error) {
+	fv := viper.New()
+	fv.SetConfigFile(path)
+	if err := fv.ReadInConfig(); err != nil {
+		return "", fmt.Errorf("read config %s: %w", path, err)
+	}
+	for _, legacy := range []string{"tls.enabled", "tls.cert_file", "tls.key_file"} {
+		if fv.IsSet(legacy) {
+			return legacy, nil
+		}
+	}
+	return "", nil
+}
+
 // readControlTLS resolves the CONTROL plane's native TLS from the
 // presence-driven http.tls pair (design 2026-10-21): BOTH cert_file and
 // key_file set → the control serves HTTPS/WSS via ListenAndServeTLS on the
@@ -469,28 +494,35 @@ func readTLS(v *viper.Viper) (*CertConfig, error) {
 // (AutomaticEnv + the http.tls key path) and are PATHS, not secrets —
 // nothing is ${VAR}-expanded and nothing is committed in configs/.
 //
-// MIGRATION GUARD (fix round 1): the pre-native-TLS control shape was a
-// top-level tls block (tls.enabled / tls.cert_file / tls.key_file) — a
-// shape this loader NO LONGER READS, so an upgrading deployment that kept
-// it would boot PLAINTEXT silently (the security control gone, only
-// tls=false in the log as a tell). Any of the three legacy keys present in
-// the control config is therefore a LOAD ERROR naming the block and the
-// migration path — even when a valid http.tls pair is also set (no silent
-// precedence). Detection goes through viper IsSet on the raw keys, which
-// the control loader reads NOWHERE else; the keys carry no defaults and no
-// BindEnv, so ONLY a config file (or an explicit tls key) can trip the
-// guard — in particular the DATA plane's ZT_TLS_ENABLED env var cannot
-// reach a control key viper does not know. The shared readTLS (the same
-// shape, DATA plane) is deliberately untouched: different consumer, still
-// consumes its tls block for backend wire TLS.
+// MIGRATION GUARD (fix round 1; made env-safe in fix round 2): the
+// pre-native-TLS control shape was a top-level tls block (tls.enabled /
+// tls.cert_file / tls.key_file) — a shape this loader NO LONGER READS, so
+// an upgrading deployment that kept it would boot PLAINTEXT silently (the
+// security control gone, only tls=false in the log as a tell). Any of the
+// three legacy keys present in the control config is therefore a LOAD
+// ERROR naming the block and the migration path — even when a valid
+// http.tls pair is also set (no silent precedence). Detection runs through
+// legacyTLSKeyFromFile on a FILE-ONLY viper instance: the round-1 guard
+// tested IsSet on the MAIN instance, but that instance's AutomaticEnv
+// resolves ZT_<KEY> for ANY key it is asked about, so the DATA plane's
+// ZT_TLS_ENABLED env var (documented on the control's start command in
+// RUN.md §6.4) made IsSet("tls.enabled") true and false-tripped the guard
+// on every config with no legacy block. The file-only instance cannot see
+// the environment at all, so only real file content trips the guard; the
+// http.tls resolution below stays on the MAIN instance so the
+// ZT_HTTP_TLS_CERT/KEY paths still beat the yaml. The shared readTLS (the
+// same shape, DATA plane) is deliberately untouched: different consumer,
+// still consumes its tls block for backend wire TLS.
 //
 // When TLS is on, BOTH files must be readable AT LOAD (fail fast) — a
 // broken cert/key surfaces at boot, never at the first browser handshake.
-func readControlTLS(v *viper.Viper) (*CertConfig, error) {
-	for _, legacy := range []string{"tls.enabled", "tls.cert_file", "tls.key_file"} {
-		if v.IsSet(legacy) {
-			return nil, fmt.Errorf("legacy control tls block detected (key %s) — control TLS moved to the http.tls cert_file/key_file pair in this version; migrate the config (remove tls:) or set ZT_HTTP_TLS_CERT/ZT_HTTP_TLS_KEY", legacy)
-		}
+func readControlTLS(v *viper.Viper, path string) (*CertConfig, error) {
+	legacy, err := legacyTLSKeyFromFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if legacy != "" {
+		return nil, fmt.Errorf("legacy control tls block detected (key %s) — control TLS moved to the http.tls cert_file/key_file pair in this version; migrate the config (remove tls:) or set ZT_HTTP_TLS_CERT/ZT_HTTP_TLS_KEY", legacy)
 	}
 	cert := v.GetString("http.tls.cert_file")
 	key := v.GetString("http.tls.key_file")
@@ -590,7 +622,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 	}); err != nil {
 		return nil, err
 	}
-	tlsCfg, err := readControlTLS(v) // native control TLS: http.tls pair presence (G3: absent → nil → plaintext)
+	tlsCfg, err := readControlTLS(v, path) // native control TLS: http.tls pair presence (G3: absent → nil → plaintext); legacy block detected from the FILE ONLY (fix round 2)
 	if err != nil {
 		return nil, err
 	}

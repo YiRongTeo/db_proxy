@@ -851,6 +851,68 @@ tls:
 	}
 }
 
+// --- Legacy guard vs ENVIRONMENT (fix round 2) ------------------------------
+//
+// The round-1 guard tested viper IsSet on the MAIN env-aware instance; with
+// AutomaticEnv + AllowEmptyEnv + the ZT prefix, viper resolves ZT_<KEY> for
+// ANY key it is asked about, so the DATA plane's ZT_TLS_ENABLED env var
+// (exported in the control's start environment — RUN.md §6.4) made
+// IsSet("tls.enabled") true and the guard refused a perfectly normal
+// control config with no tls block at all (live-reproduced). The guard now
+// reads a FILE-ONLY viper instance (legacyTLSKeyFromFile), so only real
+// file content can trip it. These tests pin that with the env var actually
+// exported in the test process — t.Setenv restores the caller's env after.
+
+// TestControlLegacyTLSGuardIgnoresEnv: with ZT_TLS_ENABLED exported (the
+// data-plane env var), a control config with NO tls block anywhere boots
+// NORMAL — plaintext, no legacy error. This is the round-1 false-trip.
+func TestControlLegacyTLSGuardIgnoresEnv(t *testing.T) {
+	t.Setenv("ZT_TLS_ENABLED", "true")
+	setSecretEnv(t)
+	path := writeTempConfig(t, tlsFixture("", ""))
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v (ZT_TLS_ENABLED must not trip the legacy guard)", path, err)
+	}
+	assertControlTLSPlaintext(t, cfg.TLS)
+}
+
+// TestControlLegacyTLSGuardEnvPlusLegacyInFileStillRefused: ZT_TLS_ENABLED
+// exported AND the legacy block IN THE FILE is still a load error — the
+// env var is irrelevant, the file's legacy block trips the guard exactly as
+// without it.
+func TestControlLegacyTLSGuardEnvPlusLegacyInFileStillRefused(t *testing.T) {
+	t.Setenv("ZT_TLS_ENABLED", "true")
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+	path := writeTempConfig(t, legacyTLSFixture("", "", filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
+	if _, err := LoadControl(path); err == nil {
+		t.Fatal("ZT_TLS_ENABLED + legacy block in file: want load error, got nil")
+	} else if !strings.Contains(err.Error(), "legacy") {
+		t.Errorf("error %q does not name the legacy tls block", err.Error())
+	}
+}
+
+// TestControlLegacyTLSGuardKeepsEnvOverrideForHTTPTLS: the FILE-ONLY guard
+// does not disturb the env override path for the NEW keys — with
+// ZT_HTTP_TLS_CERT/KEY exported and no http.tls in the file, TLS still
+// resolves from env (and ZT_TLS_ENABLED stays inert).
+func TestControlLegacyTLSGuardKeepsEnvOverrideForHTTPTLS(t *testing.T) {
+	t.Setenv("ZT_TLS_ENABLED", "true")
+	certPath, keyPath := writePairFiles(t)
+	t.Setenv("ZT_HTTP_TLS_CERT", filepath.ToSlash(certPath))
+	t.Setenv("ZT_HTTP_TLS_KEY", filepath.ToSlash(keyPath))
+	setSecretEnv(t)
+	path := writeTempConfig(t, tlsFixture("", ""))
+	cfg, err := LoadControl(path)
+	if err != nil {
+		t.Fatalf("LoadControl(%q) error: %v (env http.tls paths must still beat the yaml)", path, err)
+	}
+	if cfg.TLS == nil || !cfg.TLS.Enabled {
+		t.Fatalf("TLS = %+v, want enabled from ZT_HTTP_TLS_CERT/KEY", cfg.TLS)
+	}
+}
+
 // --- Task 8.7: credential source (config vs api) ---------------------------
 
 // TestCredentialsSourceAPIMode: credentials_source: api parses the

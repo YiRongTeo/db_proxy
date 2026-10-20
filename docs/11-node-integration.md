@@ -324,8 +324,10 @@ The **presence of the pair is the switch** — there is no `enabled` flag:
   is **TLS 1.2** (hardcoded; no knob).
 - **Migration guard:** a leftover legacy control `tls:` block (`tls.enabled` / `tls.cert_file` /
   `tls.key_file` — the shape this feature replaced) is a **load error naming the migration**,
-  even when a valid `http.tls` pair is also present (no silent precedence). The DATA plane's own
-  `tls:` block is unaffected — it still consumes its block for backend wire TLS.
+  even when a valid `http.tls` pair is also present (no silent precedence). The guard inspects
+  the config **FILE only**; environment variables like the data plane's `ZT_TLS_ENABLED` do not
+  trip it. The DATA plane's own `tls:` block is unaffected — it still consumes its block for
+  backend wire TLS.
 
 ```yaml
 http:

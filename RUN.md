@@ -410,7 +410,10 @@ start**; a broken/unreadable pair is a boot error, never a plaintext fallback; T
 hardcoded. **Migration guard:** a leftover legacy control `tls:` block (`tls.enabled` /
 `tls.cert_file` / `tls.key_file` — the pre-`http.tls` shape, still valid on the DATA plane only)
 also **refuses the boot** with a load error naming the migration — remove the block and use
-`http.tls`. Production (LB topology): terminate TLS at the LB, leave `http.tls` unset — see
+`http.tls`. The guard inspects the config **FILE only**; environment variables like the data
+plane's `ZT_TLS_ENABLED` do not trip it (exporting that var alongside a control start is safe —
+only the `http.tls` env paths `ZT_HTTP_TLS_CERT`/`ZT_HTTP_TLS_KEY` are consulted on the control).
+Production (LB topology): terminate TLS at the LB, leave `http.tls` unset — see
 docs/11-node-integration.md §11.12.
 
 ### 2.1.1 External JWT issuers (Phase 2 — `auth.jwt.external_issuers`)
