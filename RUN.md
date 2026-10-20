@@ -407,7 +407,10 @@ One-time **browser trust** for the self-signed pair: open `https://localhost:808
 the warning (or import the crt into your trust store); afterwards the https-served SPA opens
 `wss://localhost:8080/ws/checker` directly. Exactly one of cert/key set = the plane **refuses to
 start**; a broken/unreadable pair is a boot error, never a plaintext fallback; TLS 1.2 floor is
-hardcoded. Production (LB topology): terminate TLS at the LB, leave `http.tls` unset — see
+hardcoded. **Migration guard:** a leftover legacy control `tls:` block (`tls.enabled` /
+`tls.cert_file` / `tls.key_file` — the pre-`http.tls` shape, still valid on the DATA plane only)
+also **refuses the boot** with a load error naming the migration — remove the block and use
+`http.tls`. Production (LB topology): terminate TLS at the LB, leave `http.tls` unset — see
 docs/11-node-integration.md §11.12.
 
 ### 2.1.1 External JWT issuers (Phase 2 — `auth.jwt.external_issuers`)

@@ -760,6 +760,97 @@ func TestControlTLSEnvOverrides(t *testing.T) {
 	}
 }
 
+// --- Legacy control `tls:` block: migration guard (fix round 1) ------------
+//
+// The pre-native-TLS control config used a top-level `tls:` block
+// (tls.enabled / tls.cert_file / tls.key_file) — the shape the shared
+// readTLS still parses for the DATA plane. The native control TLS change
+// moved control TLS to the presence-driven http.tls pair and STOPPED
+// reading those keys, so an upgrading deployment that still carries the
+// legacy block would boot PLAINTEXT silently (the security control
+// vanishing with only tls=false in the log as a tell). The loader now
+// REFUSES any non-empty legacy control tls block at load, naming the
+// migration (http.tls / ZT_HTTP_TLS_CERT+KEY) — fail fast, never silent.
+
+// legacyTLSFixture is tlsFixture's config PLUS the legacy top-level tls
+// block, as an upgrading deployment would carry it.
+func legacyTLSFixture(cert, key string, legacyCert, legacyKey string) string {
+	return tlsFixture(cert, key) + fmt.Sprintf(`
+tls:
+  enabled: true
+  cert_file: %q
+  key_file: %q
+`, legacyCert, legacyKey)
+}
+
+// TestControlLegacyTLSBlockIsRefused: a control config still carrying the
+// legacy tls block (alone, without http.tls) is a LOAD ERROR naming the
+// legacy block and the migration path — never a silent plaintext boot.
+func TestControlLegacyTLSBlockIsRefused(t *testing.T) {
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+
+	if _, err := LoadControl(writeTempConfig(t, legacyTLSFixture("", "", filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))); err == nil {
+		t.Fatal("legacy tls block alone: want load error, got nil (silent plaintext boot)")
+	} else {
+		msg := err.Error()
+		if !strings.Contains(msg, "legacy") {
+			t.Errorf("error %q does not name the legacy tls block", msg)
+		}
+		if !strings.Contains(msg, "http.tls") {
+			t.Errorf("error %q does not name the migration target http.tls", msg)
+		}
+	}
+
+	// enabled:false but the paths still present is ALSO a leftover legacy
+	// block — refuse it too (the file shape says "upgraded from the old
+	// control", the migration has not happened).
+	if _, err := LoadControl(writeTempConfig(t, tlsFixture("", "")+`
+tls:
+  enabled: false
+  cert_file: "/old/control.crt"
+  key_file: "/old/control.key"
+`)); err == nil {
+		t.Fatal("legacy tls block with enabled:false: want load error, got nil")
+	}
+}
+
+// TestControlLegacyTLSRefusedEvenWithValidHTTPTLS: a legacy block AND a
+// VALID http.tls pair together is still a load error — the operator must
+// remove the legacy block, and no silent precedence resolves the conflict.
+func TestControlLegacyTLSRefusedEvenWithValidHTTPTLS(t *testing.T) {
+	setSecretEnv(t)
+	certPath, keyPath := writePairFiles(t)
+	path := writeTempConfig(t, legacyTLSFixture(filepath.ToSlash(certPath), filepath.ToSlash(keyPath), filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
+	if _, err := LoadControl(path); err == nil {
+		t.Fatal("legacy block + valid http.tls: want load error (no silent precedence), got nil")
+	} else if !strings.Contains(err.Error(), "legacy") {
+		t.Errorf("error %q does not name the legacy tls block", err.Error())
+	}
+}
+
+// TestControlDataPlaneLegacyTLSUnchanged: the DATA plane still CONSUMES its
+// own top-level tls block (enabled + cert/key) exactly as before — the
+// migration guard is control-only and must not break data.yaml.
+func TestControlDataPlaneLegacyTLSUnchanged(t *testing.T) {
+	certPath, keyPath := writePairFiles(t)
+	path := writeTempConfig(t, fmt.Sprintf(`
+listen:
+  addr: ":3306"
+tls:
+  enabled: true
+  cert_file: %q
+  key_file: %q
+`, filepath.ToSlash(certPath), filepath.ToSlash(keyPath)))
+	cfg, err := LoadData(path)
+	if err != nil {
+		t.Fatalf("LoadData(%q) error: %v (data plane legacy tls must keep loading)", path, err)
+	}
+	if cfg.TLS == nil || !cfg.TLS.Enabled {
+		t.Fatalf("TLS = %+v, want enabled (data plane legacy tls consumed)", cfg.TLS)
+	}
+}
+
 // --- Task 8.7: credential source (config vs api) ---------------------------
 
 // TestCredentialsSourceAPIMode: credentials_source: api parses the

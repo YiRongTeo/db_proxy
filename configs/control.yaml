@@ -239,6 +239,9 @@ db_presets:
 #   bash scripts/gen-dev-cert.sh   → scripts/dev-cert/localhost.{crt,key}
 # Env overrides (PATHS, not secrets — beat this file):
 #   ZT_HTTP_TLS_CERT / ZT_HTTP_TLS_KEY
+# MIGRATION GUARD: a leftover LEGACY control `tls:` block (tls.enabled /
+# tls.cert_file / tls.key_file — the pre-http.tls shape) REFUSES the boot
+# with a load error naming the migration — remove it and use http.tls.
 #http:
 #  tls:
 #    cert_file: "scripts/dev-cert/localhost.crt"

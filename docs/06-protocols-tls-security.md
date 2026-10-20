@@ -31,7 +31,7 @@ flowchart TD
 
 | Surface | Config | Notes |
 |---|---|---|
-| Control plane HTTPS/WSS (`:8080`) | `http.tls.enabled` + cert/key files | API + WS hub + SPA |
+| Control plane HTTPS/WSS (`:8080`) | `http.tls.cert_file` + `key_file` (pair presence is the switch) + **legacy `tls:` block refused** | API + WS hub + SPA |
 | Data-plane wire TLS | `tls.enabled` + cert/key files | MySQL: SSLRequest handshake · PG: `'S'` response · MSSQL: prelogin encryption negotiation |
 | Valkey connection | `valkey.ssl.*` | direct and sentinel modes |
 | Valkey sentinel auth | `valkey.sentinel_password` | sentinel's own `requirepass`, independent of the master's `valkey.password`. Sentinels have **no ACL users** — a username is never sent (`AUTH <password>` only) |

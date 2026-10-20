@@ -322,6 +322,10 @@ The **presence of the pair is the switch** — there is no `enabled` flag:
 - EXACTLY ONE set → the plane **refuses to start** (load error naming the missing half).
 - Files must be readable at boot — a broken pair is a load error (fail fast), and the TLS floor
   is **TLS 1.2** (hardcoded; no knob).
+- **Migration guard:** a leftover legacy control `tls:` block (`tls.enabled` / `tls.cert_file` /
+  `tls.key_file` — the shape this feature replaced) is a **load error naming the migration**,
+  even when a valid `http.tls` pair is also present (no silent precedence). The DATA plane's own
+  `tls:` block is unaffected — it still consumes its block for backend wire TLS.
 
 ```yaml
 http:

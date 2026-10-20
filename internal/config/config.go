@@ -469,11 +469,29 @@ func readTLS(v *viper.Viper) (*CertConfig, error) {
 // (AutomaticEnv + the http.tls key path) and are PATHS, not secrets —
 // nothing is ${VAR}-expanded and nothing is committed in configs/.
 //
+// MIGRATION GUARD (fix round 1): the pre-native-TLS control shape was a
+// top-level tls block (tls.enabled / tls.cert_file / tls.key_file) — a
+// shape this loader NO LONGER READS, so an upgrading deployment that kept
+// it would boot PLAINTEXT silently (the security control gone, only
+// tls=false in the log as a tell). Any of the three legacy keys present in
+// the control config is therefore a LOAD ERROR naming the block and the
+// migration path — even when a valid http.tls pair is also set (no silent
+// precedence). Detection goes through viper IsSet on the raw keys, which
+// the control loader reads NOWHERE else; the keys carry no defaults and no
+// BindEnv, so ONLY a config file (or an explicit tls key) can trip the
+// guard — in particular the DATA plane's ZT_TLS_ENABLED env var cannot
+// reach a control key viper does not know. The shared readTLS (the same
+// shape, DATA plane) is deliberately untouched: different consumer, still
+// consumes its tls block for backend wire TLS.
+//
 // When TLS is on, BOTH files must be readable AT LOAD (fail fast) — a
 // broken cert/key surfaces at boot, never at the first browser handshake.
-// The shared readTLS (tls.enabled-gated, still used by the DATA plane)
-// is deliberately untouched: different contract, different consumer.
 func readControlTLS(v *viper.Viper) (*CertConfig, error) {
+	for _, legacy := range []string{"tls.enabled", "tls.cert_file", "tls.key_file"} {
+		if v.IsSet(legacy) {
+			return nil, fmt.Errorf("legacy control tls block detected (key %s) — control TLS moved to the http.tls cert_file/key_file pair in this version; migrate the config (remove tls:) or set ZT_HTTP_TLS_CERT/ZT_HTTP_TLS_KEY", legacy)
+		}
+	}
 	cert := v.GetString("http.tls.cert_file")
 	key := v.GetString("http.tls.key_file")
 	switch {
