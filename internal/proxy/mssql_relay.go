@@ -115,11 +115,18 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 		// + audit), never forwarded. RPCs are classified by proc name: the
 		// known read-only system procs flow, everything else (write-shaped
 		// procs, sp_executesql) is a write.
+		p.log.Warn("PROBE2", "access", s.access, "typ", typ)
 		if s.access == "ro" && (typ == tdsSQLBatch || typ == tdsRPC) {
 			write := false
 			if typ == tdsSQLBatch {
 				if text, ok := decodeMSSQLBatch(payload); ok {
+					text = normalizeTDSBatchText(text)
 					write = isWriteSQL(text)
+					p.log.Warn("PROBE4", "text", text, "write", write)
+				} else {
+					// Unparseable batch on a ro session: fail safe — treat as
+					// a write (the text might hide one we couldn't decode).
+					write = true
 				}
 			} else {
 				if name, ok := decodeMSSQLRPC(payload); ok {
@@ -335,4 +342,36 @@ func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession
 	}
 	s.capture = &mssqlResultCapture{doneLen: doneLen}
 	s.mu.Unlock()
+}
+
+// normalizeTDSBatchText converts a classified batch's text to UTF-8 when it
+// is UTF-16LE (NUL in every odd byte position — how ASCII SQL rides in
+// UCS-2LE, which clients send unless the login negotiated a UTF-8
+// collation). Pure-UTF-8 text (no NULs) passes through unchanged. This
+// exists so the ro write-classifier sees real verbs; it is only used for
+// CLASSIFICATION — the bytes forwarded to the backend are untouched — and
+// is intentionally heuristic.
+func normalizeTDSBatchText(s string) string {
+	if len(s) < 2 || len(s)%2 != 0 {
+		return s
+	}
+	nulOdd := true
+	for i := 1; i < len(s); i += 2 {
+		if s[i] != 0x00 {
+			nulOdd = false
+			break
+		}
+	}
+	if !nulOdd {
+		return s
+	}
+	u16 := make([]uint16, len(s)/2)
+	for i := range u16 {
+		u16[i] = uint16(s[2*i]) | uint16(s[2*i+1])<<8
+	}
+	runes := make([]rune, len(u16))
+	for i, v := range u16 {
+		runes[i] = rune(v)
+	}
+	return string(runes)
 }

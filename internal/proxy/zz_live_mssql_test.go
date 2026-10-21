@@ -254,7 +254,7 @@ func startMSSQLTestProxyLoop(t *testing.T, vs *store.ValkeyStore, logBuf *bytes.
 
 // mssqlLiveToken mints a token for the live backend and registers a
 // cleanup that removes any leftover sess:live record.
-func mssqlLiveToken(t *testing.T, vs *store.ValkeyStore, username string, dbType string) string {
+func mssqlLiveToken(t *testing.T, vs *store.ValkeyStore, username string, dbType string, access ...string) string {
 	t.Helper()
 	token, err := store.NewToken()
 	if err != nil {
@@ -262,6 +262,9 @@ func mssqlLiveToken(t *testing.T, vs *store.ValkeyStore, username string, dbType
 	}
 	tok := models.TokenPayload{Username: username, DBUser: "ro_user",
 		DBIP: "127.0.0.1", DBPort: "1434", DBType: dbType, TicketID: "T-9-2", SessionID: "sid-" + token[len("sess_"):]}
+	if len(access) > 0 && access[0] != "" {
+		tok.Access = access[0]
+	}
 	if err := vs.SetToken(context.Background(), token, tok, time.Minute); err != nil {
 		t.Fatalf("SetToken: %v", err)
 	}

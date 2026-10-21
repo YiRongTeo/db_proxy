@@ -408,8 +408,9 @@ func TestMSSQLRWHoldLiveAdmitsOnWatch(t *testing.T) {
 		t.Errorf("login stream carries %d LOGINACK tokens, want exactly 1", ackCount)
 	}
 
-	// The session is REAL: a batch round-trips.
-	resp := c.sendBatch("SELECT 1")
+	// The session is REAL: a batch round-trips (ALL_HEADERS + UTF-16LE,
+	// like a real sqlcmd client — the live backend rejects bare text).
+	resp := c.sendBatchAllHeaders("SELECT 1")
 	if !bytes.Contains(resp, utf16le("1")) && !bytes.Contains(resp, []byte{0x81}) {
 		t.Fatalf("SELECT 1 after admission: unexpected response % x", resp)
 	}
@@ -424,7 +425,7 @@ func TestMSSQLRWHoldLiveAdmitsOnWatch(t *testing.T) {
 func TestMSSQLRoRelayLiveBlocksWrites(t *testing.T) {
 	vs := proxyTestStore(t)
 	username := fmt.Sprintf("mssql-ro-%d", time.Now().UnixNano())
-	token := mssqlLiveToken(t, vs, username, "mssql")
+	token := mssqlLiveToken(t, vs, username, "mssql", "ro")
 
 	var logBuf bytes.Buffer
 	ln, p := startMSSQLTestProxyP(t, vs, &logBuf, 0)
@@ -442,21 +443,21 @@ func TestMSSQLRoRelayLiveBlocksWrites(t *testing.T) {
 	// ro write: rejected AT THE PROXY. The marker row is NEVER inserted —
 	// verified after the session by a SELECT (the marker must be absent).
 	marker := fmt.Sprintf("ro-never-%d", time.Now().UnixNano())
-	blocked := c.sendBatch(fmt.Sprintf("INSERT INTO demo_items (id, name) VALUES (999001, '%s')", marker))
+	blocked := c.sendBatchAllHeaders(fmt.Sprintf("INSERT INTO demo_items (id, name) VALUES (999001, '%s')", marker))
 	errResp := extractErrorMsg(blocked)
 	if !strings.Contains(errResp, "read-only") {
-		t.Fatalf("INSERT on a ro session: error = %q, want the read-only message (resp % x)", errResp, blocked)
+		t.Fatalf("INSERT on a ro session: error = %q, want the read-only message (resp % x) | PROXY LOG: %s", errResp, blocked, logBuf.String())
 	}
 
 	// ro read: flows to the real backend.
-	got := c.sendBatch("SELECT count(*) FROM demo_items")
+	got := c.sendBatchAllHeaders("SELECT count(*) FROM demo_items")
 	cap := captureMSSQLResponse(got)
 	if cap.status != "ok" {
 		t.Fatalf("SELECT on a ro session: status = %q, want ok (resp % x)", cap.status, got)
 	}
 
 	// The write truly never reached the backend: count the marker rows.
-	check := c.sendBatch(fmt.Sprintf("SELECT count(*) FROM demo_items WHERE name = '%s'", marker))
+	check := c.sendBatchAllHeaders(fmt.Sprintf("SELECT count(*) FROM demo_items WHERE name = '%s'", marker))
 	capCheck := captureMSSQLResponse(check)
 	if len(capCheck.rows) != 1 || capCheck.rows[0][0] != "0" {
 		t.Fatalf("marker rows = %v, want 0 — the INSERT REACHED THE BACKEND", capCheck.rows)
