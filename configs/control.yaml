@@ -285,3 +285,25 @@ audit:
     user: "root"            # dev container root (RUN.md §1.2); needs CREATE DATABASE — use a dedicated user in prod
     password: ""            # NO SECRETS IN COMMITTED CONFIGS — set ZT_AUDIT_MYSQL_PASSWORD in .env (see .env.example); empty = plane refuses to start when enabled
     database: "zt_audit"
+# --- DB-driven data-plane routing (node-integration Task 5) ---------------
+# When enabled, POST /api/token looks up WHICH data server to hand the
+# client from the data_plane_routes table (color + least-loaded) instead of
+# the single api.data_plane_host/port above. The lookup DSN is the audit
+# block above when audit.mysql.enabled — no separate connection — or a
+# routing.mysql block with the same five fields. Enabled with NO resolvable
+# DSN is a LOAD ERROR (fail fast, never boot into silent fallback).
+# DISABLED by default: byte-identical legacy single-plane behavior (G3).
+# The SELECTION LOGIC is not config: it is ONE query at the top of
+# internal/api/dataplane_routing.go — "TUNE THIS QUERY" — edit it to change
+# selection (docs/11-node-integration.md §11.13 for the table DDL +
+# flip/drain procedures).
+# Env: ZT_ROUTING_ENABLED / ZT_ROUTING_COLOR / ZT_ROUTING_MYSQL_*.
+routing:
+  enabled: false
+  color: "blue"
+  # mysql: {}              # optional dedicated lookup DB (enabled by its presence):
+  #   host: "127.0.0.1"
+  #   port: "3307"
+  #   user: "root"
+  #   password: ""          # set ZT_ROUTING_MYSQL_PASSWORD in .env — never here
+  #   database: "zt_audit"

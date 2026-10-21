@@ -175,8 +175,14 @@ type ControlConfig struct {
 	MaxSessionSeconds int
 	DataPlaneHost     string
 	DataPlanePort     string
-	AuthUser          string
-	AuthPassword      string
+	// Routing (Task 5, node-integration append) is the DB-driven
+	// data-plane routing block: when Enabled, /api/token looks up the
+	// data plane from data_plane_routes on the routing MySQL (color +
+	// least-loaded), falling back to DataPlaneHost/Port on ANY failure.
+	// Disabled (the default) = byte-identical legacy behavior (G3).
+	Routing      RoutingConfig
+	AuthUser     string
+	AuthPassword string
 	// AuthRole (yaml auth.role, env ZT_AUTH_ROLE; JWT conversion Task 2) is
 	// the PRIMARY account's role: "maker" or "checker". REQUIRED whenever
 	// auth.jwt.login_enabled is true — explicit over default, no silent
@@ -381,6 +387,36 @@ type AuditConfig struct {
 	MySQL MySQLAuditConfig `mapstructure:"mysql"`
 }
 
+// RoutingConfig (Task 5, node-integration append) is the `routing` block of
+// configs/control.yaml. Color names the deployment color this plane routes
+// to (blue/green; env ZT_ROUTING_COLOR, default "blue"). Enabled (env
+// ZT_ROUTING_ENABLED, default FALSE) flips /api/token from the single
+// configured data plane to a per-mint lookup in the data_plane_routes table
+// — G3: absent = byte-identical legacy behavior. MySQL is the OPTIONAL
+// dedicated lookup DB block (same fields as audit.mysql; enabled implied by
+// its presence) — routing prefers the audit block when audit.mysql.enabled
+// is true (ONE database for audit + routing), so this stays nil in the
+// reuse case.
+type RoutingConfig struct {
+	Enabled bool              `mapstructure:"enabled"`
+	Color   string            `mapstructure:"color"`
+	MySQL   *MySQLAuditConfig `mapstructure:"mysql"`
+}
+
+// RoutingMySQL resolves the lookup DSN for routing: the routing.mysql block
+// when present, else the audit block when audit.mysql.enabled is true.
+// ok=false means NO usable DSN — LoadControl refuses to boot with routing
+// enabled in that state (fail fast naming the requirement).
+func (c *ControlConfig) RoutingMySQL() (MySQLAuditConfig, bool) {
+	if c.Routing.MySQL != nil {
+		return *c.Routing.MySQL, true
+	}
+	if c.Audit.MySQL.Enabled {
+		return c.Audit.MySQL, true
+	}
+	return MySQLAuditConfig{}, false
+}
+
 // DBPreset is one selectable database target in the Maker portal.
 // json tags keep the /api/db-presets wire contract snake_case (spec §5);
 // mapstructure tags are used by viper when reading configs/control.yaml.
@@ -580,6 +616,57 @@ func readAudit(v *viper.Viper) (AuditConfig, error) {
 	return a, nil
 }
 
+// readRouting reads the routing block through the same viper instance that
+// read the file (env overrides resolve consistently; AutomaticEnv maps
+// ZT_ROUTING_* because the defaults below register the keys). Color defaults
+// to "blue"; Enabled defaults to FALSE (G3: absent = byte-identical single
+// data-plane behavior). When enabled, a usable MySQL lookup DSN is REQUIRED:
+// the dedicated routing.mysql block, else the audit block when
+// audit.mysql.enabled — none resolvable is a load error naming the
+// requirement, so an operator who enables routing never boots silently into
+// permanent fallback.
+func readRouting(v *viper.Viper) (RoutingConfig, error) {
+	rc := RoutingConfig{
+		Enabled: v.GetBool("routing.enabled"),
+		Color:   v.GetString("routing.color"),
+	}
+	if rc.Color == "" {
+		rc.Color = "blue"
+	}
+	if v.IsSet("routing.mysql") {
+		rc.MySQL = &MySQLAuditConfig{
+			Enabled:  true, // implied by the block's presence
+			Host:     v.GetString("routing.mysql.host"),
+			Port:     v.GetString("routing.mysql.port"),
+			User:     v.GetString("routing.mysql.user"),
+			Password: v.GetString("routing.mysql.password"),
+			Database: v.GetString("routing.mysql.database"),
+		}
+	}
+	if !rc.Enabled {
+		return rc, nil // parked config: a DSN-less disabled block is not an error
+	}
+	if rc.MySQL != nil {
+		for _, f := range []struct{ name, val string }{
+			{"routing.mysql.host", rc.MySQL.Host},
+			{"routing.mysql.port", rc.MySQL.Port},
+			{"routing.mysql.user", rc.MySQL.User},
+			{"routing.mysql.password", rc.MySQL.Password},
+			{"routing.mysql.database", rc.MySQL.Database},
+		} {
+			if f.val == "" {
+				return RoutingConfig{}, fmt.Errorf("routing enabled with routing.mysql requires %s", f.name)
+			}
+		}
+		return rc, nil
+	}
+	// No routing.mysql block: the audit block is the intended DSN source.
+	if v.GetBool("audit.mysql.enabled") {
+		return rc, nil
+	}
+	return RoutingConfig{}, fmt.Errorf("routing.enabled=true requires a MySQL lookup DSN: set audit.mysql.enabled=true (reuse the audit database) or provide a routing.mysql block")
+}
+
 // LoadControl reads the Control Plane config (configs/control.yaml).
 // Secrets come from the environment (.env via LoadDotEnv or exported
 // variables), never from the committed file — see dotenv.go.
@@ -619,6 +706,11 @@ func LoadControl(path string) (*ControlConfig, error) {
 		"audit.mysql.host":     "127.0.0.1",
 		"audit.mysql.port":     "3307",
 		"audit.mysql.database": "zt_audit",
+		// Task 5 (node-integration append) data-plane routing: OFF by
+		// default (G3 byte-identical); color defaults to blue. Env:
+		// ZT_ROUTING_ENABLED / ZT_ROUTING_COLOR / ZT_ROUTING_MYSQL_*.
+		"routing.enabled": false,
+		"routing.color":   "blue",
 	}); err != nil {
 		return nil, err
 	}
@@ -627,6 +719,10 @@ func LoadControl(path string) (*ControlConfig, error) {
 		return nil, err
 	}
 	auditCfg, err := readAudit(v)
+	if err != nil {
+		return nil, err
+	}
+	routingCfg, err := readRouting(v)
 	if err != nil {
 		return nil, err
 	}
@@ -656,6 +752,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		SessionTTL: v.GetInt("auth.session_ttl_hours"),
 		TLS:        tlsCfg,
 		Audit:      auditCfg,
+		Routing:    routingCfg,
 	}
 	// --- Auth validation (JWT conversion Task 2) ---
 	// Review round 3 fail-fast retained: AutomaticEnv is set, so an empty

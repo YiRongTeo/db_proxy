@@ -62,6 +62,14 @@ type TokenPayload struct {
 	// The password NEVER rides the payload; it lives only in the ztcred:
 	// key with the token's own TTL.
 	CredOverride bool `json:"cred_override,omitempty"`
+	// DataPlane (Task 5, node-integration append) is the data plane this
+	// mint points at ("host:port") when DB-driven routing chose one —
+	// stamped by the Control Plane at issue time from the data_plane_routes
+	// lookup (color + least-loaded). Absent (omitempty) when routing is
+	// disabled: the single configured data_plane_host/port is implicit
+	// legacy behavior (G3 byte-identical payloads). The mint response's
+	// host/port always carries the same values.
+	DataPlane string `json:"data_plane,omitempty"`
 }
 
 // NormalizeIP canonicalizes a client address host for session-token IP

@@ -74,7 +74,7 @@ func writeServeCertPair(t *testing.T) (string, string) {
 func TestServeControlPlainHTTP(t *testing.T) {
 	cfg, vs := newServeTestCfg(t, nil)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil)
+	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil, nil)
 	if err != nil {
 		t.Fatalf("serveControl: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestServeControlHTTPS(t *testing.T) {
 	certPath, keyPath := writeServeCertPair(t)
 	cfg, vs := newServeTestCfg(t, &config.CertConfig{Enabled: true, CertFile: certPath, KeyFile: keyPath})
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil)
+	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil, nil)
 	if err != nil {
 		t.Fatalf("serveControl: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestServeControlTLSFloor(t *testing.T) {
 	certPath, keyPath := writeServeCertPair(t)
 	cfg, vs := newServeTestCfg(t, &config.CertConfig{Enabled: true, CertFile: certPath, KeyFile: keyPath})
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil)
+	addr, stop, err := serveControl(context.Background(), log, cfg, vs, nil, nil)
 	if err != nil {
 		t.Fatalf("serveControl: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestServeControlTLSSetupFailFast(t *testing.T) {
 	}
 	cfg, vs := newServeTestCfg(t, &config.CertConfig{Enabled: true, CertFile: certPath, KeyFile: keyPath})
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	_, stop, err := serveControl(context.Background(), log, cfg, vs, nil)
+	_, stop, err := serveControl(context.Background(), log, cfg, vs, nil, nil)
 	if err == nil {
 		stop()
 		t.Fatal("serveControl: want error for unreadable key file, got nil (would fall back to plaintext)")

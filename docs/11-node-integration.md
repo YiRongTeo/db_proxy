@@ -375,3 +375,90 @@ browsers, and forwards **plain HTTP to the controls** — the control plane keep
 browser reaches the Go process **directly** (single-node deployments, dev, or an LB pass-through
 mode); between the LB and the controls, network-level isolation is the trust boundary, exactly
 as for the existing plaintext data-plane hops.
+
+## 11.13 DB-driven data-plane routing (blue/green at token mint)
+
+By default every mint hands the client the single `api.data_plane_host` / `api.data_plane_port`
+pair from `configs/control.yaml`. With the `routing` block **enabled**, each `POST /api/token`
+instead asks a MySQL table **which data server to point at** and returns that plane in the mint
+response (`host` / `port`) — selection by **deployment color + least-loaded**, evaluated at
+mint time. Disabled (the default) the behavior is byte-identical to before.
+
+### Selection semantics
+
+- **One row wins**: the eligible row with the LOWEST `activesessions` (ties broken randomly)
+  for the configured `routing.color`.
+- **Eligibility guards**: `proxytype='DB'`, `environment='PROD'`, the row's
+  `deploymentcolor` must equal the active color, `activesessions < maxsessions`
+  (capacity), and `lastheartbeat` within the last 30 seconds (liveness).
+- **URL normalization**: the row's `url` (`https://fqdn:port`) is parsed — scheme must be
+  http/https and an explicit port 1–65535 must be present, or the row is **skipped**.
+  Malformed `activesessions`/`maxsessions` (negative, zero cap, over capacity) also skip the
+  row. A token is NEVER minted against an unvalidated host/port.
+- **Failure isolation (load-bearing)**: lookup DB unreachable, zero eligible rows, or any
+  error → the mint **still succeeds 200** with the configured `api.data_plane_host/port` and
+  a WARN log naming the reason. The routing DB can never fail a mint.
+- **Cache**: lookups are cached per color for 5 seconds (mints within the TTL share one
+  SELECT; a color flip therefore takes effect within ~5s).
+- **Audit trail**: the chosen plane is stamped into the stored token payload as
+  `data_plane` ("host:port") and into the `token issued` log line — trace every mint to its
+  plane with `grep '"data_plane"'` on the control log. (When routing falls back, the payload
+  carries no `data_plane` — the configured plane is implicit.)
+
+### Lookup database
+
+The lookup runs on the **same MySQL server as session audit** when `audit.mysql.enabled: true`
+(no second connection); otherwise give `routing.mysql` the same five fields. The
+`data_plane_routes` table is auto-created at boot (idempotent) with the owner's schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS data_plane_routes (
+  hostname        VARCHAR(255) NOT NULL,
+  proxytype       VARCHAR(16)  NOT NULL,
+  url             VARCHAR(512) NOT NULL,
+  ipaddress       VARCHAR(64),
+  environment     VARCHAR(32),
+  country         VARCHAR(32),
+  lastheartbeat   DATETIME,
+  deploymentcolor VARCHAR(16),
+  maxsessions     INT,
+  activesessions  INT,
+  PRIMARY KEY (hostname)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+Boot log on success: `routing table ready rows=N color=blue tune=internal/api/dataplane_routing.go routeSelectQuery ...`
+
+### Tuning the selection query
+
+The selection is **one query string constant** — deliberately NOT a config key. Open
+`internal/api/dataplane_routing.go` and edit `routeSelectQuery` at the top ("TUNE THIS QUERY
+to change data-server selection"). The contract: exactly one `?` parameter (the active
+color), returning exactly two columns — `hostname, url`. Everything else (extra WHERE
+guards, different ORDER BY, maintenance windows, regional preferences) is fair game; the
+Go-side URL/number validation and the fallback continue to apply whatever the query returns.
+
+### Config
+
+```yaml
+routing:
+  enabled: true        # ZT_ROUTING_ENABLED (default false)
+  color: "blue"        # ZT_ROUTING_COLOR (default "blue")
+  # mysql:             # optional dedicated lookup DB — omit to reuse audit.mysql
+  #   host/port/user/password/database
+```
+
+`routing.enabled: true` with neither `audit.mysql.enabled` nor a `routing.mysql` block is a
+**load error** — the plane refuses to start rather than silently routing everything to the
+fallback forever.
+
+### Ops: color flip / drain a plane
+
+1. **Flip blue → green**: `UPDATE data_plane_routes SET deploymentcolor='green' WHERE hostname IN (...)`
+   (or flip `ZT_ROUTING_COLOR=green` and restart, to move the whole plane). New mints pick the
+   green rows within the 5s cache TTL; existing tokens keep the plane minted into their payload.
+2. **Drain a plane (zero-downtime)**: set its rows' `activesessions = maxsessions` (capacity
+   guard excludes them from selection) or stop the heartbeat (`lastheartbeat` ages past 30s).
+   Restore by refreshing the heartbeat and resetting the counters.
+3. **Verify**: watch the mint log — `data_plane` in every `token issued` line — or
+   `SELECT hostname, activesessions, lastheartbeat FROM data_plane_routes WHERE deploymentcolor='green'`.

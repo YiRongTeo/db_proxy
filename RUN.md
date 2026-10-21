@@ -1034,6 +1034,37 @@ the go-mysql client → `tokens_validated_total +1`, `queries_total{select,ok} +
 +1`; gated `INSERT` → `gate_blocks_total{mysql} +1` AND `queries_total{insert,error} +1`;
 bogus token → `tokens_rejected_total{reason=invalid} +1`, `connections_total{rejected} +1`.
 
+### 2.7 DB-driven data-plane routing (node-integration Task 5)
+
+Optional mint-time blue/green: with `routing.enabled: true` every `POST /api/token` picks the
+data server from the `data_plane_routes` table (color + least `activesessions`, 30s heartbeat,
+capacity guard) instead of the fixed `api.data_plane_host/port`. Full contract, table DDL and
+tuning guide: **docs/11-node-integration.md §11.13**. The lookup DB is the AUDIT MySQL when
+`audit.mysql.enabled: true` — enable audit first (§2.5) and routing reuses it, no second
+connection. Routing enabled with NO resolvable DSN refuses to boot (load error).
+
+```bash
+# 1. Flip color blue → green (the data_plane_routes rows decide; effect within the 5s cache TTL)
+docker exec mysql-test mysql -uroot -proot_pw -e \
+  "UPDATE zt_audit.data_plane_routes SET deploymentcolor='green' WHERE hostname LIKE 'db-%';"
+
+# 2. Drain a plane (zero-downtime): capacity guard excludes it from selection
+docker exec mysql-test mysql -uroot -proot_pw -e \
+  "UPDATE zt_audit.data_plane_routes SET activesessions = maxsessions WHERE deploymentcolor='blue';"
+
+# 3. Verify per mint — the control log line carries the chosen plane:
+#    ... msg="token issued" ... data_plane=db-green1.internal:3307
+pm2 logs zt-control --lines 50 --nostream | grep '"data_plane"'
+
+# 4. Restore the drained plane (fresh heartbeat + counters) or flip colors back.
+```
+
+Notes: mint responses (`host`/`port` fields) and the stored payload (`data_plane`) carry the
+chosen plane; on ANY routing failure the mint falls back to the configured
+`api.data_plane_host/port` with a WARN (`routing lookup failed; falling back`) — a routing DB
+outage never blocks a mint. The selection query itself is ONE constant in
+`internal/api/dataplane_routing.go` (`routeSelectQuery` — "TUNE THIS QUERY"), not a config key.
+
 ---
 
 ## 3. Issue a token (curl)

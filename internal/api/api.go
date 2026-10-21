@@ -42,7 +42,20 @@ type api struct {
 	// (fixed-window per-key counters, wired in NewAPI).
 	loginLimiter *rateLimiter
 	issueLimiter *rateLimiter
+
+	// Task 5 (node-integration append): the DB-driven route source, nil
+	// unless the plane booted with routing enabled (cmd/control wires it
+	// from cfg.RoutingMySQL). chooseRoute checks cfg.Routing.Enabled AND
+	// this field — tests inject a stub here (RouteSource seam). Exported
+	// SETTER only: the api type stays internal, but cmd/control must wire
+	// the production source after NewAPI.
+	routeSource RouteSource
 }
+
+// SetRouteSource wires the production RouteSource (nil = routing
+// effectively off even when cfg.Routing.Enabled — every mint then takes
+// the config fallback, which chooseRoute treats as the disabled shape).
+func (a *api) SetRouteSource(rs RouteSource) { a.routeSource = rs }
 
 // NewAPI builds the Control Plane API with its dependencies. aw is the
 // session-audit writer (nil when audit is disabled — all hooks no-op).

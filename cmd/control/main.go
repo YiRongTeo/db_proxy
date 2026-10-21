@@ -65,8 +65,9 @@ func storeOptions(vc config.ValkeyConfig) (store.StoreOptions, error) {
 // cert or key) is returned as an ERROR so the boot fails fast — never a
 // silent plaintext fallback. Run-loop errors after a successful bind surface
 // the same way (the caller decides to exit; ErrServerClosed is nil-ed).
-func serveControl(ctx context.Context, log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, aw *audit.Writer) (string, func(), error) {
+func serveControl(ctx context.Context, log *slog.Logger, cfg *config.ControlConfig, vs *store.ValkeyStore, aw *audit.Writer, rs api.RouteSource) (string, func(), error) {
 	apiSrv := api.NewAPI(log, cfg, vs, aw)
+	apiSrv.SetRouteSource(rs)
 	if aw != nil {
 		// Consume the hub's queries:sess:* lifecycle events (started/ended)
 		// into the audit writer for the process lifetime.
@@ -178,9 +179,40 @@ func main() {
 		log.Info("session audit enabled", "host", cfg.Audit.MySQL.Host,
 			"port", cfg.Audit.MySQL.Port, "database", cfg.Audit.MySQL.Database)
 	}
+	// Task 5 (node-integration append) DB-driven data-plane routing: when
+	// routing.enabled resolved true, config has ALREADY guaranteed a usable
+	// lookup DSN (audit reuse or routing.mysql — LoadControl fails fast
+	// otherwise). Open the pool, auto-create data_plane_routes (owner's
+	// schema, idempotent) and boot-log the row count + the tuning surface.
+	// FAIL FAST: an operator who enabled routing must not boot into silent
+	// permanent fallback; runtime lookup failures stay non-fatal (WARN +
+	// config fallback per mint).
+	var rs api.RouteSource
+	if cfg.Routing.Enabled {
+		rdb, routeSrc, err := api.OpenRouteSource(cfg)
+		if err != nil {
+			log.Error("routing mysql", "err", err)
+			os.Exit(1)
+		}
+		defer rdb.Close()
+		ctxRT, cancelRT := context.WithTimeout(ctx, 10*time.Second)
+		if err := routeSrc.EnsureTable(ctxRT); err != nil {
+			cancelRT()
+			log.Error("routing table", "err", err)
+			os.Exit(1)
+		}
+		cancelRT()
+		n, err := routeSrc.CountRows(ctx)
+		if err != nil {
+			n = -1 // count is log-only; never boot-blocking past the ping above
+		}
+		log.Info("routing table ready", "rows", n, "color", cfg.Routing.Color,
+			"tune", api.RouteSelectQueryDoc)
+		rs = routeSrc
+	}
 	// Native TLS: serveControl fails fast on a broken listener — TLS setup
 	// errors exit the process, they never fall back to plaintext.
-	_, stop, err := serveControl(ctx, log, cfg, vs, aw)
+	_, stop, err := serveControl(ctx, log, cfg, vs, aw, rs)
 	if err != nil {
 		// Fail fast (Review 9.9c): a bind/serve failure must exit the
 		// process — never fall back to plaintext, never block on <-stop.

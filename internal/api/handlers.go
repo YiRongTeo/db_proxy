@@ -386,6 +386,16 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// token mode); >0 overrides it for sessions opened with this token.
 		IdleSeconds: req.IdleSeconds,
 	}
+	// Task 5 (node-integration append) DB-driven routing: resolve the data
+	// plane for THIS mint. Routing disabled (default) → the configured
+	// plane, byte-identical legacy behavior (G3, no data_plane stamped).
+	// Enabled → color + least-loaded lookup with ANY failure falling back
+	// to the config plane (a routing failure NEVER fails a mint). The
+	// choice rides the payload (data_plane) and the token-issued log line.
+	route := a.chooseRoute(r.Context(), a.routeSource, a.cfg.Routing.Color)
+	if !route.Fallback {
+		payload.DataPlane = route.DataPlane
+	}
 	// Stamps only what the mint carried: ExpiresAt is informational (the
 	// tok: TTL below is the enforcement); CredOverride sends the data
 	// plane to ztcred:<sid> FIRST — the password NEVER rides the payload,
@@ -477,12 +487,13 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	a.auditUpsertPending(r.Context(), &payload, loginSID)
 	a.log.Info("token issued", "username", payload.Username, "db_user", payload.DBUser,
 		"db_type", payload.DBType, "ticket", payload.TicketID, "access", payload.Access,
-		"session_id", payload.SessionID)
+		"session_id", payload.SessionID,
+		"data_plane", route.DataPlane) // Task 5: the plane this mint points at (config fallback included)
 	writeJSON(w, http.StatusOK, models.TokenResponse{
 		Token:     token,
 		SessionID: payload.SessionID,
-		Host:      a.cfg.DataPlaneHost,
-		Port:      a.cfg.DataPlanePort,
+		Host:      route.Host,
+		Port:      route.Port,
 		ExpiresIn: expiresIn,
 		// The absolute expiry (unix seconds) — the end_time instant when
 		// one was given; omitted otherwise.
