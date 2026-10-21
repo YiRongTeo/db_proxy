@@ -472,6 +472,11 @@ CREATE TABLE IF NOT EXISTS data_plane_routes (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
+> **Pre-existing tables are left untouched** by the idempotent `CREATE TABLE IF NOT EXISTS` —
+> e.g. a dev table extended with `port VARCHAR(8)` + `enabled TINYINT DEFAULT 1` and
+> `PRIMARY KEY (hostname, port)` keeps those columns (the gateway reads only `hostname` and
+> `url` via the selection query, so both variants work).
+
 Boot log on success: `routing table ready rows=N color=blue tune=internal/api/dataplane_routing.go routeSelectQuery ...`
 
 ### Tuning the selection query

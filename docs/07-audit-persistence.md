@@ -23,13 +23,37 @@ flowchart LR
 
 ## Schema (`zt_audit.sessions`)
 
+Full DDL — this is exactly what the control plane auto-creates on boot (`internal/audit/audit.go`, `tableColumns`):
+
+```sql
+CREATE TABLE `sessions` (
+  `id`               BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `session_id`       VARCHAR(64)  NOT NULL,                        -- sid-…, UNIQUE — the upsert key
+  `username`         VARCHAR(128) NOT NULL,                        -- maker's username (pinned: never overwritten)
+  `ticket_id`        VARCHAR(128) NOT NULL DEFAULT '',
+  `db_type`          VARCHAR(16)  NOT NULL DEFAULT '',
+  `db_user`          VARCHAR(128) NOT NULL DEFAULT '',             -- backend account name
+  `db`               VARCHAR(128) NOT NULL DEFAULT '',             -- database, filled at connection time
+  `access`           VARCHAR(8)   NOT NULL DEFAULT 'read',         -- ro | rw (explicit tokens), ro (preset read, migrated), read | write (legacy presets)
+  `checker_username` VARCHAR(128) NULL,                            -- current watcher — NULL when no checker is connected
+  `status`           VARCHAR(16)  NOT NULL DEFAULT 'pending',      -- pending → active → ended
+  `started_at`       DATETIME(3)  NULL,                            -- data-plane 'started' event
+  `ended_at`         DATETIME(3)  NULL,                            -- 'ended' event or sweeper expiry
+  `login_session_id` VARCHAR(128) NULL,                            -- (Phase 2b) IdP login session id — trace to the requesting login; NULL for local logins; distinct from session_id and never used for revocation
+  `last_seen`        DATETIME(3)  NOT NULL,                        -- stamped by every writer touch
+  `created_at`       DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX `idx_status`   (`status`),
+  INDEX `idx_username` (`username`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
 | Column | Meaning |
 |---|---|
 | `session_id` | Unique (`sid-…`) — the upsert key |
 | `username` | **Maker's** username (pinned: never overwritten by later updates) |
 | `ticket_id` | The approval ticket |
 | `db_type` / `db_user` / `db` | Target database details |
-| `access` | `read` / `write` |
+| `access` | `ro` / `rw` (explicit `access` field on the mint; `read`/`write` accepted as aliases), `ro` for preset-read tokens (migrated), `read` / `write` for legacy presets |
 | `checker_username` | The **current** watcher — `NULL` when no checker is connected |
 | `status` | `pending` → `active` → `ended` |
 | `started_at` / `ended_at` | Session open/close timestamps (`DATETIME(3)`) |
@@ -37,6 +61,8 @@ flowchart LR
 | `last_seen` / `created_at` | Heartbeat/insertion timestamps |
 
 The table (and database) are created automatically on startup when the feature is enabled. Existing tables (pre-Phase 2b) get the `login_session_id` column added automatically at startup (idempotent information_schema probe + `ALTER TABLE`).
+
+The routing source table `zt_audit.data_plane_routes` (same MySQL server, auto-created) is documented with its DDL in [Page 11 — Node Integration](11-node-integration.md).
 
 ## Lifecycle mapping
 
