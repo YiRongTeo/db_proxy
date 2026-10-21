@@ -190,6 +190,22 @@ func (p *OracleProxy) handleConn(client net.Conn) {
 		p.log.Warn("oracle: "+msg, "client", clientAddr)
 		return
 	}
+	// Fix round 1 (CRITICAL-3): close the rw-oracle bypass. The other
+	// planes enforce access "rw" by HOLDING the session until a checker
+	// watches; the oracle plane has NO hold point (the TNS login is
+	// replayed from captured responses and the backend session opens in
+	// one shot — there is no place to park the client that a TNS client
+	// would tolerate), so an rw-oracle token here would open the backend
+	// with NO checker gate at all — a silent bypass of the entire
+	// maker-checker model. Fail CLOSED with a named refusal instead: the
+	// token is already consumed (GETDEL), the client's login dies at the
+	// pre-connect point, and the log names the knob.
+	if tok.Access == "rw" {
+		p.metrics.TokensRejected("oracle_rw_unsupported")
+		p.log.Warn("oracle: rw access refused — no checker hold exists on the oracle plane; mint with a preset access:write token or wait for the TNS-phase hold",
+			"client", clientAddr, "db_user", tok.DBUser)
+		return
+	}
 	ctx, cancel = storeCallCtx()
 	// OverrideCreds: a CredOverride token resolves its password from
 	// ztcred:<sid> first — same contract as the other protocols.

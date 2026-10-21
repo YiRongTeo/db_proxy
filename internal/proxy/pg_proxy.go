@@ -427,6 +427,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// record removed). A watcher detaching after admission never kills the
 	// session.
 	var front *pgFrontend
+	admitted := false
 	if tok.Access == "rw" {
 		sid := tok.SessionID
 		if sid == "" {
@@ -434,26 +435,11 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		}
 		heldTok := *tok
 		heldTok.SessionID = sid
-		clientDied := make(chan struct{})
-		go func() {
-			// Disconnect probe: Peek (NOT Read — a consumed byte would
-			// corrupt the relayed stream). A held client is silent — the
-			// peek hits the conn deadline every cycle; a peer close errors
-			// instantly. Early client data stays buffered for the relay.
-			for {
-				_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
-				if _, err := br.Peek(1); err != nil {
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue // silent — still held, still alive
-					}
-					break // disconnected
-				}
-				_ = client.SetReadDeadline(time.Time{})
-			}
-			close(clientDied)
-		}()
+		clientDied, probeStop, probeExited := startHoldClientProbe(client, br)
 		welcome := func() error {
 			// The full PG welcome sequence — auth completes for the client.
+			// Fix round 1 (CRITICAL-1): this is THE welcome for a held
+			// session — the post-admission block below sends nothing.
 			if err := be.Send(&pgproto3.AuthenticationOk{}); err != nil {
 				return err
 			}
@@ -470,10 +456,10 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 				return err
 			}
 			// BackendKeyData carries zeros here — the real pid is captured
-			// after admission (capturePGThreadID below) and the welcome
-			// block there re-sends nothing: PG clients read the key data
-			// once; the zeros degrade cancel only until reconnect (the
-			// same degrade rule as a failed pid capture).
+			// after admission (capturePGThreadID below) and NO second
+			// welcome follows: PG clients read the key data once; the
+			// zeros degrade cancel only until reconnect (the same degrade
+			// rule as a failed pid capture).
 			if err := be.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}); err != nil {
 				return err
 			}
@@ -487,7 +473,15 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		if err != nil {
 			return // the hold logged + cleaned the pending record
 		}
+		// Fix round 1 (CRITICAL-1 + CRITICAL-2): stop the Peek probe and
+		// clear its deadline BEFORE the relay inherits the conn, and do
+		// NOT re-send the welcome below — the hold's welcome was THE
+		// login success (the old second welcome was the double-login
+		// bug). Registration + pid capture run here, then the relay
+		// starts with the client still having seen exactly ONE welcome.
+		stopHoldClientProbe(client, probeStop, probeExited, clientDied)
 		front = pgFrontendForConn(heldFront)
+		admitted = true
 	} else {
 		// 4. backend session with the CLIENT-requested database (PG clients
 		// send it in the STARTUP message — mirror of the MySQL
@@ -552,26 +546,32 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// capture. Each Send is CHECKED (review 2026-08-16): a dead client
 	// aborts the session at the first failed write instead of stranding it
 	// in a half-welcomed state.
-	if err := be.Send(&pgproto3.AuthenticationOk{}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(s.threadID), SecretKey: s.cancelKey}); err != nil {
-		return
-	}
-	if err := be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
-		return
+	// Fix round 1 (CRITICAL-1): the rw hold path already delivered THE
+	// welcome (AuthOk/params/BackendKeyData/ReadyForQuery at hold time);
+	// the old unconditional second welcome re-sent all seven messages on
+	// every held session — a DOUBLE login success. Skipped when admitted.
+	if !admitted {
+		if err := be.Send(&pgproto3.AuthenticationOk{}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(s.threadID), SecretKey: s.cancelKey}); err != nil {
+			return
+		}
+		if err := be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
+			return
+		}
 	}
 	p.metrics.ConnectionsTotal("postgres", "ok")
 	p.metrics.ConnectionsActiveInc("postgres")

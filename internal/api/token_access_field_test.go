@@ -231,21 +231,15 @@ func TestTokenAccessFieldOracleRoRefused(t *testing.T) {
 	// covered by TestTokenAccessFieldOracleRwAllowed below.
 }
 
-// TestTokenAccessFieldOracleRwAllowed: the rw hold needs no SQL
-// classification, so an explicit rw mint for oracle succeeds.
-func TestTokenAccessFieldOracleRwAllowed(t *testing.T) {
-	srv, client, vs, cfg := newAccessFieldTestServer(t)
+// TestTokenAccessFieldOracleRWRefused: oracle has NO hold point and NO
+// classification (TNS capture is Phase 1) — fix round 1 refuses BOTH ro and
+// rw explicit mints for db_type oracle at the mint (an rw-oracle session
+// would silently bypass checker-watched admission).
+func TestTokenAccessFieldOracleRWRefused(t *testing.T) {
+	srv, client, _, cfg := newAccessFieldTestServer(t)
 	client = withBearer(client, mintJWT(t, cfg, testJWTUser, "maker"))
-	ctx := context.Background()
 
-	token := issueToken(t, client, srv.URL, `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1521","db_type":"oracle","ticket_id":"T-6-access","access":"rw"}`)
-	p, err := vs.GetDeleteToken(ctx, token)
-	if err != nil || p == nil {
-		t.Fatalf("GetDeleteToken: p=%v err=%v", p, err)
-	}
-	if p.Access != "rw" {
-		t.Errorf("stored access = %q, want rw", p.Access)
-	}
+	postToken(t, client, srv.URL, `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1521","db_type":"oracle","ticket_id":"T-6-access","access":"rw"}`)
 }
 
 // TestTokenAccessFieldStoredPayloadShape: the stored payload's access stays

@@ -374,6 +374,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// after admission never kills the session). A held client that walks
 	// away exits the hold with NO backend and the pending record removed.
 	var backend net.Conn
+	admitted := false
 	if tok.Access == "rw" {
 		sid := tok.SessionID
 		if sid == "" {
@@ -381,26 +382,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		}
 		heldTok := *tok
 		heldTok.SessionID = sid
-		clientDied := make(chan struct{})
-		go func() {
-			// Disconnect probe: Peek (NOT Read — a consumed byte would
-			// corrupt the relayed stream). A held client is silent — the
-			// peek hits the conn deadline every cycle and the client stays
-			// held; a peer close errors instantly. Early client data (a
-			// protocol-broken early query) counts as liveness and STAYS
-			// buffered for the post-admission relay.
-			for {
-				_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
-				if _, err := br.Peek(1); err != nil {
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue // silent — still held, still alive
-					}
-					break // disconnected
-				}
-				_ = client.SetReadDeadline(time.Time{})
-			}
-			close(clientDied)
-		}()
+		clientDied, probeStop, probeExited := startHoldClientProbe(client, br)
 		heldBackend, err := p.holdRWSession(ctx, client, clientDied,
 			func() error { return writeMySQLPacket(client, authReplySeq, okPacket()) },
 			&heldTok, OverrideCreds(p.creds, tok), database,
@@ -410,7 +392,16 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		if err != nil {
 			return // the hold logged + cleaned the pending record
 		}
+		// Fix round 1 (CRITICAL-1 + CRITICAL-2): stop the Peek probe and
+		// clear its deadline BEFORE the relay inherits the conn — the
+		// probe's rolling 500ms read deadline must never survive
+		// admission. The step-5 OK below is SKIPPED: the hold already
+		// wrote THE login success; the relay-level setup (register +
+		// thread-id capture) happens here instead, and the relay starts
+		// with the client still having seen exactly ONE OK.
+		stopHoldClientProbe(client, probeStop, probeExited, clientDied)
 		backend = heldBackend
+		admitted = true
 	} else {
 		// 4. backend connection (real credentials, client-requested
 		// database). OverrideCreds: a CredOverride token resolves its
@@ -469,8 +460,14 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// 5. OK — session established (seq 2 plaintext / 3 under TLS). Sent
 	// only after register + capture, so the session is fully visible
 	// (killable, thread id known) when the client learns it is up.
-	if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
-		return
+	// Fix round 1 (CRITICAL-1): the rw hold path already delivered THE
+	// login success (the hold's OK at auth time); sending a second OK
+	// here was a DOUBLE login success on every held session. The admitted
+	// path skips this write — the relay-level wiring above is identical.
+	if !admitted {
+		if err := writeMySQLPacket(client, authReplySeq, okPacket()); err != nil {
+			return
+		}
 	}
 	p.metrics.ConnectionsTotal("mysql", "ok")
 	p.metrics.ConnectionsActiveInc("mysql")

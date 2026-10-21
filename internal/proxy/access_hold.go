@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"net"
@@ -202,3 +203,86 @@ func (pub *sessionPublisher) holdRWSession(ctx context.Context, client net.Conn,
 
 // holdClientWatch is per-plane (each plane's handshake read loop already
 // detects disconnect; the planes pass their own death channels).
+
+// startHoldClientProbe arms the Peek-based disconnect probe for a held
+// rw session (the CRITICAL-2 leak fix, shared by all three hold planes).
+// It is EXACTLY the probe loop the planes used to inline, with one
+// addition: probeStop. The probe re-arms a rwHoldPollInterval read
+// deadline on the client conn every cycle; without a stop signal that
+// deadline survives admission and kills the relay read of any client
+// idle longer than 500ms. stopHoldClientProbe MUST run on admission —
+// before the conn is handed to the relay — to stop the goroutine, clear
+// the deadline, and retire the death signal.
+//
+// Conns are expected to honor read deadlines (every real socket does); a
+// deadline-ignoring test conn (net.Pipe) leaves the probe parked inside
+// Peek until its NEXT deadline-setting cycle — stopHoldClientProbe still
+// returns (see below), the conn is handed to the relay deadline-free, and
+// the parked Peek is broken by the first real deadline clearance.
+//
+// The returned probeExited channel closes when the probe goroutine has
+// returned from its loop (on real sockets: fully off the conn).
+func startHoldClientProbe(client net.Conn, br *bufio.Reader) (clientDied chan struct{}, probeStop chan struct{}, probeExited chan struct{}) {
+	died := make(chan struct{})
+	stop := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		// Disconnect probe: Peek (NOT Read — a consumed byte would
+		// corrupt the relayed stream). A held client is silent — the
+		// peek hits the conn deadline every cycle and the client stays
+		// held; a peer close errors instantly. Early client data (a
+		// protocol-broken early query) counts as liveness and STAYS
+		// buffered for the post-admission relay.
+		for stopped := false; !stopped; {
+			// Check the stop signal between cycles so a stop observed
+			// mid-cycle is honored before the next Peek arms.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
+			if _, err := br.Peek(1); err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue // silent — still held, still alive
+				}
+				// disconnected: raise the death signal, then WAIT for
+				// the stop close before leaving. Waiting (instead of
+				// exiting immediately) keeps the stop/exit handshake
+				// total: stopHoldClientProbe closes stop and waits for
+				// exited; whatever order the two goroutines observe the
+				// closes in, exited is always seen after stop.
+				close(died)
+				<-stop
+				return
+			}
+			_ = client.SetReadDeadline(time.Time{})
+		}
+	}()
+	return died, stop, exited
+}
+
+// stopHoldClientProbe tears the probe down at admission and restores the
+// conn to the deadline-free state the relay contract requires. The ORDER
+// is load-bearing: close stop, WAIT for the probe goroutine to return
+// (bounded — the conn honors read deadlines, so its Peek finishes within
+// one rwHoldPollInterval), THEN clear the read deadline. Clearing before
+// the exit would race: the probe's final cycle can arm a fresh 500ms
+// deadline after the clear, and an expired-but-uncleared deadline makes
+// every later read fail instantly — the exact leak this fix removes.
+// The death signal is retired UNLESS the probe already fired it (a
+// genuinely dead client keeps its signal; the hold's select must still
+// see it).
+func stopHoldClientProbe(client net.Conn, probeStop chan<- struct{}, probeExited <-chan struct{}, clientDied chan struct{}) {
+	close(probeStop)
+	<-probeExited
+	_ = client.SetReadDeadline(time.Time{})
+	// Retire the death signal ONLY if the probe never fired.
+	select {
+	case <-clientDied:
+		// already dead — leave the signal for the hold's select
+	default:
+		close(clientDied)
+	}
+}

@@ -390,26 +390,37 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Oracle has NO statement classification (TNS capture is Phase 1):
-		// a ro mint for oracle would be silently unprotected, so it is
-		// REFUSED at the mint with a named 422 — never shipped.
-		if access == "ro" && req.DBType == "oracle" {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use rw or a SELECT-only backend account",
-			})
+		// Task 6 + fix round 1: oracle is structurally EXCLUDED from BOTH
+		// access levels the explicit field can request. ro: no statement
+		// classification exists (TNS Phase-1), so a ro-oracle session
+		// would be silently unprotected. rw: the oracle plane has NO hold
+		// point (the captured-response TNS login opens the backend in one
+		// shot), so an rw-oracle session would skip the checker gate
+		// entirely — the data plane refuses such tokens pre-connect
+		// (fail-closed) and the mint refuses them here, symmetrically.
+		// Preset "write" on oracle keeps the legacy ungated semantics
+		// (SELECT-only service accounts remain the data-side control).
+		if req.DBType == "oracle" && (access == "ro" || access == "rw") {
+			kind := "ro"
+			if access == "rw" {
+				kind = "rw"
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"access %s is not supported for db_type oracle — the gateway cannot hold or classify Oracle sessions yet; use a preset write token or a SELECT-only backend account"}`, kind), http.StatusUnprocessableEntity)
 			return
 		}
 	} else {
 		access = a.accessForPreset(req.DBType, req.DBUser, req.DBIP, string(req.DBPort))
 		// Preset migration: preset "read" now enforces ro (TRUE read-only);
-		// preset "write" keeps the legacy no-gate. The oracle guard above
-		// covers the explicit ro; the migrated preset "read" on oracle gets
-		// the same named refusal.
+		// preset "write" keeps the legacy no-gate. The oracle guard below
+		// covers the migrated ro on oracle — an oracle preset with access
+		// "write" keeps the legacy ungated semantics (no silent protection
+		// claim is made for it in docs).
 		if access == "read" {
 			access = "ro"
 		}
 		if access == "ro" && req.DBType == "oracle" {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use rw or a SELECT-only backend account",
+				"error": "access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use a SELECT-only backend account",
 			})
 			return
 		}

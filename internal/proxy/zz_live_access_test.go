@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -296,4 +298,169 @@ func TestPGRoRelayLiveBlocksWrites(t *testing.T) {
 			return
 		}
 	}
+}
+
+// --- Fix round 1: rw hold LIVE tests for the MSSQL + MSSQL ro relay --------
+
+// TestMSSQLRWHoldLiveAdmitsOnWatch: the full login-phase hold on the live
+// mssql-test backend. The TDS client logs in with an rw token: NOTHING
+// comes back while unwatched (login-phase hold — no synthesized ack), a
+// checker watch admits, the REAL login response arrives, and a batch
+// round-trips. Asserts exactly ONE login success: the login() harness
+// scans tokens until DONE(FINAL) — a duplicated success stream would
+// surface as a second LOGINACK here.
+func TestMSSQLRWHoldLiveAdmitsOnWatch(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	var logBuf bytes.Buffer
+	ln, p := startMSSQLTestProxyP(t, vs, &logBuf, 0)
+	_ = p
+
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	sid := fmt.Sprintf("sid-ms-rw-%d", time.Now().UnixNano())
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "mssql-rw-hold",
+		DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1434", DBType: "mssql",
+		TicketID: "T-6-FIX1", Access: "rw", SessionID: sid}, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	c := dialTDS(t, ln.Addr().String())
+	if enc := c.prelogin(encryptNotSup); enc != encryptNotSup {
+		t.Fatalf("prelogin encryption = %#x, want ENCRYPT_NOT_SUP", enc)
+	}
+	// Send LOGIN7 and read the FIRST message with a short deadline: while
+	// held, the proxy must send NOTHING (the old synthesized ack arrived
+	// here instantly — a success-before-admission fails this test).
+	msg := buildLogin7("tds-test-client", token, "TDS-TEST", "127.0.0.1", "appdb", nil, tdsVersion740, tdsPacketSize)
+	if err := writeTDSPacket(c.conn, tdsLogin7, msg); err != nil {
+		t.Fatalf("login7 write: %v", err)
+	}
+	_ = c.conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	if typ, payload, err := readTDSMessage(c.br); err == nil {
+		t.Fatalf("held MSSQL session answered pre-admission: typ=%#x payload=% x", typ, payload)
+	}
+
+	// The pending directory record is alive while held.
+	raw, rerr := vs.GetSessionLive(ctx, sid)
+	if rerr != nil || raw == nil {
+		t.Fatalf("held session missing from the directory: %v", rerr)
+	}
+	if !bytes.Contains(raw, []byte(`"pending"`)) {
+		t.Errorf("held record = %s, want status pending", raw)
+	}
+
+	// Admit → the REAL login response completes the login.
+	if err := vs.SetWatchConn(ctx, sid, "checker-ms-rw", time.Minute); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	_ = c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var all []byte
+	ok := true
+	done := false
+	for i := 0; i < 8 && !done; i++ {
+		typ, payload, err := readTDSMessage(c.br)
+		if err != nil || typ != tdsTabular {
+			t.Fatalf("login response after admission: typ=%#x err=%v", typ, err)
+		}
+		all = append(all, payload...)
+		var d, o bool
+		d, o, _ = scanLoginResponse(payload)
+		ok = ok && o
+		if d {
+			done = true
+		}
+	}
+	if !done || !ok {
+		t.Fatalf("login after admission: done=%v ok=%v stream=% x", done, ok, all)
+	}
+	// Exactly ONE LOGINACK in the whole stream (the old flow produced the
+	// synthesized one BEFORE admission AND the real one after).
+	ackCount := 0
+	for pos := 0; pos < len(all); {
+		switch all[pos] {
+		case 0xAD:
+			ackCount++
+			if pos+3 > len(all) {
+				pos = len(all)
+			} else {
+				pos += 3 + int(binary.LittleEndian.Uint16(all[pos+1:pos+3]))
+			}
+		case 0xFD, 0xFE, 0xFF:
+			pos += 13
+		case 0xAA, 0xAB, 0xAE, 0xE3, 0xE4:
+			if pos+3 > len(all) {
+				pos = len(all)
+			} else {
+				pos += 3 + int(binary.LittleEndian.Uint16(all[pos+1:pos+3]))
+			}
+		default:
+			pos = len(all)
+		}
+	}
+	if ackCount != 1 {
+		t.Errorf("login stream carries %d LOGINACK tokens, want exactly 1", ackCount)
+	}
+
+	// The session is REAL: a batch round-trips.
+	resp := c.sendBatch("SELECT 1")
+	if !bytes.Contains(resp, utf16le("1")) && !bytes.Contains(resp, []byte{0x81}) {
+		t.Fatalf("SELECT 1 after admission: unexpected response % x", resp)
+	}
+	c.close()
+}
+
+// TestMSSQLRoRelayLiveBlocksWrites: a ro session against the live
+// mssql-test backend — an INSERT batch is answered at the proxy with the
+// read-only ERROR token and NEVER reaches the backend (asserted via the
+// response arriving without any backend round-trip marker), a SELECT
+// flows and returns the backend's data.
+func TestMSSQLRoRelayLiveBlocksWrites(t *testing.T) {
+	vs := proxyTestStore(t)
+	username := fmt.Sprintf("mssql-ro-%d", time.Now().UnixNano())
+	token := mssqlLiveToken(t, vs, username, "mssql")
+
+	var logBuf bytes.Buffer
+	ln, p := startMSSQLTestProxyP(t, vs, &logBuf, 0)
+
+	c := dialTDS(t, ln.Addr().String())
+	if enc := c.prelogin(encryptNotSup); enc != encryptNotSup {
+		t.Fatalf("prelogin encryption = %#x, want ENCRYPT_NOT_SUP", enc)
+	}
+	resp, done, ok := c.login(token, "appdb")
+	if !done || !ok {
+		t.Fatalf("login failed: done=%v ok=%v", done, ok)
+	}
+	_ = resp
+
+	// ro write: rejected AT THE PROXY. The marker row is NEVER inserted —
+	// verified after the session by a SELECT (the marker must be absent).
+	marker := fmt.Sprintf("ro-never-%d", time.Now().UnixNano())
+	blocked := c.sendBatch(fmt.Sprintf("INSERT INTO demo_items (id, name) VALUES (999001, '%s')", marker))
+	errResp := extractErrorMsg(blocked)
+	if !strings.Contains(errResp, "read-only") {
+		t.Fatalf("INSERT on a ro session: error = %q, want the read-only message (resp % x)", errResp, blocked)
+	}
+
+	// ro read: flows to the real backend.
+	got := c.sendBatch("SELECT count(*) FROM demo_items")
+	cap := captureMSSQLResponse(got)
+	if cap.status != "ok" {
+		t.Fatalf("SELECT on a ro session: status = %q, want ok (resp % x)", cap.status, got)
+	}
+
+	// The write truly never reached the backend: count the marker rows.
+	check := c.sendBatch(fmt.Sprintf("SELECT count(*) FROM demo_items WHERE name = '%s'", marker))
+	capCheck := captureMSSQLResponse(check)
+	if len(capCheck.rows) != 1 || capCheck.rows[0][0] != "0" {
+		t.Fatalf("marker rows = %v, want 0 — the INSERT REACHED THE BACKEND", capCheck.rows)
+	}
+	c.close()
+	_ = p
 }

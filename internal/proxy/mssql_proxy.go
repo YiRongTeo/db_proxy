@@ -439,12 +439,15 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	p.metrics.TokensValidated()
 
-	// Task 6 (node-integration): access "rw" — the connection is HELD. The
-	// TDS client's LOGINACK is synthesized proxy-side (a minimal successful
-	// login response — the client believes it is connected), with NO
-	// backend connect and NO credential draw until a checker watches. On
-	// admission connectMSSQLBackend runs (full rw for the session's life —
-	// a watcher detaching after admission never kills the session); a held
+	// Task 6 (node-integration): access "rw" — the connection is HELD. Fix
+	// round 1 (CRITICAL-1): the hold runs in the LOGIN PHASE — before any
+	// login response, the client gets NOTHING (protocol-correct: TDS
+	// clients wait for the login response with no traffic of their own).
+	// On admission the real backend login is performed and its response
+	// relayed at step 7 EXACTLY as the normal path does — so the client
+	// receives exactly ONE login success: the REAL token stream, byte-exact
+	// (the old synthesized ENVCHANGE/LOGINACK before the real response was
+	// a double success AND a malformed ENVCHANGE — both gone). A held
 	// client that walks away exits the hold with no backend and the
 	// pending record removed.
 	var backend net.Conn
@@ -459,31 +462,9 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		}
 		heldTok := *tok
 		heldTok.SessionID = sid
-		clientDied := make(chan struct{})
-		go func() {
-			// Disconnect probe: Peek (NOT Read — a consumed byte would
-			// corrupt the relayed stream). A held client is silent — the
-			// peek hits the conn deadline every cycle; a peer close errors
-			// instantly. Early client data stays buffered for the relay.
-			for {
-				_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
-				if _, err := br.Peek(1); err != nil {
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						continue // silent — still held, still alive
-					}
-					break // disconnected
-				}
-				_ = client.SetReadDeadline(time.Time{})
-			}
-			close(clientDied)
-		}()
-		// Minimal LOGINACK-shaped success: ENVCHANGE (0xE3) with an empty
-		// payload block + LOGINACK (0xAD) + DONE (0xFD, final) — the token
-		// stream every TDS client reads past a successful login. Byte
-		// details per mssql_capture.go token shapes.
-		heldLoginResp := buildTDSHeldLoginAck()
+		clientDied, probeStop, probeExited := startHoldClientProbe(client, br)
 		heldConn, err := p.holdRWSession(ctx, client, clientDied,
-			func() error { return writeTDSMessage(client, tdsTabular, heldLoginResp) },
+			func() error { return nil }, // login-phase hold: no success to send yet
 			&heldTok, OverrideCreds(p.creds, tok), li.database,
 			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
 				bc, bbr, resp, ok, edb, cerr := connectMSSQLBackend(ctx, tok, res, li, p.tlsCfg != nil)
@@ -497,11 +478,15 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 			return // the hold logged + cleaned the pending record
 		}
 		backend = heldConn
+		// Fix round 1 (CRITICAL-2): stop the Peek probe and clear its
+		// rolling deadline BEFORE the relay inherits the conn — a stale
+		// 500ms deadline would kill the relay read of any client idle
+		// longer than one poll interval.
+		stopHoldClientProbe(client, probeStop, probeExited, clientDied)
 		if len(loginResp) == 0 || !loginOK {
-			// Admission happened but the backend refused: the hold already
-			// sent the client a success shape, so the session is now a
-			// zombie — tear it down honestly (close; the client sees the
-			// drop exactly like a backend-gone mid-session).
+			// Admission happened but the backend refused: the client has
+			// seen no success yet (login-phase hold), so this is an honest
+			// login failure on the wire.
 			p.metrics.ConnectionsTotal("mssql", "rejected")
 			p.log.Error("backend connect/login failed after rw admission", "client", clientAddr, "db_user", tok.DBUser)
 			_ = writeTDSMessage(client, tdsTabular, buildLoginError(fmt.Sprintf("Login failed for user '%s': backend unavailable.", token), li.tdsVersion < mssqlLegacyDoneMaxTDSVersion))
@@ -537,8 +522,8 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// preserved verbatim; only the TDS envelope is rebuilt. A backend
 	// rejection ends the attempt here: no session is established and the
 	// backend closes the conn on its own. (rw path: loginOK was checked
-	// above; this write is the real login response replacing the minimal
-	// held ack.)
+	// above; this write IS the client's one and only login success — the
+	// login-phase hold sent nothing before it, so byte-exact-once holds.)
 	if !loginOK {
 		p.metrics.ConnectionsTotal("mssql", "rejected") // Task 9.10: rejection funnel
 		p.log.Warn("backend login rejected", "client", clientAddr, "db_user", tok.DBUser)
@@ -796,32 +781,6 @@ func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
 // it.
 func buildLoginError(msg string, shortDone bool) []byte {
 	return buildTDSErrorToken(msg, 18456, 1, 14, shortDone)
-}
-
-// buildTDSHeldLoginAck is the rw hold's proxy-side login success: a minimal
-// TABULAR token stream a TDS client parses as a successful login — one
-// ENVCHANGE token (0xE3, type 1 = database, empty old/new value blocks),
-// one LOGINACK (0xAD) and a final DONE (0xFD, DONE_FINAL). Built once per
-// held session; the REAL backend login response replaces it after
-// admission (step 7).
-func buildTDSHeldLoginAck() []byte {
-	// ENVCHANGE body: type(1)=0x01 (database) + oldval US_VARCHAR (len 0)
-	// + newval US_VARCHAR (len 0) → 5 bytes total with the token header.
-	envBody := []byte{0x01, 0x00, 0x00}
-	envTok := append([]byte{0xE3, byte(len(envBody)), 0x00}, envBody...)
-	// LOGINACK body: interface(1)=1 (TSQL) + tds version(4, LE 0x04000074)
-	// + procname B_VARCHAR (len 0) + final(1)=0xFD → 7 bytes.
-	ackBody := []byte{0x01, 0x74, 0x00, 0x00, 0x04, 0x00, 0xFD}
-	ackTok := append([]byte{0xAD, byte(len(ackBody)), 0x00}, ackBody...)
-	// DONE: reuse the 13-byte DONE shape with status = DONE_FINAL (LE
-	// 0x0200 → bytes 00 02) and no attention bit.
-	done := buildTDSAttnAck(false)
-	done[1] = 0x00 // status lo: clears DONE_ATTN (0x20)
-	done[2] = 0x02 // status hi: DONE_FINAL (0x0200)
-	out := make([]byte, 0, len(envTok)+len(ackTok)+len(done))
-	out = append(out, envTok...)
-	out = append(out, ackTok...)
-	return append(out, done...)
 }
 
 // buildTDSErrorToken builds a TABULAR RESULT token stream carrying one

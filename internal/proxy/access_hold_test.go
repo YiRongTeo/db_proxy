@@ -2,15 +2,20 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgproto3/v2"
 	"zerotrust-proxy/internal/models"
+	"zerotrust-proxy/internal/store"
 )
 
 // --- Task 6 (node-integration): rw connection HOLD --------------------------
@@ -300,4 +305,505 @@ func TestMySQLRoRelayBlocksWritesForwardsReads(t *testing.T) {
 func readTDSFrameMySQLTest(br *bufio.Reader) (int, []byte, error) {
 	seq, pkt, err := readMySQLPacket(br)
 	return int(seq), pkt, err
+}
+
+// --- Fix round 1 (CRITICAL-2): the Peek probe must not kill the relay -------
+//
+// The probe re-arms a 500ms read deadline on the client conn; if that
+// deadline survived admission, ANY rw client idle >500ms would lose its
+// relay read. After admission the probe must be stopped, the goroutine
+// fully off the conn, and the deadline cleared before the relay starts —
+// then a client that idles >1s with no writes still receives data.
+
+// TestHoldProbeDeadlineClearedOnAdmission: after admission the probe is
+// stopped and the conn handed over deadline-free. A read with NO deadline
+// on the (probe-surviving) client conn must survive a 1.1s idle — a stale
+// 500ms probe deadline would kill it at ~500ms. Uses a REAL loopback TCP
+// pair (net.Pipe ignores deadlines, which would park the probe's Peek and
+// let it swallow relay bytes — unrepresentative of every production conn).
+func TestHoldProbeDeadlineClearedOnAdmission(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
+	sid := "sid-hold-idle"
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	// Real loopback pair: client = the proxy's side (probe + relay),
+	// cpeer = the remote peer that later delivers a byte after the idle.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr == nil {
+			accepted <- c
+		}
+	}()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	cpeer := <-accepted
+	defer cpeer.Close()
+
+	tok := &models.TokenPayload{Username: "hold-idle", DBUser: "rw_user", DBType: "mysql", SessionID: sid}
+	// The buffered reader is created HERE and shared by the probe AND the
+	// "relay" read below — exactly how the planes wire it (the probe peeks
+	// through br; the relay inherits br after admission, so any byte the
+	// probe's Peek pulled into the buffer is still delivered to the relay).
+	br := bufio.NewReader(client)
+	clientDied, probeStop, probeExited := startHoldClientProbe(client, br)
+
+	holdDone := make(chan error, 1)
+	go func() {
+		_, err := p.holdRWSession(ctx, client, clientDied, func() error { return nil }, tok,
+			&ConfigCredResolver{}, "appdb",
+			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
+				return nil, context.Canceled
+			})
+		holdDone <- err
+	}()
+
+	// Watcher attaches → admission on the next tick.
+	if err := vs.SetWatchConn(ctx, sid, "checker-idle", time.Minute); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	// The admission wiring: stop the probe, wait for it to leave the conn,
+	// and hand the conn to the relay DEADLINE-FREE (exactly what the
+	// planes run after holdRWSession).
+	stopHoldClientProbe(client, probeStop, probeExited, clientDied)
+
+	// A byte arrives after 1.1s of silence; the relay read (client.Read,
+	// no deadline) must still be healthy.
+	go func() {
+		time.Sleep(1100 * time.Millisecond)
+		_, _ = cpeer.Write([]byte{0x00})
+	}()
+	buf := make([]byte, 1)
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second)) // bounded test read only
+	// Read through the SHARED br (the relay's reader): a byte the probe's
+	// Peek already pulled into the buffer must still reach the relay.
+	if _, err := br.Read(buf); err != nil {
+		t.Fatalf("relay read dead after 1.1s idle — a stale probe deadline killed it: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	select {
+	case err := <-holdDone:
+		if err == nil {
+			t.Fatal("stub connector unexpectedly succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hold did not finish")
+	}
+}
+
+// --- Fix round 1 (CRITICAL-1): EXACTLY ONE login success per held session ---
+//
+// The old wiring sent the login success TWICE on the MySQL and PG planes
+// (the hold's success packet at auth + the unconditional post-admission
+// OK/welcome). These tests drive the REAL plane connect paths (fake edge
+// backends, a watcher admits the held session) and count the client-visible
+// success messages across admission: exactly ONE may arrive.
+
+// TestMySQLRWHoldAdmissionSingleOK: full handshake against the mysql plane
+// with an rw token: the hold's OK arrives while held; a watcher admits; the
+// session comes up on a fake edge backend and a SELECT round-trips. The
+// first frame after the SELECT must be the column-count, NOT a second OK.
+func TestMySQLRWHoldAdmissionSingleOK(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	backendAddr, _, _ := startEdgeBackend(t)
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	port := backendAddr[strings.LastIndex(backendAddr, ":")+1:]
+	sid := fmt.Sprintf("sid-hold-single-%d", time.Now().UnixNano())
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "hold-single",
+		DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: port, DBType: "mysql",
+		TicketID: "T-6-FIX1", Access: "rw", SessionID: sid}, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	creds := map[string]string{"mysql:rw_user@" + backendAddr: "rw_pw"}
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{Creds: creds}, nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go p.handleConn(context.Background(), conn, bufio.NewReader(conn))
+		}
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	cbr := bufio.NewReader(client)
+
+	if _, _, err := readMySQLPacket(cbr); err != nil { // server greeting
+		t.Fatalf("read handshake: %v", err)
+	}
+	if err := writeMySQLPacket(client, 1, buildTestHandshakeResponse(token)); err != nil {
+		t.Fatalf("write handshake response: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// Success #1 — the hold's OK (auth completes while held).
+	if _, pkt, err := readMySQLPacket(cbr); err != nil || len(pkt) == 0 || pkt[0] != 0x00 {
+		t.Fatalf("hold did not deliver the OK: pkt=% x err=%v", pkt, err)
+	}
+	// HELD: nothing else arrives while unwatched.
+	_ = client.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+	if _, pkt, err := readMySQLPacket(cbr); err == nil {
+		t.Fatalf("held session answered early: % x", pkt)
+	}
+
+	// Admit. The backend connect runs; the client must see NO second OK.
+	if err := vs.SetWatchConn(ctx, sid, "checker-single", time.Minute); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	// Drive a SELECT (retrying — the admission window may consume the
+	// first write) and require the response to start with the fake edge
+	// backend's OK-echo — but distinguish it from a SECOND auth OK by
+	// sequence: the SELECT response carries seq = 1 (the request was seq
+	// 0); the old double-OK bug sent its stray at the AUTH reply seq (2),
+	// payload-identical to this echo, so seq is the discriminator: a first
+	// response frame at seq 2 (authReplySeq, unprompted) is the bug.
+	_ = client.SetReadDeadline(time.Now().Add(6 * time.Second))
+	deadline := time.Now().Add(6 * time.Second)
+	sel := append([]byte{cmdQuery}, "SELECT 1"...)
+	responded := false
+	for !responded && time.Now().Before(deadline) {
+		if err := writeMySQLPacket(client, 0, sel); err != nil {
+			t.Fatalf("write SELECT: %v", err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+		seq, pkt, err := readMySQLPacket(cbr)
+		if err != nil {
+			continue // probe may have eaten the first byte pre-admission
+		}
+		if len(pkt) > 0 && pkt[0] == 0x00 && seq == 2 { // 2 = authReplySeq (plaintext): the auth-phase reply slot
+			t.Fatalf("SECOND OK packet after admission (seq %d, payload % x) — double login success", seq, pkt)
+		}
+		responded = true
+	}
+	if !responded {
+		t.Fatal("no backend response after admission")
+	}
+	client.Close()
+}
+
+// TestPGRWHoldAdmissionSingleWelcome: full startup against the pg plane
+// with an rw token: the hold's welcome arrives while held (exactly ONE
+// AuthenticationOk); a watcher admits; the session comes up on a fake
+// edge backend and a query round-trips with NO second AuthenticationOk.
+func TestPGRWHoldAdmissionSingleWelcome(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+
+	// The live pg-test backend: ro_user has SELECT (the hold→admission
+	// flow is under test, not the account's privilege) — a rw token can
+	// name ro_user as its db_user; access lives on the TOKEN.
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	sid := fmt.Sprintf("sid-pg-single-%d", time.Now().UnixNano())
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "pg-single",
+		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "5433", DBType: "postgres",
+		TicketID: "T-6-FIX1", Access: "rw", SessionID: sid}, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{Creds: pgLiveCreds}, nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr == nil {
+			p.handleConn(context.Background(), conn, bufio.NewReader(conn))
+		}
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	front := pgproto3.NewFrontend(pgproto3.NewChunkReader(client), client)
+	if err := front.Send(&pgproto3.StartupMessage{ProtocolVersion: 196608,
+		Parameters: map[string]string{"user": token, "database": "appdb"}}); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+
+	// The hold's welcome — count the AuthenticationOks while held.
+	authOKs := 0
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		msg, err := front.Receive()
+		if err != nil {
+			t.Fatalf("welcome read: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.AuthenticationOk); ok {
+			authOKs++
+			continue
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if authOKs != 1 {
+		t.Fatalf("held welcome carried %d AuthenticationOk messages, want exactly 1", authOKs)
+	}
+
+	// HELD: silence.
+	_ = client.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+	if _, err := front.Receive(); err == nil {
+		t.Fatal("held session answered early")
+	}
+
+	// Admit: the backend connect runs; the post-admission block must send
+	// NOTHING (the old bug re-sent all seven messages). A query round-trips
+	// and any second AuthenticationOk anywhere fails the count.
+	if err := vs.SetWatchConn(ctx, sid, "checker-pg-single", time.Minute); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+
+	deadline := time.Now().Add(6 * time.Second)
+	responded := false
+	for !responded && time.Now().Before(deadline) {
+		if err := front.Send(&pgproto3.Query{String: "SELECT 1"}); err != nil {
+			t.Fatalf("send query: %v", err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+		for {
+			msg, err := front.Receive()
+			if err != nil {
+				break // retry the query
+			}
+			if _, ok := msg.(*pgproto3.AuthenticationOk); ok {
+				t.Fatal("SECOND AuthenticationOk after admission — double login success")
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				responded = true
+				break
+			}
+		}
+	}
+	if !responded {
+		t.Fatal("no backend response after admission")
+	}
+	client.Close()
+}
+
+
+
+// --- Fix round 1 (CRITICAL-3): the oracle rw bypass is CLOSED ---------------
+//
+// The oracle plane has no hold point (TNS Phase-1), so an rw-oracle token
+// used to open a backend session with NO checker gate — a silent bypass of
+// the maker-checker model. The plane now refuses rw tokens at the
+// pre-connect point: no backend session, no credential draw.
+
+// TestOracleRWDeniedPreConnect: an rw-oracle token reaching the oracle
+// plane is refused BEFORE any backend work — the backend session count
+// stays at zero (dialer seam never fires) and the client conn is dropped.
+// The hand-rolled TNS client drives the full CONNECT/O5LOGON/server-data/
+// data-type/AUTH sequence the plane replays from its captured mirrors.
+func TestOracleRWDeniedPreConnect(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	var logBuf bytes.Buffer
+	p := NewOracleProxy(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})), vs, &ConfigCredResolver{Creds: map[string]string{
+		"oracle:rw_user@127.0.0.1:1521": "rw_pw",
+	}})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go p.HandleConn(conn)
+		}
+	}()
+
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	sid := fmt.Sprintf("sid-o-rw-%d", time.Now().UnixNano())
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "oracle-rw",
+		DBUser: "rw_user", DBIP: "127.0.0.1", DBPort: "1521", DBType: "oracle",
+		TicketID: "T-6-FIX1", Access: "rw", SessionID: sid}, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	// Handshake: CONNECT (JDBC family shape — the descriptor carries the
+	// service name and the dict-auth marker), then mirror-read the
+	// ACCEPT/O5LOGON/server-data/data-type responses the plane replays.
+	// The payload's first bytes ARE the TNS version field: 0x013d = go-ora
+	// (JDBC family — the flow with the data-type exchange; see
+	// detectOracleFamily).
+	desc := "\x01\x3d\x08\x01(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)(CID=(PROGRAM=go-ora)(HOST=x)(USER=u)))" +
+		"(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1521)))"
+	if err := writeTNSHandshakeFrame(client, 1, []byte(desc)); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	if _, _, err := readTNSHandshakeFrame(bufio.NewReader(client)); err != nil { // ACCEPT
+		t.Fatalf("read accept: %v", err)
+	}
+	// O5LOGON request → mirrored response; server-data request → mirrored.
+	br := bufio.NewReader(client)
+	for i := 0; i < 2; i++ {
+		if err := writeTNSFrame(client, 6, []byte{0x01, 0x00}); err != nil {
+			t.Fatalf("write nego %d: %v", i, err)
+		}
+		if _, _, err := readTNSFrame(br); err != nil {
+			t.Fatalf("read nego %d: %v", i, err)
+		}
+	}
+	// JDBC data-type negotiation: one request → mirrored 2756B response.
+	if err := writeTNSFrame(client, 6, []byte{0x02, 0x00}); err != nil {
+		t.Fatalf("write data-type: %v", err)
+	}
+	if _, _, err := readTNSFrame(br); err != nil {
+		t.Fatalf("read data-type resp: %v", err)
+	}
+
+	// AUTH packet carrying the token (the plane scans for sess_…).
+	auth := append([]byte("AUTH_TERMINAL@"), 0)
+	auth = append(auth, []byte(token)...)
+	if err := writeTNSFrame(client, 6, auth); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+
+	// The refusal: the plane returns WITHOUT a mirrored auth response —
+	// the conn is closed (handleConn's defer). A read must hit EOF/error
+	// within a bounded window.
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := br.Peek(1); err == nil {
+		t.Fatal("oracle rw session was NOT refused — the client saw a response (bypass open)")
+	}
+	// The refusal must name its reason in the log.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuf.String(), "rw access refused") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("refusal not logged; log:\n%s", logBuf.String())
+}
+
+// TestOracleROTokenStillConnects shape-checks the sibling path: a
+// NON-rw oracle token is not caught by the new gate (the gate must not
+// over-refuse). The connect proceeds past the access check into the
+// backend login (which fails against the closed backend port here — the
+// assertion is that the failure is the BACKEND one, not the rw refusal).
+func TestOracleROTokenNotCaughtByRWGate(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	var logBuf bytes.Buffer
+	// Backend port deliberately dead: the login attempt fails, proving the
+	// gate did not fire (an rw token would have been refused earlier).
+	p := NewOracleProxy(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})), vs, &ConfigCredResolver{Creds: map[string]string{
+		"oracle:ro_user@127.0.0.1:1": "ro_pw",
+	}})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr == nil {
+			p.HandleConn(conn)
+		}
+	}()
+
+	token, err := store.NewToken()
+	if err != nil {
+		t.Fatalf("NewToken: %v", err)
+	}
+	if err := vs.SetToken(ctx, token, models.TokenPayload{Username: "oracle-ro",
+		DBUser: "ro_user", DBIP: "127.0.0.1", DBPort: "1", DBType: "oracle",
+		TicketID: "T-6-FIX1"}, time.Minute); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	desc := "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)(CID=(PROGRAM=sqlplus)(HOST=x)(USER=u)))" +
+		"(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1)))"
+	if err := writeTNSHandshakeFrame(client, 1, []byte(desc)); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	br := bufio.NewReader(client)
+	if _, _, err := readTNSHandshakeFrame(br); err != nil {
+		t.Fatalf("read accept: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := writeTNSFrame(client, 6, []byte{0x01, 0x00}); err != nil {
+			t.Fatalf("write nego %d: %v", i, err)
+		}
+		if _, _, err := readTNSFrame(br); err != nil {
+			t.Fatalf("read nego %d: %v", i, err)
+		}
+	}
+	auth := append([]byte("AUTH_TERMINAL@"), 0)
+	auth = append(auth, []byte(token)...)
+	if err := writeTNSFrame(client, 6, auth); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuf.String(), "backend login failed") {
+			return // gate skipped, backend attempted: correct
+		}
+		if strings.Contains(logBuf.String(), "rw access refused") {
+			t.Fatal("ro token was caught by the rw gate — over-refusal")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("ro path never reached the backend login; log:\n%s", logBuf.String())
 }
