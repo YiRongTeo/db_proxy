@@ -45,6 +45,29 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 				continue
 			}
 		}
+		// Task 6 (node-integration) TRUE read-only: on a ro session EVERY write
+		// SQL command is rejected AT THE PROXY — never forwarded, no checker
+		// involvement. Text classification over the sniffed copy; the block
+		// reply mirrors the write-gate's ERR shape. COM_INIT_DB (USE) is schema
+		// flow control, not data — it flows.
+		if len(payload) > 0 && s.access == "ro" {
+			var sqlText string
+			switch payload[0] {
+			case cmdQuery, cmdPrepare:
+				sqlText = trimSniffedSQL(payload[1:])
+			case cmdExecute:
+				sqlText = "EXECUTE" // prepared exec — fail-safe: blocked
+			}
+			if sqlText != "" && isWriteSQLMySQL(sqlText) {
+				msg := readOnlyMessage(s.id)
+				s.writeMu.Lock() // serialize with drain replies (Task 9.10)
+				_ = writeMySQLPacket(client, seq+1, errPacket(1045, "42000", msg))
+				s.writeMu.Unlock()
+				p.publishBlocked(s, msg)
+				p.metrics.GateBlocks("mysql")
+				continue
+			}
+		}
 		s.writeMu.Lock() // serialize with the gate flush (Task 9.10)
 		err = writeMySQLPacket(backend, seq, payload)
 		s.writeMu.Unlock()
@@ -152,6 +175,12 @@ func isSQLExecCommand(cmd byte) bool {
 // recorded in the audit event.
 func gatingMessage(sid string) string {
 	return fmt.Sprintf("maker gating: no checker connected to session %s", sid)
+}
+
+// readOnlyMessage is the Task 6 TRUE-read-only block text: a ro session's
+// write command is rejected with this message (no checker involvement).
+func readOnlyMessage(sid string) string {
+	return fmt.Sprintf("read-only session: write commands are rejected by the gateway (session %s)", sid)
 }
 
 // checkWriteGate implements the Task 8.6 maker write-gate decision: a

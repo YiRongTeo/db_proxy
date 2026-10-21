@@ -224,8 +224,10 @@ func TestTokenIssueWritesAuditPendingRow(t *testing.T) {
 	if r.dbType != "mysql" || r.dbUser != "ro_user" {
 		t.Errorf("db target = %s/%s, want mysql/ro_user", r.dbType, r.dbUser)
 	}
-	if r.access != "read" {
-		t.Errorf("access = %q, want read (ro_user preset)", r.access)
+	// Task 6 preset migration: the audit row records the CANONICAL access —
+	// "ro" (the ro_user preset's read migrated).
+	if r.access != "ro" {
+		t.Errorf("access = %q, want ro (ro_user preset, migrated)", r.access)
 	}
 	if r.db != "" {
 		t.Errorf("db = %q, want \"\" (unknown at issue time)", r.db)

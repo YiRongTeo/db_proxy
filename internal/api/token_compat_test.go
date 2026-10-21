@@ -59,8 +59,14 @@ func TestTokenCompatClientExactPayload(t *testing.T) {
 	srv, client, vs, cfg := newModeTestAPIServer(t, "single-use", 0)
 	client = withBearer(client, mintJWT(t, cfg, "alice", "maker"))
 
+	// The literal endTime is mint-relative: always tomorrow 23:59 local, so
+	// the "end_time is in the past" 422 can never time-bomb the test (the
+	// original hardcoded 2026-10-21 and expired on Oct 22). The naive
+	// gateway-local parse and the exact expires_at assertion are unchanged.
+	end := time.Now().AddDate(0, 0, 1)
+	endLiteral := end.Format("2006-01-02 15:04:05")
 	status, raw := compatIssue(t, client, srv.URL,
-		`{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":3306,"db_type":"mysql","ticket_id":"T-COMPAT-1","endTime":"2026-10-21 23:59:00"}`)
+		fmt.Sprintf(`{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":3306,"db_type":"mysql","ticket_id":"T-COMPAT-1","endTime":"%s"}`, endLiteral))
 	if status != http.StatusOK {
 		t.Fatalf("status %d, want 200 (body %s)", status, raw)
 	}
@@ -75,7 +81,7 @@ func TestTokenCompatClientExactPayload(t *testing.T) {
 	if out.ExpiresAt == 0 {
 		t.Errorf("response lacks expires_at: %s", raw)
 	}
-	want := time.Date(2026, 10, 21, 23, 59, 0, 0, time.Local)
+	want := time.Date(end.Year(), end.Month(), end.Day(), end.Hour(), end.Minute(), end.Second(), 0, time.Local)
 	if want.Before(time.Now()) {
 		t.Skipf("client literal endTime %s already in the past", want)
 	}

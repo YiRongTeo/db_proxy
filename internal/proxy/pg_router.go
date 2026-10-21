@@ -199,3 +199,23 @@ func (f *pgFrontend) Send(msg pgproto3.FrontendMessage) error { return f.f.Send(
 func (f *pgFrontend) Receive() (pgproto3.BackendMessage, error) { return f.f.Receive() }
 
 func (f *pgFrontend) Close() { _ = f.conn.Close() }
+
+// connectPostgresBackendConn is the hold's holdConnector shape (net.Conn
+// return): the same connect as connectPostgresBackend, returning the
+// wrapped frontend's conn. The caller recovers the FULL pgFrontend with
+// pgFrontendForConn — the pgproto3 Frontend it wraps is reconstructed over
+// the same raw conn (safe: after Hijack the raw stream is clean and the
+// reconstructed Frontend has read nothing yet).
+func connectPostgresBackendConn(ctx context.Context, t *models.TokenPayload, res CredResolver, dbName string) (net.Conn, error) {
+	f, err := connectPostgresBackend(ctx, t, res, dbName)
+	if err != nil {
+		return nil, err
+	}
+	return f.conn, nil
+}
+
+// pgFrontendForConn wraps a raw backend conn (from connectPostgresBackendConn)
+// into the pgFrontend the relay drives.
+func pgFrontendForConn(raw net.Conn) *pgFrontend {
+	return &pgFrontend{conn: raw, f: pgproto3.NewFrontend(pgproto3.NewChunkReader(raw), raw)}
+}

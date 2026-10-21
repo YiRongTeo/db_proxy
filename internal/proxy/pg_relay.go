@@ -51,6 +51,29 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 			p.gatePGReject(be, msg, s, blockMsg)
 			continue
 		}
+		// Task 6 (node-integration) TRUE read-only: a ro session's Query/Parse
+		// carrying a write is rejected AT THE PROXY (FATAL 28000 + audit), never
+		// forwarded — no checker involvement. Execute is fail-safe-blocked (a
+		// prepared statement's text may have been classified at Parse time, but
+		// the provenance is not trackable here).
+		if s.access == "ro" {
+			var sqlText string
+			readOnlyCandidate := false
+			switch m := msg.(type) {
+			case *pgproto3.Query:
+				sqlText, readOnlyCandidate = m.String, true
+			case *pgproto3.Parse:
+				sqlText, readOnlyCandidate = m.Query, true
+			case *pgproto3.Execute:
+				sqlText, readOnlyCandidate = "EXECUTE", true
+			}
+			if readOnlyCandidate && isWriteSQL(sqlText) {
+				blockMsg := readOnlyMessage(s.id)
+				p.gatePGReject(be, msg, s, blockMsg)
+				p.metrics.GateBlocks("postgres")
+				continue
+			}
+		}
 		// Task 9.10: while a grace wait is ACTIVE, EVERY message is
 		// stalled — extended-protocol messages (Bind/Describe/Sync/Close/
 		// Flush) must never overtake the held Parse/Execute messages, or

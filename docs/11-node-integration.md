@@ -41,6 +41,49 @@
 | `end_time` | string \| int | no | absent = no deadline | **NEW.** Absolute kill time for the token and any session it opens — see [§11.3](#113-end_time---the-absolute-deadline) |
 | `endTime` | string \| int | no | — | **ALIAS of `end_time`** (the node client's camelCase contract spelling). Both keys are accepted; setting **both** with different values → `400 end_time and endTime are both set with different values`; identical values (or `null` on one side) are fine. No other field has a camelCase alias |
 | `password` | string | no | absent = unchanged | **NEW.** At-mint backend-credential override — see [§11.4](#114-password---the-at-mint-credential-override) |
+| `access` | string | no | preset's `access` | **NEW — Task 6.** Explicit access level: `read` \\| `ro` \\| `write` \\| `rw` (case-insensitive) — see [§11.2.1](#1121-access---true-read-only-ro-and-held-read-write-rw) |
+
+### 11.2.1 `access` — TRUE read-only (`ro`) and HELD read-write (`rw`)
+
+The optional `access` field chooses the session's enforcement model. Values are
+**case-insensitive** and normalized at mint: `read`/`ro` → **`ro`**,
+`write`/`rw` → **`rw`**. Anything else → `422 access must be read, ro, write or rw`.
+An absent (or `null`/empty) field takes the matching preset's `access` — that path is
+byte-identical to the pre-field behavior apart from the preset migration below.
+
+| Canonical value | Enforcement |
+|---|---|
+| `ro` | **TRUE read-only.** The session authenticates normally and every **write** SQL command is rejected AT THE PROXY (protocol-appropriate error, WARN log + `gate_blocks` metric, audit event) — it never reaches the backend. Reads flow. **No checker involvement.** A checker watching changes nothing; the gate is the classifier |
+| `rw` | **HELD read-write.** The client's protocol auth COMPLETES (it sees a normal login success) but the backend connection is **NOT opened and the credential is NOT drawn** until a checker actively watches the session (`WatchActive(sid)`). The held session appears in the checker directory as `pending` (the mint-time record, refreshed while held). When watched: the backend connect proceeds and the session is full read/write **for its life** — a watcher detaching after admission does NOT kill the session. A client that disconnects while held exits cleanly: no backend, no leaked directory record |
+| `write` (legacy presets only) | **Legacy no-gate.** Presets declaring `access: "write"` keep today's behavior (connect + write freely) for backward compatibility. **Flagged for future unification** — new integrations should use `rw` instead |
+
+**Preset migration:** a preset with `access: "read"` now enforces `ro` (true
+read-only). The stored payload carries the canonical value (`ro`) — the legacy
+`read` value never ships.
+
+**Checker separation of duties:** a checker-role principal may mint only `ro`
+tokens — `rw` (and the legacy write presets) → `403 checker role limited to
+read-only tokens`. Alias normalization happens BEFORE the SoD check, so a
+checker sending `"rw"` is refused on the canonical value.
+
+**Oracle limitation:** the Oracle relay has no statement classification yet
+(TNS capture is Phase 1). A `ro` mint for `db_type: oracle` — explicit or via
+a migrated read-only preset — is **refused at the mint** with
+`422 access ro is not supported for db_type oracle — the gateway cannot
+classify Oracle statements yet; use rw or a SELECT-only backend account`.
+`rw` mints for oracle work (the hold needs no classification).
+
+**Classification caveat (honest scope):** `ro` enforcement is TEXT
+classification of the statement's leading keyword (comments skipped,
+`WITH`-CTEs walked through — a data-modifying CTE is classified as a write).
+It is a **strong first line, not a guarantee**: side effects through
+`SELECT` (`SELECT ... INTO OUTFILE`, functions with side effects,
+unparseable shapes) are the residual risk. **True read-only assurance comes
+from provisioning SELECT-only backend accounts (`ro_user`) so even a
+misclassified statement cannot mutate data.** Gateway `ro` + a SELECT-only
+backend account is the defense-in-depth pairing. The classifier's verb list
+lives in ONE place: `writeVerbsShared`/`writeVerbsMySQL` in
+`internal/proxy/write_classify.go` (`EXTEND HERE`).
 
 ### Default-port map (used when `db_port` is omitted)
 
@@ -206,7 +249,9 @@ Node-integration messages are **verbatim** — match them exactly in the client.
 | `422` | `{"error":"password must not be empty"}` | **NEW** — explicit empty-string `password` |
 | `422` | `{"error":"password exceeds 256 bytes"}` | **NEW** — > 256 bytes (256 accepted; never truncated) |
 | `422` | `{"error":"password requires a finite token ttl — supply end_time or set api.session_token_ttl_seconds"}` | **NEW** — `password` on a mint that resolves an infinite TTL (session mode, `session_token_ttl_seconds: 0`, no `end_time`) |
-| `403` | `{"error":"checker role limited to read-only tokens"}` | Checker-role principal minting a write-access token |
+| `422` | `{"error":"access must be read, ro, write or rw"}` | **NEW (Task 6)** — `access` outside the four accepted aliases (case-insensitive) |
+| `422` | `{"error":"access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use rw or a SELECT-only backend account"}` | **NEW (Task 6)** — a `ro` mint (explicit or migrated preset) for oracle: no statement classification exists, so the mint is refused rather than silently unprotected |
+| `403` | `{"error":"checker role limited to read-only tokens"}` | Checker-role principal minting a write-access token — `access: "rw"` (or a legacy `write` preset); alias-normalized first, so `"rw"` is refused on the canonical value |
 | `429` | `{"error":"token issuance rate limited"}` | Per-username issuance throttle |
 | `500` | `{"error":"internal"}` | Store failure — including a failed `ztcred:` write (the mint is rolled back: `tok:` deleted) |
 

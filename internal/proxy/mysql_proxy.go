@@ -364,16 +364,66 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	}
 	p.metrics.TokensValidated()
 
-	// 4. backend connection (real credentials, client-requested database).
-	// OverrideCreds: a CredOverride token resolves its password from
-	// ztcred:<sid> first, falling back to the configured chain (see
-	// cred_chain.go).
-	backend, err := connectMySQLBackend(ctx, tok, OverrideCreds(p.creds, tok), database)
-	if err != nil {
-		p.metrics.ConnectionsTotal("mysql", "rejected")
-		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
-		_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "backend unavailable"))
-		return
+	// Task 6 (node-integration): access "rw" — the connection is HELD. The
+	// backend connection is NOT opened and the credential is NOT drawn
+	// until a checker actively watches the session. The hold completes the
+	// client's auth (the OK packet — the client believes it is connected),
+	// heartbeats the mint-time pending directory record, and polls
+	// WatchActive on a bounded ticker; on admission the normal backend
+	// connect runs (full rw for the session's life — a watcher detaching
+	// after admission never kills the session). A held client that walks
+	// away exits the hold with NO backend and the pending record removed.
+	var backend net.Conn
+	if tok.Access == "rw" {
+		sid := tok.SessionID
+		if sid == "" {
+			sid = models.NewSessionID()
+		}
+		heldTok := *tok
+		heldTok.SessionID = sid
+		clientDied := make(chan struct{})
+		go func() {
+			// Disconnect probe: Peek (NOT Read — a consumed byte would
+			// corrupt the relayed stream). A held client is silent — the
+			// peek hits the conn deadline every cycle and the client stays
+			// held; a peer close errors instantly. Early client data (a
+			// protocol-broken early query) counts as liveness and STAYS
+			// buffered for the post-admission relay.
+			for {
+				_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
+				if _, err := br.Peek(1); err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						continue // silent — still held, still alive
+					}
+					break // disconnected
+				}
+				_ = client.SetReadDeadline(time.Time{})
+			}
+			close(clientDied)
+		}()
+		heldBackend, err := p.holdRWSession(ctx, client, clientDied,
+			func() error { return writeMySQLPacket(client, authReplySeq, okPacket()) },
+			&heldTok, OverrideCreds(p.creds, tok), database,
+			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
+				return connectMySQLBackend(ctx, tok, res, db)
+			})
+		if err != nil {
+			return // the hold logged + cleaned the pending record
+		}
+		backend = heldBackend
+	} else {
+		// 4. backend connection (real credentials, client-requested
+		// database). OverrideCreds: a CredOverride token resolves its
+		// password from ztcred:<sid> first, falling back to the configured
+		// chain (see cred_chain.go).
+		var err error
+		backend, err = connectMySQLBackend(ctx, tok, OverrideCreds(p.creds, tok), database)
+		if err != nil {
+			p.metrics.ConnectionsTotal("mysql", "rejected")
+			p.log.Error("backend connect failed", "err", err, "client", clientAddr)
+			_ = writeMySQLPacket(client, authReplySeq, errPacket(1045, "42000", "backend unavailable"))
+			return
+		}
 	}
 	defer backend.Close()
 

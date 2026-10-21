@@ -151,6 +151,14 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 		// echoed, never audited; empty and >256-byte values are rejected.
 		// A POINTER so "absent" and "present but empty" stay distinguishable.
 		Password *string `json:"password,omitempty"`
+		// Access is the OPTIONAL explicit access level (Task 6, node-
+		// integration): "read"/"ro" (case-insensitive) → canonical "ro" —
+		// TRUE read-only, every write SQL command rejected at the proxy;
+		// "write"/"rw" → canonical "rw" — the connection is HELD until a
+		// checker watches. Absent/null/"" → the preset path unchanged.
+		// Anything else → 422 naming the field. Normalization happens
+		// BEFORE the checker SoD check below (checker + rw → 403).
+		Access string `json:"access,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"bad request: %s"}`, err), http.StatusBadRequest)
@@ -361,18 +369,64 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Stamp the session id at ISSUE time so the session is visible to
 	// checkers (status "pending") before the maker connects; the data
 	// plane adopts this id on connect.
-	access := a.accessForPreset(req.DBType, req.DBUser, req.DBIP, string(req.DBPort))
+	// Task 6 (node-integration) access resolution: the EXPLICIT access
+	// field wins when present (normalized read/ro → "ro", write/rw → "rw",
+	// case-insensitive; anything else → 422 naming the field); absent/null/
+	// "" falls to the preset path — where "read" migrates to "ro" (TRUE
+	// read-only) and "write" stays "write" (legacy no-gate, flagged in
+	// docs). Normalization happens BEFORE the checker SoD check so a
+	// checker sending "rw" is 403'd on the canonical value.
+	var access string
+	if raw := strings.TrimSpace(req.Access); raw != "" {
+		switch strings.ToLower(raw) {
+		case "read", "ro":
+			access = "ro"
+		case "write", "rw":
+			access = "rw"
+		default:
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "access must be read, ro, write or rw",
+			})
+			return
+		}
+		// Oracle has NO statement classification (TNS capture is Phase 1):
+		// a ro mint for oracle would be silently unprotected, so it is
+		// REFUSED at the mint with a named 422 — never shipped.
+		if access == "ro" && req.DBType == "oracle" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use rw or a SELECT-only backend account",
+			})
+			return
+		}
+	} else {
+		access = a.accessForPreset(req.DBType, req.DBUser, req.DBIP, string(req.DBPort))
+		// Preset migration: preset "read" now enforces ro (TRUE read-only);
+		// preset "write" keeps the legacy no-gate. The oracle guard above
+		// covers the explicit ro; the migrated preset "read" on oracle gets
+		// the same named refusal.
+		if access == "read" {
+			access = "ro"
+		}
+		if access == "ro" && req.DBType == "oracle" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": "access ro is not supported for db_type oracle — the gateway cannot classify Oracle statements yet; use rw or a SELECT-only backend account",
+			})
+			return
+		}
+	}
 	// Role gate (SoD): a checker-role principal may mint only read-access
 	// (or ungated ad-hoc) tokens — a write token would let a checker open
 	// a write session and watch itself, bypassing the write gate (a
 	// session's queries are blocked unless a checker watches, and the
-	// checker can never watch its own session). No matching preset →
-	// access "" — UNGATED, NOT read: the data plane gates only on literal
+	// checker can never watch its own session). Task 6: the canonical rw
+	// (explicit or aliased) is equally refused — the hold-admission model
+	// is still a write capability. No matching preset → access "" —
+	// UNGATED, NOT read: the data plane gates only on literal
 	// access=="write", so "" rides the backend account's real privilege.
 	// Config hygiene consequence: every credentials key backed by rw
 	// creds MUST pair with an access:write preset (RUN.md §2.3), or a
 	// checker minting "" over it runs gate-free.
-	if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && access == "write" {
+	if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && (access == "write" || access == "rw") {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker role limited to read-only tokens"})
 		return
 	}
@@ -585,6 +639,10 @@ func (a *api) recordPendingSession(ctx context.Context, p *models.TokenPayload) 
 // plane's write gate (queries blocked unless a checker watches the session).
 // No matching preset → "" — the data plane treats absent access as read (no
 // gate), so tokens for ad-hoc targets stay ungated.
+// Task 6 preset migration: preset "read" resolves to "ro" (TRUE read-only —
+// every write SQL command rejected at the proxy, no checker involvement);
+// the MIGRATION happens at the handleToken call site (this helper returns
+// the preset verbatim so modeForPreset-style reuse stays honest).
 func (a *api) accessForPreset(dbType, dbUser, dbIP, dbPort string) string {
 	for _, p := range a.cfg.DBPresets {
 		if p.DBType == dbType && p.DBUser == dbUser && p.DBIP == dbIP && p.DBPort == dbPort {

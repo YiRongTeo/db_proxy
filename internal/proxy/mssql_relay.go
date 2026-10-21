@@ -110,6 +110,31 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 			p.gateMSSQLReject(client, s, msg)
 			continue
 		}
+		// Task 6 (node-integration) TRUE read-only: a ro session's SQL batch
+		// text is classified — a write is rejected AT THE PROXY (ERROR token
+		// + audit), never forwarded. RPCs are classified by proc name: the
+		// known read-only system procs flow, everything else (write-shaped
+		// procs, sp_executesql) is a write.
+		if s.access == "ro" && (typ == tdsSQLBatch || typ == tdsRPC) {
+			write := false
+			if typ == tdsSQLBatch {
+				if text, ok := decodeMSSQLBatch(payload); ok {
+					write = isWriteSQL(text)
+				}
+			} else {
+				if name, ok := decodeMSSQLRPC(payload); ok {
+					write = !mssqlReadOnlyProc(name)
+				} else {
+					write = true // unparseable RPC — fail safe
+				}
+			}
+			if write {
+				msg := readOnlyMessage(s.id)
+				p.gateMSSQLReject(client, s, msg)
+				p.metrics.GateBlocks("mssql")
+				continue
+			}
+		}
 		if p.gateMSSQLHolding(s) {
 			// Task 9.10 stall: never forward anything past the held queue.
 			if !p.gateMSSQLHold(s, frames, typ == tdsAttention) {

@@ -1161,6 +1161,17 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/token \
 #      (ztcred:<session_id> key, TTL = token TTL, data plane resolves
 #      override-first). Requires a FINITE token ttl: with session mode +
 #      session_token_ttl_seconds: 0 you MUST also pass end_time (else 422).
+#    - add  "access":"ro" | "rw"  (case-insensitive; also "read"/"write")
+#      → explicit access level (Task 6). "ro" = TRUE read-only: every write
+#      SQL command is rejected AT THE PROXY (reads flow, no checker
+#      involvement; Oracle refuses ro mints — no statement classification
+#      yet). "rw" = connection HELD: the client's login completes but the
+#      backend is NOT touched and NO credential is drawn until a checker
+#      watches the session; then full read/write for the session's life.
+#      Absent → the matching preset's access; preset "read" now enforces
+#      ro; preset "write" keeps the legacy no-gate (unify later). CAVEAT:
+#      ro classification is a strong FIRST LINE — true assurance is a
+#      SELECT-only backend account (docs/11 §11.2.1).
 echo "$TOKEN"
 ```
 

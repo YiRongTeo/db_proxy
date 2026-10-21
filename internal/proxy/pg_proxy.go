@@ -419,16 +419,89 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// relay phase is deadline-free by design.
 	_ = client.SetDeadline(time.Time{})
 
-	// 4. backend session with the CLIENT-requested database (PG clients send
-	// it in the STARTUP message — mirror of the MySQL CONNECT_WITH_DB flow);
-	// an empty/missing value falls back to the default backend database.
-	front, err := connectPostgresBackend(ctx, tok, OverrideCreds(p.creds, tok), sm.Parameters["database"])
-	if err != nil {
-		p.metrics.ConnectionsTotal("postgres", "rejected")
-		p.log.Error("backend connect failed", "err", err, "client", clientAddr)
-		_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
-			Message: "backend unavailable"})
-		return
+	// Task 6 (node-integration): access "rw" — the connection is HELD after
+	// auth completes (the welcome sequence below is written by the hold's
+	// writeLoginOK), with NO backend connect and NO credential draw until a
+	// checker watches. On admission the hold returns the backend conn; a
+	// held client that walks away exits the hold (no backend, pending
+	// record removed). A watcher detaching after admission never kills the
+	// session.
+	var front *pgFrontend
+	if tok.Access == "rw" {
+		sid := tok.SessionID
+		if sid == "" {
+			sid = models.NewSessionID()
+		}
+		heldTok := *tok
+		heldTok.SessionID = sid
+		clientDied := make(chan struct{})
+		go func() {
+			// Disconnect probe: Peek (NOT Read — a consumed byte would
+			// corrupt the relayed stream). A held client is silent — the
+			// peek hits the conn deadline every cycle; a peer close errors
+			// instantly. Early client data stays buffered for the relay.
+			for {
+				_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
+				if _, err := br.Peek(1); err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						continue // silent — still held, still alive
+					}
+					break // disconnected
+				}
+				_ = client.SetReadDeadline(time.Time{})
+			}
+			close(clientDied)
+		}()
+		welcome := func() error {
+			// The full PG welcome sequence — auth completes for the client.
+			if err := be.Send(&pgproto3.AuthenticationOk{}); err != nil {
+				return err
+			}
+			if err := be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"}); err != nil {
+				return err
+			}
+			if err := be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}); err != nil {
+				return err
+			}
+			if err := be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"}); err != nil {
+				return err
+			}
+			if err := be.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"}); err != nil {
+				return err
+			}
+			// BackendKeyData carries zeros here — the real pid is captured
+			// after admission (capturePGThreadID below) and the welcome
+			// block there re-sends nothing: PG clients read the key data
+			// once; the zeros degrade cancel only until reconnect (the
+			// same degrade rule as a failed pid capture).
+			if err := be.Send(&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}); err != nil {
+				return err
+			}
+			return be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		}
+		heldFront, err := p.holdRWSession(ctx, client, clientDied, welcome, &heldTok,
+			OverrideCreds(p.creds, tok), sm.Parameters["database"],
+			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
+				return connectPostgresBackendConn(ctx, tok, res, db)
+			})
+		if err != nil {
+			return // the hold logged + cleaned the pending record
+		}
+		front = pgFrontendForConn(heldFront)
+	} else {
+		// 4. backend session with the CLIENT-requested database (PG clients
+		// send it in the STARTUP message — mirror of the MySQL
+		// CONNECT_WITH_DB flow); an empty/missing value falls back to the
+		// default backend database.
+		var err error
+		front, err = connectPostgresBackend(ctx, tok, OverrideCreds(p.creds, tok), sm.Parameters["database"])
+		if err != nil {
+			p.metrics.ConnectionsTotal("postgres", "rejected")
+			p.log.Error("backend connect failed", "err", err, "client", clientAddr)
+			_ = be.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28000",
+				Message: "backend unavailable"})
+			return
+		}
 	}
 	defer front.Close()
 

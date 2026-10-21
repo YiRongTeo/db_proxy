@@ -93,9 +93,12 @@ func TestTokenAccessFromPreset(t *testing.T) {
 		body string
 		want string
 	}{
+		// Task 6 preset migration: preset access "read" now resolves to
+		// canonical "ro" (TRUE read-only) — the payload never carries the
+		// legacy "read" value anymore.
 		{"read-write preset", `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-8-6"}`, "write"},
-		{"mysql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-8-6"}`, "read"},
-		{"pg read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"5433","db_type":"postgres","ticket_id":"T-8-6"}`, "read"},
+		{"mysql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"3307","db_type":"mysql","ticket_id":"T-8-6"}`, "ro"},
+		{"pg read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"5433","db_type":"postgres","ticket_id":"T-8-6"}`, "ro"},
 		{"no matching preset", `{"db_user":"some_user","db_ip":"10.1.2.3","db_port":"3306","db_type":"mysql","ticket_id":"T-8-6"}`, ""},
 	}
 	for _, tc := range cases {
@@ -130,7 +133,7 @@ func TestTokenAccessMSSQLPresets(t *testing.T) {
 		body string
 		want string
 	}{
-		{"mssql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-3"}`, "read"},
+		{"mssql read-only preset", `{"db_user":"ro_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-3"}`, "ro"},
 		{"mssql read-write preset", `{"db_user":"rw_user","db_ip":"127.0.0.1","db_port":"1434","db_type":"mssql","ticket_id":"T-9-3"}`, "write"},
 	}
 	for _, tc := range cases {
@@ -220,10 +223,11 @@ func TestTokenRoleGate(t *testing.T) {
 		wantStatus       int
 		wantAccess       string // stored payload access for the 200 rows
 	}{
-		{"checker + read preset", "checker", task7ReadBody, http.StatusOK, "read"},
+		// Task 6 preset migration: read presets resolve to canonical "ro".
+		{"checker + read preset", "checker", task7ReadBody, http.StatusOK, "ro"},
 		{"checker + write preset", "checker", task7WriteBody, http.StatusForbidden, ""},
 		{"maker + write preset", "maker", task7WriteBody, http.StatusOK, "write"},
-		{"maker + read preset", "maker", task7ReadBody, http.StatusOK, "read"},
+		{"maker + read preset", "maker", task7ReadBody, http.StatusOK, "ro"},
 		{"checker + ad-hoc target (no preset)", "checker", task7AdhocBody, http.StatusOK, ""},
 		{"maker + ad-hoc target (no preset)", "maker", task7AdhocBody, http.StatusOK, ""},
 	}
