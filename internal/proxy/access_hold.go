@@ -133,7 +133,13 @@ func (pub *sessionPublisher) finishHeldSession(sid string) {
 //     conn after the success packet returns (error/EOF = the client went
 //     away — it would never send anything the hold consumes), and
 //  3. heartbeats the pending directory record + polls WatchActive on the
-//     bounded ticker until a watcher watches.
+//     bounded ticker until a watcher watches,
+//  4. fires the session-status callback with action "started" at HOLD-START
+//     (Task 8, node-integration) — the "session is available to join"
+//     signal, fired before any watcher attaches. A held-then-admitted
+//     session therefore produces started(hold)+started(admission): the
+//     DOUBLE started is the accepted contract (first = joinable now,
+//     second = backend live). See NotifySession.
 //
 // On admission the connect runs (the credential draw happens inside) and
 // its result returns to the caller (which proceeds into the normal relay
@@ -156,6 +162,13 @@ func (pub *sessionPublisher) holdRWSession(ctx context.Context, client net.Conn,
 		return nil, err
 	}
 	pub.holdHeartbeat(tok)
+	// Task 8 (node-integration): the hold-start session-status callback —
+	// "started" = "session is available to join", fired BEFORE any watcher
+	// attaches (the checker UI's push signal). Fire-and-forget (dispatch
+	// runs on its own goroutine) and nil-safe (disabled config = no-op).
+	// Admission then fires the normal started again — the double-started
+	// contract, accepted: first = joinable now, second = backend live.
+	pub.callbacks.NotifySession(nil, tok, "started")
 	stop := make(chan struct{})
 	admitted := make(chan struct{}, 1)
 	go pub.watchForAdmission(ctx, sid, stop, admitted)

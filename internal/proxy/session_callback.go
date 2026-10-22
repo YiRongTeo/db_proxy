@@ -98,6 +98,13 @@ func callbackSkipKey(addr string) string {
 // own goroutine and this call returns immediately — the relay never waits
 // on the main application. The timestamp is captured HERE (the actual
 // event time). Safe on a nil receiver (disabled).
+//
+// Cadence (node-integration Task 8): an rw session under the maker-checker
+// hold fires "started" TWICE — once at HOLD-START (holdRWSession, the
+// "session is available to join" signal, before any watcher attaches) and
+// once at admission (backend connect success, "backend live"). A
+// held-then-walked-away session produces started+ended (no second started).
+// Flag-off / non-rw sessions keep the single started at connect success.
 func (cb *SessionCallbacks) NotifySession(s sessionCommon, tok *models.TokenPayload, action string) {
 	if cb == nil || cb.baseURL == "" {
 		return

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,6 +230,238 @@ func TestHoldWriteClassifierGateWiring(t *testing.T) {
 	// rw sessions never trip the legacy write gate — the hold is the gate.
 	if msg := p.checkWriteGate(s, cmdQuery); msg != "" {
 		t.Errorf("rw session gated at the relay: %q — the hold is upstream, the relay must not gate rw", msg)
+	}
+}
+
+// --- Task 8 (node-integration): the hold-start session-status callback ------
+//
+// A HELD rw session must POST action:"started" to the session-status
+// callback at HOLD-START — the "session is available to join" signal for
+// Ryan's checker UI — BEFORE any watcher attaches (long before the
+// backend-open admission whose own started fires later; the DOUBLE
+// started is the accepted contract: first = joinable now, second =
+// backend live). The postFn seam (session_callback.go) captures the
+// payloads WITHOUT HTTP, exactly like TestSessionCallbackPanicIsolated.
+
+// cbRecord is the postFn-recording callback client: every dispatch is
+// captured as an ordered (action, target) event so the test can assert
+// exactly-one-started and the fire-order relative to admission.
+type cbRecord struct {
+	mu         sync.Mutex
+	events     []string      // "callback:<action>" entries in dispatch order
+	target     string        // wire path of the FIRST callback (sid check)
+	startFired chan struct{} // closed on the FIRST recorded callback
+}
+
+func newCbRecord() *cbRecord {
+	return &cbRecord{startFired: make(chan struct{})}
+}
+
+func (c *cbRecord) post(target, payload, _ string) error {
+	var body struct {
+		Action string `json:"action"`
+	}
+	_ = json.Unmarshal([]byte(payload), &body)
+	c.mu.Lock()
+	c.events = append(c.events, "callback:"+body.Action)
+	if c.target == "" {
+		c.target = target
+	}
+	first := len(c.events) == 1
+	c.mu.Unlock()
+	if first {
+		close(c.startFired)
+	}
+	return nil
+}
+
+func (c *cbRecord) snapshot(t *testing.T) []string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string{}, c.events...)
+}
+
+// holdCbCallbacks builds a REAL SessionCallbacks (non-empty baseURL =
+// enabled) whose deliveries are captured by rec — zero HTTP.
+func holdCbCallbacks(rec *cbRecord) *SessionCallbacks {
+	cb, err := NewSessionCallbacks(slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"http://callback.test", time.Second, "", "")
+	if err != nil {
+		panic(err) // unreachable: absolute url
+	}
+	cb.postFn = rec.post
+	return cb
+}
+
+// TestHoldStartFiresSessionCallbackBeforeWatch: a held rw session fires
+// exactly ONE session-status callback, action "started", carrying the HELD
+// sid — and it lands BEFORE any watcher attaches (the test attaches the
+// watcher only after the callback was recorded) and before admission (the
+// connector runs strictly after the callback event). This is the
+// "joinable now" push signal the checker UI consumes.
+func TestHoldStartFiresSessionCallbackBeforeWatch(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	sid := "sid-hold-cb-start"
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	rec := newCbRecord()
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
+	p.SetSessionCallbacks(holdCbCallbacks(rec))
+
+	client, cpeer := net.Pipe()
+	defer cpeer.Close()
+	defer client.Close()
+
+	tok := &models.TokenPayload{Username: "hold-cb", DBUser: "rw_user", DBType: "mysql", SessionID: sid}
+	// NO watcher exists yet: admission would only fire the connector, so
+	// any connector call recorded before the watch attach is a breach.
+	admitted := make(chan struct{}, 1)
+	events := struct {
+		mu  sync.Mutex
+		log []string
+	}{}
+	mark := func(e string) {
+		events.mu.Lock()
+		events.log = append(events.log, e)
+		events.mu.Unlock()
+	}
+
+	holdDone := make(chan error, 1)
+	go func() {
+		_, err := p.holdRWSession(ctx, client, nil,
+			func() error { return nil }, // login success: the hold contract, not under test here
+			tok, &ConfigCredResolver{}, "appdb",
+			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
+				mark("admitted")
+				admitted <- struct{}{}
+				return nil, nil
+			})
+		holdDone <- err
+	}()
+
+	// The hold-start callback must arrive WITHOUT any watcher attached.
+	// (The dispatch goroutine delivers shortly after the hold arms.)
+	select {
+	case <-rec.startFired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held session fired NO session-status callback at hold-start — the joinable-now signal is missing")
+	}
+	got := rec.snapshot(t)
+	if len(got) != 1 || got[0] != "callback:started" {
+		t.Fatalf("hold-start callbacks = %v, want exactly [callback:started]", got)
+	}
+	mark("callback:started") // recorded BEFORE the watch attach below
+
+	// Now attach the watcher → admission on the next tick.
+	if err := vs.SetWatchConn(ctx, sid, "checker-cb", time.Minute); err != nil {
+		t.Fatalf("SetWatchConn: %v", err)
+	}
+	t.Cleanup(func() { _ = vs.DelWatch(context.Background(), sid) })
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher attached but the session was never admitted")
+	}
+
+	// Order: the hold-start callback strictly precedes admission.
+	events.mu.Lock()
+	log := append([]string{}, events.log...)
+	events.mu.Unlock()
+	if len(log) != 2 || log[0] != "callback:started" || log[1] != "admitted" {
+		t.Fatalf("event order = %v, want [callback:started admitted] — the hold-start callback must precede admission", log)
+	}
+	// The wire target carries the HELD sid (the callback path key).
+	snap := rec.snapshot(t)
+	if len(snap) != 1 || snap[0] != "callback:started" {
+		t.Fatalf("callbacks after admission = %v, want exactly one started (admission-time started is publishLifecycle's, not the hold's)", snap)
+	}
+}
+
+// TestHoldStartCallbackCarriesHeldSidNoWatcherNoBackend: the walked-away
+// shape — the hold-start callback fires with the held sid, and a client
+// disconnect while still unwatched produces NO backend connect and NO
+// further callbacks from the hold itself (held → started is all the hold
+// emits; ended is the plane's finishSession business).
+func TestHoldStartCallbackCarriesHeldSidNoWatcherNoBackend(t *testing.T) {
+	vs := proxyTestStore(t)
+	ctx := context.Background()
+	sid := "sid-hold-cb-walkaway"
+	cleanupLiveRecord(t, vs, sid)
+	t.Cleanup(func() { _ = vs.DelSessionLive(ctx, sid) })
+
+	rec := newCbRecord()
+	p := NewMySQLProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
+	p.SetSessionCallbacks(holdCbCallbacks(rec))
+
+	client, cpeer := net.Pipe()
+	defer cpeer.Close()
+
+	tok := &models.TokenPayload{Username: "hold-cb-walk", DBUser: "rw_user", DBType: "mysql", SessionID: sid}
+	holdDone := make(chan struct{})
+	clientDied := make(chan struct{})
+	// The same Peek-probe the planes wire (net.Pipe ignores deadlines, so
+	// mirror the DisconnectCleanup fixture's manual probe loop).
+	cbr := bufio.NewReader(client)
+	go func() {
+		for {
+			_ = client.SetReadDeadline(time.Now().Add(rwHoldPollInterval))
+			if _, err := cbr.Peek(1); err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				break
+			}
+			_ = client.SetReadDeadline(time.Time{})
+		}
+		close(clientDied)
+	}()
+	go func() {
+		_, _ = p.holdRWSession(ctx, client, clientDied,
+			func() error { return nil },
+			tok, &ConfigCredResolver{}, "appdb",
+			func(ctx context.Context, tok *models.TokenPayload, res CredResolver, db string) (net.Conn, error) {
+				t.Error("connector ran with NO watcher — admission breach")
+				return nil, context.Canceled
+			})
+		close(holdDone)
+	}()
+
+	// The hold-start callback carries the HELD sid on the wire.
+	select {
+	case <-rec.startFired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no hold-start callback")
+	}
+	// Wait for the delivery payload to be readable, then check the sid.
+	deadline := time.Now().Add(5 * time.Second)
+	var target string
+	for time.Now().Before(deadline) {
+		rec.mu.Lock()
+		if len(rec.events) >= 1 {
+			target = rec.target
+		}
+		rec.mu.Unlock()
+		if target != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if want := "http://callback.test/dbpxy/session/" + sid + "/status"; target != want {
+		t.Fatalf("hold-start callback target = %q, want %q (the held sid)", target, want)
+	}
+
+	// Walk away: the hold exits cleanly, connector untouched.
+	cpeer.Close()
+	select {
+	case <-holdDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hold did not exit after client disconnect")
+	}
+	if got := rec.snapshot(t); len(got) != 1 || got[0] != "callback:started" {
+		t.Fatalf("callbacks = %v, want exactly one started (the hold must not fire ended)", got)
 	}
 }
 
@@ -620,8 +853,6 @@ func TestPGRWHoldAdmissionSingleWelcome(t *testing.T) {
 	}
 	client.Close()
 }
-
-
 
 // --- Fix round 1 (CRITICAL-3): the oracle rw bypass is CLOSED ---------------
 //

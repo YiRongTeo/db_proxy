@@ -168,23 +168,37 @@ Ops semantics of the `ztcred:` key (TTL skew, kill/revoke behavior, manual scrub
 
 ## 11.6 Session callbacks — Data Plane → Main app
 
-On Maker session **start** (backend connect success) and **end** (every close path: client close,
-backend close, idle timeout, kill, token expiry/`end_time`), the data plane POSTs a status callback
-to the main app. **Disabled by default** — zero HTTP traffic until a callback URL is configured
-([§11.9](#119-config-knobs)).
+On Maker session **start** (rw hold-start **and** backend connect success) and **end** (every close
+path: client close, backend close, idle timeout, kill, token expiry/`end_time`), the data plane POSTs
+a status callback to the main app. **Disabled by default** — zero HTTP traffic until a callback URL
+is configured ([§11.9](#119-config-knobs)).
 
 | Aspect | Value |
 |---|---|
 | Method + path | `POST {url}/dbpxy/session/{sessionId}/status` (`sessionId` = the mint response's `session_id`, URL-path-escaped) |
 | Body | `{"action":"started"\|"ended","timestamp":"<RFC3339 UTC>"}` |
 | Header | `Content-Type: application/json`; plus **`X-Session-Callback-Key: <secret>`** on every request when a shared secret is configured (no header when empty) |
-| `started` | Sent exactly once, when the backend connect succeeds |
+|| `started` | Sent at **rw hold-start** (the maker's rw connection authenticated and is HELD waiting for a checker — the **"session is available to join"** signal, fired before any watcher attaches) and **again at backend connect success**. An rw session therefore receives **TWO** `started` callbacks (accepted contract: first = *joinable now*, second = *backend live*); every non-rw session receives exactly one, at connect success |
 | `ended` | Sent on **every** close path — client/backend disconnect, idle timeout, kill, token expiry (`end_time` or TTL), revoke |
 | Delivery | **Fire-and-forget** on its own goroutine — the relay path never waits on the main app |
 | Retries | **Exactly ONE** retry after **2 s** on failure — no backoff schedule, no buffering |
 | Failure handling | Non-2xx and transport errors are **WARN-logged only** — they never affect the relay or the session |
 | Response body | Read (bounded) and **discarded** — the data plane ignores any `session_id`/`action`/`rows_updated` the main app returns |
-| Correlation | The main app correlates by `sessionId` — the same id the mint response carried |
+|| Correlation | The main app correlates by `sessionId` — the same id the mint response carried |
+
+### `started` cadence — the rw hold (maker–checker)
+
+An `access: "rw"` session under the checker hold (`rw_require_checker_watch: true`, the default)
+produces this callback sequence — the **double `started` is the contract**:
+
+| Session shape | Callbacks | Meaning |
+|---|---|---|
+| rw held → checker watches → admitted | `started` (hold-start) → `started` (backend live) → … → `ended` | First `started` = **joinable now** (push this to the checker UI); second = **backend live** |
+| rw held → maker walks away | `started` (hold-start) → `ended` | Never admitted; the session existed only as pending in the directory |
+| rw with `rw_require_checker_watch: false`, or any non-rw session | `started` (connect success) → `ended` | Unchanged single-`started` cadence |
+
+Both `started` callbacks carry the same `sessionId`; the `timestamp` of each is the actual event
+time (hold-start vs backend connect).
 
 ## 11.7 Full flow
 
@@ -214,6 +228,7 @@ sequenceDiagram
 
     DP-)Cb: POST /dbpxy/session/<sid>/status {"action":"started","timestamp":...} (+ X-Session-Callback-Key)
     Note over DP,Cb: fire-and-forget; ONE retry after 2 s; WARN-only on failure
+    Note over DP,Cb: rw hold path: a FIRST started fires at hold-start (available to join), before any watcher
     App->>DP: queries (relay + audit feed unchanged)
 
     alt end_time reached (tok: TTL expiry) or kill/revoke (DEL tok:)
