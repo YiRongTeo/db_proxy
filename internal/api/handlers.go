@@ -437,9 +437,18 @@ func (a *api) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Config hygiene consequence: every credentials key backed by rw
 	// creds MUST pair with an access:write preset (RUN.md §2.3), or a
 	// checker minting "" over it runs gate-free.
-	if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && (access == "write" || access == "rw") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker role limited to read-only tokens"})
-		return
+	// Task 7 (node-integration): auth.allow_checker_write (default FALSE,
+	// strict SoD) is the UAT escape hatch — true skips THIS refusal so a
+	// checker-role principal may mint write/rw tokens. The self-watch SoD
+	// (checkerMayWatch) is unaffected: even with the flag on, a checker
+	// still cannot watch their own session. The oracle+rw refusal above is
+	// ALSO unaffected (the data plane has no hold point for oracle —
+	// fail-closed regardless of this flag).
+	if !a.cfg.AllowCheckerWrite {
+		if sess := sessionFrom(r); sess != nil && sess.Role == "checker" && (access == "write" || access == "rw") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker role limited to read-only tokens"})
+			return
+		}
 	}
 	payload := models.TokenPayload{
 		Username: req.Username, DBUser: req.DBUser, DBIP: req.DBIP,
