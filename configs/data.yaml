@@ -92,6 +92,20 @@ log_query_output: false
 # behavior). Negative values fall back to the default (20).
 # Env: ZT_GATE_WAIT_SECONDS.
 gate_wait_seconds: 20
+# Task 7 (node-integration) rw-hold toggle: true (default) = an access:"rw"
+# token is HELD at connect until a checker watches (the Task 6 hold). false =
+# the UAT escape hatch: rw tokens ADMIT IMMEDIATELY on the normal connect
+# path (no hold, no watch needed) — one person plays maker AND checker.
+# ASYMMETRY (deliberate): this flag does NOT touch oracle — the oracle plane
+# has no hold point, so its rw refusal stays fail-closed with the flag OFF,
+# and the control plane's oracle+rw mint refusal is likewise not relaxed by
+# auth.allow_checker_write. rw sessions admitted with the flag off are NOT
+# gated afterwards (a legacy preset access:write session is not either); the
+# gate_wait_seconds grace logic only ever applied to write-access sessions
+# and is untouched.
+# Env: ZT_RW_REQUIRE_CHECKER_WATCH (set exactly "false"; anything viper
+# parses truthy — 1/true — re-enables the hold).
+rw_require_checker_watch: true
 # session enforcement (Task 9.13; all 0 = off):
 #   idle_seconds: close sessions idle this long (0 = off). Default 1800.
 #     Applies to EVERY token mode (single-use AND session) — the safety

@@ -194,6 +194,15 @@ type ControlConfig struct {
 	// keeps SoD — only checker-role principals may watch/kill; true lets
 	// maker-role principals watch and kill too.
 	AllowMakerWatch bool
+	// AllowCheckerWrite (yaml auth.allow_checker_write, env
+	// ZT_AUTH_ALLOW_CHECKER_WRITE; node-integration Task 7) is the UAT
+	// escape hatch for the mint-side separation of duties: false (default)
+	// keeps strict SoD — a checker-role principal may mint only
+	// read-access tokens (a write/rw mint is refused 403); true SKIPS that
+	// refusal so a checker may mint write and rw tokens too (one person
+	// playing both roles). The SELF-watch SoD is NOT relaxed by this flag:
+	// checkerMayWatch still rejects a checker watching their own session.
+	AllowCheckerWrite bool
 	// AuthUsers (Task 9.13, SoD testing) are OPTIONAL additional UI
 	// users beyond the primary auth.username/password pair — e.g. a
 	// dedicated checker account so maker and checker roles use different
@@ -740,6 +749,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 		AuthPassword:      v.GetString("auth.password"),
 		AuthRole:          v.GetString("auth.role"),
 		AllowMakerWatch:   v.GetBool("auth.allow_maker_watch"),
+		AllowCheckerWrite: v.GetBool("auth.allow_checker_write"),
 		JWT: JWTConfig{
 			Enabled:        v.GetBool("auth.jwt.enabled"),
 			LoginEnabled:   v.GetBool("auth.jwt.login_enabled"),
@@ -1135,6 +1145,18 @@ type DataConfig struct {
 	// 0 = reject immediately (the pre-8.13 behavior). Negative values fall
 	// back to the default.
 	GateWaitSeconds int
+	// RWRequireCheckerWatch (yaml rw_require_checker_watch, env
+	// ZT_RW_REQUIRE_CHECKER_WATCH; node-integration Task 7) gates the Task 6
+	// rw hold: true (default) = an access:"rw" token is HELD at connect
+	// until a checker watches; false = the UAT escape hatch — rw tokens
+	// ADMIT IMMEDIATELY on the normal post-auth connect path (no hold, no
+	// WatchActive polling), exactly like a legacy preset access:write
+	// token. The gate_wait_seconds grace logic is untouched (with no hold
+	// there is nothing to gate on an rw session). Oracle is ASYMMETRIC by
+	// design: the control plane still refuses oracle+rw mints and the
+	// oracle data plane keeps its rw refusal REGARDLESS of this flag (the
+	// oracle plane has no hold point — fail-closed defense in depth).
+	RWRequireCheckerWatch bool
 	// CredentialsSource selects where the backend DB password comes from:
 	// "config" (default — the committed credentials list below) or "api"
 	// (per-connect fetch from CredentialsAPI; Task 8.7).
@@ -1267,6 +1289,14 @@ func LoadData(path string) (*DataConfig, error) {
 		// checker instead of failing instantly (default 20; 0 = reject
 		// immediately, the pre-8.13 behavior; negative → default).
 		"gate_wait_seconds": 20,
+		// Task 7 (node-integration): the Task 6 rw hold is ON by default —
+		// an access:"rw" token is held until a checker watches (G3:
+		// byte-identical). rw_require_checker_watch: false (UAT escape
+		// hatch) admits rw immediately on the normal connect path. Only
+		// true/false/1/0 are meaningful env values (viper cast.ToBool maps
+		// anything else — e.g. "yes" — to false = hold OFF; operators
+		// should set exactly "false").
+		"rw_require_checker_watch": true,
 		// Task 9.8: OTel metrics for Prometheus scraping — DISABLED by
 		// default (zero overhead; the proxies' metrics wrapper stays
 		// nil). When enabled the data plane serves the instruments at
@@ -1371,6 +1401,7 @@ func LoadData(path string) (*DataConfig, error) {
 		TLS:                       tlsCfg,
 		LogQueryOutput:            v.GetBool("log_query_output"),
 		GateWaitSeconds:           gateWait,
+		RWRequireCheckerWatch:     v.GetBool("rw_require_checker_watch"),
 		CredentialsSource:         source,
 		CredentialsAPI:            apiCfg,
 		Credentials:               map[string]string{},

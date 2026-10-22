@@ -55,6 +55,15 @@ auth:
   # allow_maker_watch (JWT conversion): false (default) = only checker-role
   # principals may watch/kill sessions (SoD); true lets makers watch too.
   allow_maker_watch: false
+  # allow_checker_write (Task 7, node-integration): false (default) = strict
+  # SoD at the MINT — a checker-role principal may only mint read-access
+  # tokens; a write/rw mint is refused 403. true = the UAT escape hatch: a
+  # checker may mint write/rw too (one person plays both roles). This does
+  # NOT relax the self-watch SoD (a checker still cannot watch their own
+  # session) and does NOT relax the oracle+rw mint refusal (the data plane
+  # has no hold point for oracle — fail-closed).
+  # Env: ZT_AUTH_ALLOW_CHECKER_WRITE.
+  allow_checker_write: false
   # users (Task 9.13): OPTIONAL extra UI accounts beyond the primary pair —
   # e.g. a dedicated CHECKER so maker and checker roles use different
   # identities (the SoD watch rejects checker == maker). Passwords are
