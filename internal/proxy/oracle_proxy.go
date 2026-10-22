@@ -48,6 +48,14 @@ func NewOracleProxy(log *slog.Logger, vs Store, creds CredResolver) *OracleProxy
 // capture yet — accepted for wiring symmetry).
 func (p *OracleProxy) SetLogQueryOutput(bool) {}
 
+// SetRWRequireCheckerWatch is the Task 7 parity setter that DELIBERATELY
+// does nothing: the oracle plane has NO rw hold point (the TNS login
+// replays captured responses in one shot), so its access:"rw" refusal is
+// fail-closed REGARDLESS of the flag — flag off does not enable oracle rw
+// (and the control-plane mint refuses oracle+rw anyway). Accepted for
+// wiring symmetry with the other planes; wired in cmd/data/main.go.
+func (p *OracleProxy) SetRWRequireCheckerWatch(bool) {}
+
 // SetMetrics wires the OTel instruments (Task 9.8); nil keeps no-ops.
 func (p *OracleProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 
@@ -200,6 +208,14 @@ func (p *OracleProxy) handleConn(client net.Conn) {
 	// maker-checker model. Fail CLOSED with a named refusal instead: the
 	// token is already consumed (GETDEL), the client's login dies at the
 	// pre-connect point, and the log names the knob.
+	// Task 7 (node-integration): this refusal is DELIBERATELY independent
+	// of rwAdmitWithoutWatch (the inverted rw_require_checker_watch flag) —
+	// the flag cannot turn it off here. There
+	// is no hold point to skip, so "flag off" would mean an unwatched rw
+	// backend session, i.e. the bypass itself. (An rw-oracle token cannot
+	// exist anyway — the mint refuses oracle+rw — this is defense in
+	// depth. The control-plane mint refusal is likewise NOT relaxed by
+	// auth.allow_checker_write.)
 	if tok.Access == "rw" {
 		p.metrics.TokensRejected("oracle_rw_unsupported")
 		p.log.Warn("oracle: rw access refused — no checker hold exists on the oracle plane; mint with a preset access:write token or wait for the TNS-phase hold",

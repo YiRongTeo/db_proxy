@@ -221,6 +221,16 @@ func main() {
 	mysqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	pgProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
 	mssqlProxy.SetGateWaitSeconds(cfg.GateWaitSeconds)
+	// Task 7 (node-integration) rw-hold toggle: true (default) = an
+	// access:"rw" token is held until a checker watches; false (the UAT
+	// escape hatch, configs/data.yaml rw_require_checker_watch,
+	// ZT_RW_REQUIRE_CHECKER_WATCH) admits rw immediately on the normal
+	// connect path. Oracle accepts the call as a no-op — its rw refusal is
+	// fail-closed regardless (no hold point exists to skip).
+	mysqlProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
+	pgProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
+	mssqlProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
+	oracleProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
 	// OTel metrics: enabled (configs/data.yaml metrics block,
 	// ZT_METRICS_ENABLED) builds the Prometheus-backed meter wrapper and
 	// wires it into every instrumented site; disabled (default) leaves the

@@ -80,6 +80,16 @@ type MySQLProxy struct {
 	// SetGateWaitSeconds.
 	gateWaitSeconds int
 
+	// rwAdmitWithoutWatch (Task 7, node-integration) is the INVERTED
+	// config flag rw_require_checker_watch: false (the Go zero value AND
+	// the deployed default) = the Task 6 hold — an access:"rw" token is
+	// held until a checker watches (byte-identical G3, for constructors
+	// and struct literals alike); true = the UAT escape hatch — rw admits
+	// immediately on the normal connect path. Set ONLY via
+	// SetRWRequireCheckerWatch (which negates the config value). Oracle
+	// keeps its rw refusal regardless.
+	rwAdmitWithoutWatch bool
+
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
 }
@@ -117,6 +127,15 @@ func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
 		seconds = defaultGateWaitSeconds
 	}
 	p.gateWaitSeconds = seconds
+}
+
+// SetRWRequireCheckerWatch toggles the Task 6 rw hold (Task 7,
+// node-integration): true (default) = an access:"rw" token is HELD until a
+// checker watches; false = the UAT escape hatch — rw admits immediately on
+// the normal connect path (no hold, no WatchActive polling). Wired from
+// config rw_require_checker_watch (ZT_RW_REQUIRE_CHECKER_WATCH).
+func (p *MySQLProxy) SetRWRequireCheckerWatch(require bool) {
+	p.rwAdmitWithoutWatch = !require
 }
 
 // SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
@@ -373,9 +392,14 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// connect runs (full rw for the session's life — a watcher detaching
 	// after admission never kills the session). A held client that walks
 	// away exits the hold with NO backend and the pending record removed.
+	// Task 7 (node-integration): rwRequireCheckerWatch=false (the UAT
+	// escape hatch) SKIPS the hold — rw falls through to the else branch
+	// below, exactly the path a legacy preset access:"write" token takes
+	// (immediate connect, the OK written at step 5). Default true =
+	// byte-identical (G3).
 	var backend net.Conn
 	admitted := false
-	if tok.Access == "rw" {
+	if tok.Access == "rw" && !p.rwAdmitWithoutWatch {
 		sid := tok.SessionID
 		if sid == "" {
 			sid = models.NewSessionID()
