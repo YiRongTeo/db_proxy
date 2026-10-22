@@ -1306,6 +1306,23 @@ gate still requires a watcher ≠ maker. Checker is **monitor-only** for
 statements (live audit; no approval of queries — kill is the only action).
 UI tokens can only target the `db_presets` allowlist from `configs/control.yaml`.
 
+**Configurable SoD (node-integration Task 7, UAT):** two flags relax the
+maker-checker separation when one person must play both roles — both default
+to the strict behavior above, so a config with neither key behaves
+byte-identically:
+
+| Flag | Where | Default | Effect when flipped |
+|---|---|---|---|
+| `auth.allow_checker_write` | control.yaml (`ZT_AUTH_ALLOW_CHECKER_WRITE`) | `false` | A checker-role principal may MINT write/rw tokens (the 403 above is skipped) |
+| `rw_require_checker_watch` | data.yaml (`ZT_RW_REQUIRE_CHECKER_WATCH`) | `true` | `false` = rw tokens admit IMMEDIATELY (no checker hold, no watch needed) |
+
+`allow_checker_write` does NOT relax the self-watch SoD (a checker still
+cannot watch their own session) and does NOT relax the oracle+rw mint
+refusal. `rw_require_checker_watch: false` is likewise ASYMMETRIC for oracle:
+the oracle plane has no hold point, so its rw refusal stays fail-closed with
+the flag off — oracle rw is not enabled by either flag (defense in depth;
+an rw-oracle token cannot be minted anyway).
+
 ### 5.1 Maker write-gating (Task 8.6)
 
 A **write-access** maker token (`db_presets[].access: write` — the MySQL read-write preset) cannot
