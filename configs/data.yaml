@@ -103,8 +103,10 @@ gate_wait_seconds: 20
 # gated afterwards (a legacy preset access:write session is not either); the
 # gate_wait_seconds grace logic only ever applied to write-access sessions
 # and is untouched.
-# Env: ZT_RW_REQUIRE_CHECKER_WATCH (set exactly "false"; anything viper
-# parses truthy — 1/true — re-enables the hold).
+# Env: ZT_RW_REQUIRE_CHECKER_WATCH — STRICT parse (true/1/false/0 only,
+# case-insensitive). A typo ("yes", "on", "2") is REJECTED at boot: the value
+# is treated as UNSET (this yaml key / the TRUE default decides) and a boot
+# WARN names the rejected value. A typo can never silently disable the hold.
 rw_require_checker_watch: true
 # session enforcement (Task 9.13; all 0 = off):
 #   idle_seconds: close sessions idle this long (0 = off). Default 1800.

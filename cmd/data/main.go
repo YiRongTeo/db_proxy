@@ -231,6 +231,12 @@ func main() {
 	pgProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
 	mssqlProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
 	oracleProxy.SetRWRequireCheckerWatch(cfg.RWRequireCheckerWatch)
+	if cfg.RWRequireCheckerWatchEnvRejected != "" {
+		log.Warn("ZT_RW_REQUIRE_CHECKER_WATCH value not recognized (accepted: true/false/1/0, case-insensitive; empty = yaml decides) — ignored, hold stays as rw_require_checker_watch/default (ON)", "rejected_value", cfg.RWRequireCheckerWatchEnvRejected)
+	}
+	if !cfg.RWRequireCheckerWatch {
+		log.Warn("rw checker-watch requirement is DISABLED (rw_require_checker_watch / ZT_RW_REQUIRE_CHECKER_WATCH) — rw tokens ADMIT IMMEDIATELY with no checker hold; a security control is off (UAT only)")
+	}
 	// OTel metrics: enabled (configs/data.yaml metrics block,
 	// ZT_METRICS_ENABLED) builds the Prometheus-backed meter wrapper and
 	// wires it into every instrumented site; disabled (default) leaves the

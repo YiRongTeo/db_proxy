@@ -84,6 +84,28 @@ func sessionIPLockEnv() (override *bool, rejected bool, raw string) {
 	}
 }
 
+// rwRequireCheckerWatchEnv is the strict raw-string allowlist for
+// ZT_RW_REQUIRE_CHECKER_WATCH (Task 7 follow-up). false DISABLES the checker
+// hold, so a cast.ToBool typo ("yes"/"on" → false) was a FAIL-OPEN; here only
+// accepted explicit spellings (true/1/false/0, case-insensitive) count, a
+// rejected value is UNSET (yaml/TRUE default decides), and the raw value is
+// surfaced for the boot WARN. Read via os.Getenv, NOT viper, for the same
+// reason as sessionIPLockEnv.
+func rwRequireCheckerWatchEnv() (override *bool, rejected bool, raw string) {
+	s := strings.TrimSpace(os.Getenv("ZT_RW_REQUIRE_CHECKER_WATCH"))
+	if s == "" {
+		return nil, false, ""
+	}
+	switch strings.ToLower(s) {
+	case "true", "1":
+		return boolPtr(true), false, s
+	case "false", "0":
+		return boolPtr(false), false, s
+	default:
+		return nil, true, s
+	}
+}
+
 // readYAMLSessionIPLock resolves session.ip_lock from the config FILE ONLY:
 // (*bool)(nil) when the yaml key is absent, otherwise its bool value. A
 // separate viper instance with AutomaticEnv disabled and NO defaults is
@@ -91,6 +113,25 @@ func sessionIPLockEnv() (override *bool, rejected bool, raw string) {
 // (possibly rejected) ZT_SESSION_IP_LOCK through AutomaticEnv on every
 // GetBool, defeating the strict env allowlist, and its defaults map would
 // mask the yaml key's absence (breaking explicit-false detection).
+// readYAMLDataFlag reads one TOP-LEVEL bool key from the data config FILE
+// ONLY (no env, no defaults): (*bool)(nil) when absent. Used where a strict
+// env allowlist needs the yaml fallback to stay uncontaminated by the very
+// env value it just rejected (readYAMLSessionIPLock pattern).
+func readYAMLDataFlag(path, key string) (*bool, error) {
+	yv := viper.New()
+	yv.SetConfigFile(path)
+	// NO SetEnvPrefix/automatic env: this instance must see the FILE only —
+	// the whole point is to not re-resolve the env value that a strict
+	// allowlist just rejected.
+	if err := yv.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	if !yv.IsSet(key) {
+		return nil, nil
+	}
+	return boolPtr(yv.GetBool(key)), nil
+}
+
 func readYAMLSessionIPLock(path string) (*bool, error) {
 	yv := viper.New()
 	yv.SetConfigFile(path)
@@ -1157,6 +1198,13 @@ type DataConfig struct {
 	// oracle data plane keeps its rw refusal REGARDLESS of this flag (the
 	// oracle plane has no hold point — fail-closed defense in depth).
 	RWRequireCheckerWatch bool
+	// RWRequireCheckerWatchEnvRejected carries the rejected
+	// ZT_RW_REQUIRE_CHECKER_WATCH value when the raw env string failed the
+	// strict allowlist (true/1/false/0, case-insensitive). Empty = nothing
+	// rejected. Rejection means UNSET: the yaml key / TRUE default decides —
+	// a typo can never disable the checker hold (the fail-open this replaces;
+	// mirrors SessionIPLockEnvRejected).
+	RWRequireCheckerWatchEnvRejected string
 	// CredentialsSource selects where the backend DB password comes from:
 	// "config" (default — the committed credentials list below) or "api"
 	// (per-connect fetch from CredentialsAPI; Task 8.7).
@@ -1393,6 +1441,28 @@ func LoadData(path string) (*DataConfig, error) {
 	if ipLockRejected {
 		ipLockEnvRejected = ipLockRaw
 	}
+	// Task 7 follow-up: strict raw-string parse for ZT_RW_REQUIRE_CHECKER_WATCH
+	// (false disables the hold — a typo must never fail-open). Env allowlist
+	// wins; else the yaml key read FILE-ONLY (a rejected env must not leak
+	// back in through AutomaticEnv — v.GetBool would cast.ToBool the raw
+	// garbage string and ignore the defaults map); else TRUE.
+	rwEnv, rwRejected, rwRaw := rwRequireCheckerWatchEnv()
+	rwRequireResolved := true
+	if rwEnv != nil {
+		rwRequireResolved = *rwEnv
+	} else {
+		yamlRW, err := readYAMLDataFlag(path, "rw_require_checker_watch")
+		if err != nil {
+			return nil, err
+		}
+		if yamlRW != nil {
+			rwRequireResolved = *yamlRW
+		}
+	}
+	rwRequireEnvRejected := ""
+	if rwRejected {
+		rwRequireEnvRejected = rwRaw
+	}
 	cfg := &DataConfig{
 		ListenAddr:                v.GetString("listen.addr"),
 		ListenOracleAddr:          v.GetString("listen.oracle_addr"),
@@ -1401,7 +1471,7 @@ func LoadData(path string) (*DataConfig, error) {
 		TLS:                       tlsCfg,
 		LogQueryOutput:            v.GetBool("log_query_output"),
 		GateWaitSeconds:           gateWait,
-		RWRequireCheckerWatch:     v.GetBool("rw_require_checker_watch"),
+		RWRequireCheckerWatch:     rwRequireResolved,
 		CredentialsSource:         source,
 		CredentialsAPI:            apiCfg,
 		Credentials:               map[string]string{},
@@ -1411,8 +1481,9 @@ func LoadData(path string) (*DataConfig, error) {
 		// Fix round 1 (strict env parse, fail-locked): resolved above from
 		// sessionIPLockEnv (raw-string allowlist) with the yaml-only
 		// fallback — see the resolution block before this literal.
-		SessionIPLock:            sessionIPLock,
-		SessionIPLockEnvRejected: ipLockEnvRejected,
+		SessionIPLock:                    sessionIPLock,
+		SessionIPLockEnvRejected:         ipLockEnvRejected,
+		RWRequireCheckerWatchEnvRejected: rwRequireEnvRejected,
 		SessionCallback: SessionCallbackConfig{
 			URL:              v.GetString("session_callback.url"),
 			TimeoutSeconds:   v.GetInt("session_callback.timeout_seconds"),
