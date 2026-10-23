@@ -268,6 +268,23 @@ func main() {
 	pgProxy.SetSessionCallbacks(sessionCallbacks)
 	mssqlProxy.SetSessionCallbacks(sessionCallbacks)
 	oracleProxy.SetSessionCallbacks(sessionCallbacks)
+	// Task 9 (node-integration) re-lock: the rw_relock_on_watch_loss flag
+	// (default TRUE) enables the freeze-on-last-watch-loss policy on the
+	// three hold-capable planes; oracle is called as a no-op mirror of
+	// Tasks 6/7 (no hold point — its rw refusal stands regardless). A
+	// rejected ZT_RW_RELOCK_ON_WATCH_LOSS value and a DISABLED re-lock each
+	// boot their own WARN (same convention as the hold flag above).
+	mysqlProxy.SetRWRelockOnWatchLoss(cfg.RWRelockOnWatchLoss)
+	pgProxy.SetRWRelockOnWatchLoss(cfg.RWRelockOnWatchLoss)
+	mssqlProxy.SetRWRelockOnWatchLoss(cfg.RWRelockOnWatchLoss)
+	oracleProxy.SetRWRelockOnWatchLoss(cfg.RWRelockOnWatchLoss)
+	if cfg.RWRelockOnWatchLossEnvRejected != "" {
+		log.Warn("ZT_RW_RELOCK_ON_WATCH_LOSS value not recognized (accepted: true/false/1/0, case-insensitive; empty = yaml decides) — ignored, re-lock stays as rw_relock_on_watch_loss/default (ON)", "rejected_value", cfg.RWRelockOnWatchLossEnvRejected)
+	}
+	if !cfg.RWRelockOnWatchLoss {
+		log.Warn("rw re-lock on watch loss is DISABLED (rw_relock_on_watch_loss / ZT_RW_RELOCK_ON_WATCH_LOSS) — an admitted rw session STAYS OPEN when its last checker leaves (one-way admission; UAT only)")
+	}
+	relocker := proxy.NewRelocker(mysqlProxy, pgProxy, mssqlProxy)
 	killer := proxy.NewKiller(mysqlProxy, pgProxy, mssqlProxy, oracleProxy)
 	killer.SetMetrics(m)
 	killer.SetStore(vs)
@@ -371,6 +388,31 @@ func main() {
 			default:
 				log.Warn(line, "session_id", sid)
 			}
+		}
+	}()
+
+	// Re-lock switch (Task 9, node-integration): subscribe to the
+	// ctl:relock channel — the control plane's hub publishes there when
+	// the LAST checker left an ADMITTED session (watch:<sid>:* count hit
+	// zero, sess:live status active). Each message carries
+	// {"action":"relock","session_id":"..."}; the Relocker freezes the
+	// session on whichever plane holds it as a hold-admitted rw session
+	// (mysql/pg/mssql; oracle never relocks — no hold point). Same shape
+	// as the kill subscriber: bounded channel, non-blocking drops upstream.
+	relockCh := make(chan []byte, 16)
+	go func() {
+		defer close(relockCh)
+		if err := vs.Subscribe(ctx, "ctl:relock", false, relockCh); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("relock subscriber", "err", err)
+		}
+	}()
+	go func() {
+		for msg := range relockCh {
+			sid, froze := relocker.HandleRelock(msg)
+			if !froze {
+				continue // unknown / non-rw / flag-off / malformed — nothing to freeze
+			}
+			log.Info("session re-locked", "session_id", sid)
 		}
 	}()
 

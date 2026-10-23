@@ -196,9 +196,43 @@ produces this callback sequence — the **double `started` is the contract**:
 | rw held → checker watches → admitted | `started` (hold-start) → `started` (backend live) → … → `ended` | First `started` = **joinable now** (push this to the checker UI); second = **backend live** |
 | rw held → maker walks away | `started` (hold-start) → `ended` | Never admitted; the session existed only as pending in the directory |
 | rw with `rw_require_checker_watch: false`, or any non-rw session | `started` (connect success) → `ended` | Unchanged single-`started` cadence |
+| rw admitted → **last checker leaves** (Task 9 re-lock, `rw_relock_on_watch_loss: true` default) → checker watches again | `started` (hold-start) → `started` (backend live) → **`started` (re-lock)** → … → `ended` | With re-lock on, a session can emit `started` **MULTIPLE times** — once at hold-start and once per re-lock; **`ended` exactly once**. Each re-lock reuses the hold-start `started` (the "joinable now" signal — no new action value): the session is frozen with the gating error until a checker watches again |
 
 Both `started` callbacks carry the same `sessionId`; the `timestamp` of each is the actual event
 time (hold-start vs backend connect).
+
+### Re-lock lifecycle (Task 9 — an admitted rw session re-freezes when the last checker leaves)
+
+`rw_relock_on_watch_loss` (data.yaml, `ZT_RW_RELOCK_ON_WATCH_LOSS`, default `true`) reverses the
+Task 6 ONE-WAY admission for hold-admitted rw sessions:
+
+```
+hold → started (hold-start) → started (admitted) → … → (last checker leaves)
+     → relock → started (callback again) → re-admit → … → ended (exactly once)
+```
+
+- **Trigger** — the control plane's WS hub, in its disconnect defer, removes its own
+  `watch:<sid>:<conn>` lease and counts the remaining leases (`WatchCount`). When the count is
+  zero AND the `sess:live` record shows `status=active` (admitted — a pending record is still
+  pre-hold and never re-locks), it publishes `{"action":"relock","session_id":<sid>}` on the
+  `ctl:relock` channel (the same control→data pubsub coupling as `ctl:kill`).
+- **Freeze** — the data plane's re-lock subscriber (a small `Relocker` next to the kill
+  subscriber, no Oracle arm) sets a per-session frozen flag on the MySQL/PG/MSSQL plane that
+  holds the session. While frozen, EVERY client→backend message is answered with the normal
+  gating error (`maker gating: no checker connected to session <sid>` — MySQL `ERR 1045`,
+  PG `FATAL 28000`, MSSQL `ERROR 18456`) and NOT forwarded; the backend→client direction keeps
+  draining. In-flight transactions are left untouched (no ROLLBACK, no COMMIT — the freeze point
+  is the detach).
+- **Re-admission** — the frozen session polls `WatchActive` on the hold's 500 ms cadence; a
+  checker re-attaching unfreezes it and the relay continues without a reconnect. An explicit kill
+  works while frozen (kill tears down regardless).
+- **Audit** — re-lock/free cycles do NOT change the sessions row status (it stays `active` from
+  first admission; `ended` only at real close). No columns were added.
+- **Scope** — hold-admitted rw sessions ONLY: legacy preset `write` sessions keep their
+  per-command write gate; sessions admitted with `rw_require_checker_watch: false` never held and
+  never relock; oracle NEVER relocks (no hold point). `rw_relock_on_watch_loss: false` (UAT)
+  restores the one-way admission byte-identically. The env value uses the STRICT
+  `true/1/false/0` parse — a typo is rejected at boot (re-lock stays ON, WARN names the value).
 
 ## 11.7 Full flow
 

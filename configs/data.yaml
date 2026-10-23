@@ -108,6 +108,27 @@ gate_wait_seconds: 20
 # is treated as UNSET (this yaml key / the TRUE default decides) and a boot
 # WARN names the rejected value. A typo can never silently disable the hold.
 rw_require_checker_watch: true
+# Task 9 (node-integration) rw RE-LOCK: true (default, the owner-directed
+# policy) = when the LAST checker leaves an ADMITTED rw session, the control
+# plane's hub publishes a re-lock command and the data plane FREEZES the
+# session — still connected; EVERY SQL command is answered with the normal
+# gating error ("maker gating: no checker connected to session <sid>"),
+# in-flight queries/transactions are left untouched (no ROLLBACK, no COMMIT),
+# and the backend→client direction keeps draining. When a checker watches
+# again the session unfreezes and the relay continues. Each re-lock fires
+# the session-status callback action "started" again (the "joinable now"
+# signal — a session can emit started MULTIPLE times: hold-start, each
+# re-lock; ended exactly once). false = the old ONE-WAY admission (a
+# watcher detaching after admission never affects the session; the UAT
+# single-person mode). Only hold-admitted rw sessions re-lock: legacy preset
+# write sessions keep their per-command write gate, sessions admitted with
+# rw_require_checker_watch: false never held and never relock, and oracle
+# NEVER relocks (no hold point). Kill still works while frozen.
+# Env: ZT_RW_RELOCK_ON_WATCH_LOSS — STRICT parse (true/1/false/0 only,
+# case-insensitive), same contract as ZT_RW_REQUIRE_CHECKER_WATCH: a typo is
+# REJECTED at boot (treated as UNSET — this yaml key / the TRUE default
+# decides) and a boot WARN names the rejected value.
+rw_relock_on_watch_loss: true
 # session enforcement (Task 9.13; all 0 = off):
 #   idle_seconds: close sessions idle this long (0 = off). Default 1800.
 #     Applies to EVERY token mode (single-use AND session) — the safety

@@ -43,6 +43,17 @@ sequenceDiagram
 4. **Timeout** — no watcher by the deadline → the client receives a readable auth-class error and an audit event (`status=error`, message `maker gating: no checker connected...`). Nothing was executed; no row can land.
 5. **Re-open, no latch** — a later watcher **does** re-open the gate: the maker's next command runs, same connection, no reconnect required. (The permanent latch from an earlier design was removed — a returning checker unblocks the session.)
 
+## The rw re-lock (Task 9 — freeze on last watch loss)
+
+The gate above applies to legacy preset `access: write` sessions, per command. **Hold-admitted rw
+sessions** (the maker–checker hold, `rw_require_checker_watch: true` default) have their own
+post-admission enforcement: `rw_relock_on_watch_loss` (data.yaml, `ZT_RW_RELOCK_ON_WATCH_LOSS`,
+**default `true`**) re-freezes an admitted rw session when the LAST checker leaves — every
+command gets the same gating error as above, in-flight work is untouched, and the session
+re-admits (same 500 ms watch poll as the hold) when a checker watches again. Each re-lock fires
+the session-status callback `started` again. Flag `false` (UAT) restores the one-way admission.
+Full lifecycle: docs/11-node-integration.md ("Re-lock lifecycle") and RUN.md §5.1.1.
+
 ## Separation of duties (checker ≠ maker) — 2026-08-17
 
 The checker who arms the gate for a session **cannot be the session's maker**. At WebSocket attach

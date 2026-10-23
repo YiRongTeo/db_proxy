@@ -1315,13 +1315,16 @@ byte-identically:
 |---|---|---|---|
 | `auth.allow_checker_write` | control.yaml (`ZT_AUTH_ALLOW_CHECKER_WRITE`) | `false` | A checker-role principal may MINT write/rw tokens (the 403 above is skipped) |
 | `rw_require_checker_watch` | data.yaml (`ZT_RW_REQUIRE_CHECKER_WATCH`) | `true` | `false` = rw tokens admit IMMEDIATELY (no checker hold, no watch needed) |
+| `rw_relock_on_watch_loss` | data.yaml (`ZT_RW_RELOCK_ON_WATCH_LOSS`) | `true` | `false` = the old ONE-WAY admission: an admitted rw session STAYS OPEN when its last checker leaves (owner-directed Task 9 re-lock is the default — see §5.1) |
 
 `allow_checker_write` does NOT relax the self-watch SoD (a checker still
 cannot watch their own session) and does NOT relax the oracle+rw mint
 refusal. `rw_require_checker_watch: false` is likewise ASYMMETRIC for oracle:
 the oracle plane has no hold point, so its rw refusal stays fail-closed with
 the flag off — oracle rw is not enabled by either flag (defense in depth;
-an rw-oracle token cannot be minted anyway).
+an rw-oracle token cannot be minted anyway). `rw_relock_on_watch_loss: false`
+(the UAT one-way admission) never touches oracle either — oracle sessions
+are never hold-admitted, so nothing exists to re-lock.
 
 ### 5.1 Maker write-gating (Task 8.6)
 
@@ -1343,6 +1346,30 @@ Practical flow for a write-access maker: generate the token → a checker opens 
 dashboard session selector, or any WS client subscribing to `sess:<sid>`) → INSERT/UPDATE/DELETE
 work. If the watcher is removed mid-session, the very next query is blocked until a checker watches
 the session again.
+
+#### 5.1.1 Re-lock: an admitted rw session re-freezes when the last checker leaves (Task 9)
+
+`rw_relock_on_watch_loss` (data.yaml, `ZT_RW_RELOCK_ON_WATCH_LOSS`, **default `true`**) closes the
+one-way-admission gap: when the LAST checker leaves a hold-admitted **rw** session, the session
+RE-LOCKS — it stays connected but is FROZEN until a checker watches again.
+
+Lifecycle (callback cadence for the main application):
+
+```
+hold → started (hold-start) → started (admitted) → … → (last checker leaves)
+     → relock → started (callback again — "joinable now") → re-admit → … → ended (exactly once)
+```
+
+| Aspect | Behavior |
+|---|---|
+| Trigger | The control plane's WS hub, in its disconnect defer, after removing its own `watch:<sid>:<conn>` lease, checks `WatchCount(sid)`; when zero AND the `sess:live` record shows `status=active`, it publishes `{"action":"relock","session_id":<sid>}` on the `ctl:relock` channel (the same control→data pubsub coupling as `ctl:kill`) |
+| Freeze | The data plane sets a per-session frozen flag (MySQL/PG/MSSQL): EVERY client→backend message is answered with the normal gating error (`maker gating: no checker connected to session <sid>` — MySQL `ERR 1045` / PG `FATAL 28000` / MSSQL `ERROR 18456`) and NOT forwarded |
+| In-flight work | Untouched: no ROLLBACK, no COMMIT — the freeze point is the detach; the backend→client direction keeps draining (an in-flight result set may finish arriving); no new SQL reaches the backend after the freeze |
+| Re-admission | The frozen session polls `WatchActive` on the hold's 500 ms cadence; a checker re-subscribing to `sess:<sid>` unfreezes it and the relay continues (no reconnect) |
+| Callbacks | Each re-lock fires `started` AGAIN (the hold-start "joinable now" signal — NO new action value). **A session can emit `started` MULTIPLE times** (hold-start, each re-lock); `ended` exactly once. The sessions row status stays `active` throughout — re-lock/free cycles never change it, and no audit columns were added |
+| Scope | Hold-admitted rw sessions ONLY. Legacy preset `access: write` sessions keep their per-command write gate; sessions admitted with `rw_require_checker_watch: false` never held and never relock; oracle NEVER relocks (no hold point — same asymmetry as the Tasks 6/7 flags) |
+| Kill | An explicit kill works while frozen (kill tears down regardless of the freeze) |
+| Flag off | `false` restores the old one-way admission byte-identically (UAT single-person mode); a typo'd `ZT_RW_RELOCK_ON_WATCH_LOSS` value is REJECTED at boot (strict `true/1/false/0` parse, same contract as `ZT_RW_REQUIRE_CHECKER_WATCH`) — the re-lock stays ON and a WARN names the rejected value |
 
 **Separation of duties (2026-08-17):** the checker who arms the gate for a session must be a
 **different user** than the session's maker. The WS hub rejects a maker's attempt to watch their own
