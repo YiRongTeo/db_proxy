@@ -106,6 +106,35 @@ func rwRequireCheckerWatchEnv() (override *bool, rejected bool, raw string) {
 	}
 }
 
+// strictBoolEnv is the shared raw-string allowlist reader behind
+// rwRequireCheckerWatchEnv and rwRelockOnWatchLossEnv (node-integration
+// Task 9): only true/1/false/0 (case-insensitive) count; set-but-empty is
+// UNSET (yaml decides); anything else is UNSET with the raw value surfaced
+// for the boot WARN — a typo can never silently disable the flag's
+// protection.
+func strictBoolEnv(name string) (override *bool, rejected bool, raw string) {
+	s := strings.TrimSpace(os.Getenv(name))
+	if s == "" {
+		return nil, false, ""
+	}
+	switch strings.ToLower(s) {
+	case "true", "1":
+		return boolPtr(true), false, s
+	case "false", "0":
+		return boolPtr(false), false, s
+	default:
+		return nil, true, s
+	}
+}
+
+// rwRelockOnWatchLossEnv is the strict raw-string allowlist for
+// ZT_RW_RELOCK_ON_WATCH_LOSS (Task 9). false restores the one-way admission,
+// so a cast.ToBool typo would be a fail-open; a rejected value is UNSET
+// (yaml/TRUE default decides) and its raw value surfaces for the boot WARN.
+func rwRelockOnWatchLossEnv() (override *bool, rejected bool, raw string) {
+	return strictBoolEnv("ZT_RW_RELOCK_ON_WATCH_LOSS")
+}
+
 // readYAMLSessionIPLock resolves session.ip_lock from the config FILE ONLY:
 // (*bool)(nil) when the yaml key is absent, otherwise its bool value. A
 // separate viper instance with AutomaticEnv disabled and NO defaults is
@@ -1205,6 +1234,29 @@ type DataConfig struct {
 	// a typo can never disable the checker hold (the fail-open this replaces;
 	// mirrors SessionIPLockEnvRejected).
 	RWRequireCheckerWatchEnvRejected string
+	// RWRelockOnWatchLoss (yaml rw_relock_on_watch_loss, env
+	// ZT_RW_RELOCK_ON_WATCH_LOSS; node-integration Task 9) is the RE-LOCK
+	// policy: true (default, the owner-directed change) = when the LAST
+	// checker leaves an ADMITTED rw session, the control plane publishes a
+	// re-lock command and the data plane FREEZES the session (still
+	// connected; every SQL command answered with the gating error) until a
+	// checker watches again — each re-lock fires the session-status callback
+	// "started" again. false = the old Task 6 ONE-WAY admission (a watcher
+	// detaching after admission never affects the session; the UAT
+	// single-person mode). G3: the flag-OFF path is byte-identical to
+	// one-way admission. Only applies to hold-admitted rw sessions — legacy
+	// preset write sessions keep their per-command checkWriteGate, and
+	// flag-off (rw_require_checker_watch=false) sessions never hold and
+	// never relock. Oracle NEVER relocks (no hold point — same asymmetry as
+	// Tasks 6/7).
+	RWRelockOnWatchLoss bool
+	// RWRelockOnWatchLossEnvRejected carries the rejected
+	// ZT_RW_RELOCK_ON_WATCH_LOSS value when the raw env string failed the
+	// strict allowlist (true/1/false/0, case-insensitive). Empty = nothing
+	// rejected. Rejection means UNSET: the yaml key / TRUE default decides —
+	// a typo can never silently disable the re-lock (mirrors
+	// RWRequireCheckerWatchEnvRejected).
+	RWRelockOnWatchLossEnvRejected string
 	// CredentialsSource selects where the backend DB password comes from:
 	// "config" (default — the committed credentials list below) or "api"
 	// (per-connect fetch from CredentialsAPI; Task 8.7).
@@ -1463,6 +1515,28 @@ func LoadData(path string) (*DataConfig, error) {
 	if rwRejected {
 		rwRequireEnvRejected = rwRaw
 	}
+	// Task 9 (node-integration): strict raw-string parse for
+	// ZT_RW_RELOCK_ON_WATCH_LOSS (false restores the one-way admission — a
+	// typo must never fail-open). Env allowlist wins; else the yaml key read
+	// FILE-ONLY (same uncontaminated-fallback reasoning as the hold flag);
+	// else TRUE (the owner-directed default: re-lock ON).
+	relockEnv, relockRejected, relockRaw := rwRelockOnWatchLossEnv()
+	relockResolved := true
+	if relockEnv != nil {
+		relockResolved = *relockEnv
+	} else {
+		yamlRelock, err := readYAMLDataFlag(path, "rw_relock_on_watch_loss")
+		if err != nil {
+			return nil, err
+		}
+		if yamlRelock != nil {
+			relockResolved = *yamlRelock
+		}
+	}
+	relockEnvRejected := ""
+	if relockRejected {
+		relockEnvRejected = relockRaw
+	}
 	cfg := &DataConfig{
 		ListenAddr:                v.GetString("listen.addr"),
 		ListenOracleAddr:          v.GetString("listen.oracle_addr"),
@@ -1484,6 +1558,8 @@ func LoadData(path string) (*DataConfig, error) {
 		SessionIPLock:                    sessionIPLock,
 		SessionIPLockEnvRejected:         ipLockEnvRejected,
 		RWRequireCheckerWatchEnvRejected: rwRequireEnvRejected,
+		RWRelockOnWatchLoss:              relockResolved,
+		RWRelockOnWatchLossEnvRejected:   relockEnvRejected,
 		SessionCallback: SessionCallbackConfig{
 			URL:              v.GetString("session_callback.url"),
 			TimeoutSeconds:   v.GetInt("session_callback.timeout_seconds"),
