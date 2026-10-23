@@ -163,6 +163,18 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				a.log.Warn("watch clear failed", "session_id", watchSid, "err", err)
 			}
+			// Task 9 (node-integration) RE-LOCK trigger: this connection's
+			// lease is gone — when it was the LAST one (WatchCount == 0)
+			// and the session is ADMITTED (sess:live status "active" — a
+			// pending record is still pre-hold, nothing to re-lock), tell
+			// the data plane to freeze the session until a checker
+			// watches again. The command rides the SAME control→data
+			// pubsub coupling as ctl:kill. Failure semantics: a failed
+			// count probe publishes NOTHING (a missed re-lock self-heals
+			// when a checker re-attaches; a false one would freeze a
+			// healthy session), and a publish error is logged — the
+			// disconnect defer must never fail the teardown.
+			a.maybeRelock(context.Background(), watchSid)
 			// Task 9.7 audit: watcher gone → checker_username = NULL
 			// (mirrors this connection's lease deletion).
 			a.auditChecker(context.Background(), watchSid, "")
@@ -223,6 +235,62 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// maybeRelock publishes the re-lock command when the hub's disconnect defer
+// removed the LAST watch lease of an ADMITTED session (Task 9,
+// node-integration): WatchCount(sid) == 0 (this connection was the final
+// checker) AND the sess:live record shows status "active" (the data plane
+// overwrote the mint-time pending record at admission — a pending session is
+// still pre-hold and must never re-lock; a missing record is fail-closed:
+// no proof of admission, no re-lock). The command is the ctl:kill-shaped
+// {"action":"relock","session_id":<sid>} on the "ctl:relock" channel; the
+// data plane's Relocker (cmd/data) consumes it. Best-effort: a count error
+// publishes NOTHING (a missed re-lock self-heals when a checker re-attaches;
+// a false one would freeze a healthy session); a publish failure logs — the
+// disconnect defer must never fail the teardown. Called with the session
+// channel's sid ONLY (the defer runs for a watch connection; a non-watch
+// connection never reaches this).
+func (a *api) maybeRelock(ctx context.Context, sid string) {
+	n, err := a.vs.WatchCount(ctx, sid)
+	if err != nil {
+		a.log.Warn("relock: watch count probe failed — no relock", "session_id", sid, "err", err)
+		return
+	}
+	if n != 0 {
+		return // another checker still watches — presence survives
+	}
+	raw, err := a.vs.GetSessionLive(ctx, sid)
+	if err != nil {
+		a.log.Warn("relock: session record probe failed — no relock", "session_id", sid, "err", err)
+		return
+	}
+	if raw == nil {
+		return // no record: not provably admitted — fail closed
+	}
+	var rec struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		a.log.Warn("relock: session record unreadable — no relock", "session_id", sid, "err", err)
+		return
+	}
+	if rec.Status != "active" {
+		return // pending (pre-hold) or unknown — nothing to re-lock
+	}
+	payload, err := json.Marshal(struct {
+		Action    string `json:"action"`
+		SessionID string `json:"session_id"`
+	}{Action: "relock", SessionID: sid})
+	if err != nil {
+		a.log.Error("relock: payload marshal", "err", err)
+		return
+	}
+	if err := a.vs.Publish(ctx, "ctl:relock", payload); err != nil {
+		a.log.Warn("relock: publish failed", "session_id", sid, "err", err)
+		return
+	}
+	a.log.Info("relock: last checker left an active session — relock published", "session_id", sid)
 }
 
 // subscribeLoop keeps a subscription alive: Subscribe blocks for the life

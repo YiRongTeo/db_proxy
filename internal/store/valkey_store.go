@@ -401,6 +401,36 @@ func (s *ValkeyStore) WatchActive(ctx context.Context, sid string) (bool, error)
 	return n > 0, nil
 }
 
+// watchCountScript counts (does not early-exit) the watch:<sid>:* leases —
+// the Task 9 re-lock probe: the hub's disconnect defer compares the count
+// after ITS lease removal against 0 (the "I was the last checker" trigger).
+// Same bounded SCAN walk as watchAnyScript; only the return value differs.
+var watchCountScript = valkey.NewLuaScript(`
+local cursor = '0'
+local n = 0
+repeat
+  local r = redis.call('SCAN', cursor, 'MATCH', KEYS[1] .. '*', 'COUNT', 256)
+  cursor = r[1]
+  n = n + #r[2]
+until cursor == '0'
+return n`)
+
+// WatchCount returns the number of live watch:<sid>:* presence leases —
+// how many checker connections are currently watching the session (Task 9,
+// node-integration). The WS hub calls it in its disconnect defer, AFTER
+// WatchRemoveConn, to detect that its connection was the LAST watcher of an
+// admitted rw session (count == 0 → publish the re-lock command). Errors
+// propagate: the caller must treat a failed probe as "not last" (no
+// re-lock) — a missed re-lock self-heals when a checker re-attaches, and a
+// false re-lock on a store error would freeze healthy sessions.
+func (s *ValkeyStore) WatchCount(ctx context.Context, sid string) (int64, error) {
+	res := watchCountScript.Exec(ctx, s.client, []string{watchPrefix + sid + ":"}, []string{})
+	if err := res.Error(); err != nil {
+		return 0, err
+	}
+	return res.AsInt64()
+}
+
 // DelWatch force-clears ALL presence for a session (every connection's
 // lease). Test/ops support for tearing a session's watch state down
 // wholesale — the hub never calls it (each connection removes only its own
