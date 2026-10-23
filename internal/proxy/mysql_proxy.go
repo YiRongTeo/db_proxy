@@ -48,7 +48,22 @@ type mysqlSession struct {
 	writeMu sync.Mutex
 	gateMu  sync.Mutex
 	gate    mysqlGateState
+
+	// relock (Task 9, node-integration) is the re-lock freeze state: set
+	// when the hub reports the LAST checker left this hold-admitted rw
+	// session (ctl:relock). While frozen the relay answers every
+	// client→backend message with the gating error and forwards nothing;
+	// the re-admission poll unfreezes on the next watch. Kill ignores it.
+	relock relockState
+
+	// holdAdmitted (Task 9) marks a session that came up through the rw
+	// hold — the ONLY sessions that ever relock. Legacy preset write
+	// sessions (and flag-off rw admits) keep their existing behavior.
+	holdAdmitted bool
 }
+
+// relockStatePtr is the shared freeze step's per-plane surface.
+func (s *mysqlSession) relockStatePtr() *relockState { return &s.relock }
 
 // MySQLProxy runs MySQL sessions on the Data Plane. It performs the 6-step
 // session lifecycle: server handshake, client response, single-use token
@@ -89,6 +104,20 @@ type MySQLProxy struct {
 	// SetRWRequireCheckerWatch (which negates the config value). Oracle
 	// keeps its rw refusal regardless.
 	rwAdmitWithoutWatch bool
+
+	// rwRelockDisabled (Task 9, node-integration) is the INVERTED re-lock flag
+	// rw_relock_on_watch_loss: false (the Go zero value AND the deployed
+	// default) = the re-lock is ON — when the LAST checker leaves an admitted
+	// rw session the hub's ctl:relock command FREEZES it until a checker
+	// watches again; true = the old one-way admission (HandleRelock is a hard
+	// no-op; the UAT escape hatch). The inversion keeps hand-built proxies
+	// (and the config default TRUE) re-lock-ON, like rwAdmitWithoutWatch.
+	// true (the constructor zero value = the config default) = when the
+	// LAST checker leaves an admitted rw session the hub's ctl:relock
+	// command FREEZES it until a checker watches again; false = the old
+	// one-way admission (HandleRelock is a hard no-op). Wired via
+	// SetRWRelockOnWatchLoss from config rw_relock_on_watch_loss.
+	rwRelockDisabled bool
 
 	mu       sync.Mutex
 	sessions map[string]*mysqlSession // active sessions — kill registry (Task 6.4)
@@ -137,6 +166,54 @@ func (p *MySQLProxy) SetGateWaitSeconds(seconds int) {
 func (p *MySQLProxy) SetRWRequireCheckerWatch(require bool) {
 	p.rwAdmitWithoutWatch = !require
 }
+
+// SetRWRelockOnWatchLoss toggles the Task 9 re-lock (node-integration):
+// true (default) = the ctl:relock command freezes an admitted rw session
+// whose last checker left, until a checker watches again; false = the old
+// one-way admission (HandleRelock is a hard no-op). Wired from config
+// rw_relock_on_watch_loss (ZT_RW_RELOCK_ON_WATCH_LOSS).
+func (p *MySQLProxy) SetRWRelockOnWatchLoss(on bool) { p.rwRelockDisabled = !on }
+
+// HandleRelock applies ONE ctl:relock command to THIS plane's registry:
+// a registered, live, hold-admitted access:"rw" session is FROZEN (every
+// client→backend message answered with the gating error until a checker
+// watches again) and the hold-start callback "started" fires again (the
+// "joinable now" signal — the double/multi-started contract). Returns false
+// (touching nothing) when the relock flag is off, the id is unknown here,
+// the session is not a hold-admitted rw session (legacy write/ro presets
+// never relock), or it is already frozen.
+func (p *MySQLProxy) HandleRelock(msg []byte) bool {
+	if p.rwRelockDisabled {
+		return false
+	}
+	p.mu.Lock()
+	s := p.sessions[relockTargetID(msg)]
+	p.mu.Unlock()
+	if s == nil || s.access != "rw" || !s.holdAdmitted {
+		return false
+	}
+	if !beginRelock(&p.sessionPublisher, s) {
+		return false // already frozen
+	}
+	// The re-lock callback: the hold-start signal again. nil-safe
+	// (callbacks disabled = no-op).
+	p.callbacks.NotifySession(nil, s.tok, "started")
+	return true
+}
+
+// sessionFrozen reports whether the session is currently re-locked
+// (inspection seam for the freeze/unfreeze tests).
+func (p *MySQLProxy) sessionFrozen(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	return s != nil && s.relock.isFrozen()
+}
+
+// closeRelockWait ends the re-admission poll at session teardown — the poll
+// goroutine must never outlive the session (or publish/poll after
+// finishSession's DelSessionLive).
+func (p *MySQLProxy) closeRelockWait(s *mysqlSession) { endRelockWait(s) }
 
 // SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
 // config metrics.enabled=false) keeps every instrument call a no-op.
@@ -399,6 +476,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// byte-identical (G3).
 	var backend net.Conn
 	admitted := false
+	holdAdmitted := false
 	if tok.Access == "rw" && !p.rwAdmitWithoutWatch {
 		sid := tok.SessionID
 		if sid == "" {
@@ -426,6 +504,10 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		stopHoldClientProbe(client, probeStop, probeExited, clientDied)
 		backend = heldBackend
 		admitted = true
+		// Task 9 (node-integration): the hold-admitted mark — this is the
+		// ONLY session shape that ever re-locks (the flag-off rw admits and
+		// legacy presets below never set it).
+		holdAdmitted = true
 	} else {
 		// 4. backend connection (real credentials, client-requested
 		// database). OverrideCreds: a CredOverride token resolves its
@@ -465,15 +547,16 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	// deadline-bounded (threadIDCaptureTimeout) and degrades to threadID 0
 	// on any failure, so session setup can never hang on a stalled backend.
 	s := &mysqlSession{
-		id:        sid,
-		client:    client,
-		backend:   backend,
-		db:        database,
-		startedAt: time.Now().UTC(),
-		lastSeen:  time.Now().UTC(),
-		tok:       tok,
-		access:    tok.Access,
-		closer:    func() { client.Close(); backend.Close() },
+		id:           sid,
+		client:       client,
+		backend:      backend,
+		db:           database,
+		startedAt:    time.Now().UTC(),
+		lastSeen:     time.Now().UTC(),
+		tok:          tok,
+		access:       tok.Access,
+		holdAdmitted: holdAdmitted,
+		closer:       func() { client.Close(); backend.Close() },
 	}
 	if tok.Mode == "session" {
 		s.token = token
@@ -505,6 +588,7 @@ func (p *MySQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
 	defer p.closeGateWait(s)
+	defer p.closeRelockWait(s)   // Task 9: end the re-admission poll (never outlive the session)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,

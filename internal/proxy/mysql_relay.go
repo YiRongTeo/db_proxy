@@ -24,6 +24,23 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 		if len(payload) > 0 {
 			p.sniffCommand(s, payload[0], payload[1:], tok, clientAddr)
 		}
+		// Task 9 (node-integration) RE-LOCK freeze: a frozen (re-locked)
+		// session rejects EVERY client command with the same gating error
+		// and forwards NOTHING — checked before the write gate, since the
+		// freeze applies to reads too (owner decision 1). The reply is the
+		// well-formed ERR 1045 the pre-8.13 gated writer saw; the
+		// backend→client direction keeps draining in its own pipe. The
+		// freeze does NOT queue (no grace-hold semantics): the maker
+		// re-sends after re-admission.
+		if len(payload) > 0 {
+			if msg := p.relockBlockMsg(s); msg != "" {
+				s.writeMu.Lock() // serialize with drain replies (Task 9.10)
+				_ = writeMySQLPacket(client, seq+1, errPacket(1045, "42000", msg))
+				s.writeMu.Unlock()
+				p.publishBlocked(s, msg)
+				continue
+			}
+		}
 		// Task 8.6 maker write-gate: check BEFORE forwarding, per command
 		// (never cached), fail-closed. A blocked command is answered with
 		// ERR 1045 to the CLIENT and NOT forwarded — the backend never sees
@@ -204,6 +221,20 @@ func (p *MySQLProxy) checkWriteGate(s *mysqlSession, cmd byte) string {
 		return gatingMessage(s.id)
 	}
 	if !watched {
+		return gatingMessage(s.id)
+	}
+	return ""
+}
+
+// relockBlockMsg is the Task 9 re-lock freeze decision (checked BEFORE the
+// write gate): a FROZEN session rejects EVERY client command — read or
+// write, SQL-exec or not — with the SAME gating error the write gate uses
+// (the pre-8.13 gated-writer failure mode, owner decision 1), and the relay
+// must NOT forward it. Returns "" when the session may proceed. The flag is
+// read under its own mutex — the freeze lands from the ctl:relock
+// subscriber goroutine at any moment.
+func (p *MySQLProxy) relockBlockMsg(s *mysqlSession) string {
+	if s.relock.isFrozen() {
 		return gatingMessage(s.id)
 	}
 	return ""

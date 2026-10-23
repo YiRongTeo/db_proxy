@@ -51,6 +51,15 @@ func (p *PGProxy) pipePGClientToBackend(be *pgproto3.Backend, front *pgFrontend,
 			p.gatePGReject(be, msg, s, blockMsg)
 			continue
 		}
+		// Task 9 (node-integration) RE-LOCK freeze (PG mirror): a frozen
+		// (re-locked) session rejects EVERY client message with the same
+		// gating error (FATAL 28000; a SimpleQuery also draws the trailing
+		// ReadyForQuery via gatePGReject) and forwards NOTHING. The
+		// freeze does NOT queue: the maker re-sends after re-admission.
+		if blockMsg := p.relockPGBlockMsg(s); blockMsg != "" {
+			p.gatePGReject(be, msg, s, blockMsg)
+			continue
+		}
 		// Task 6 (node-integration) TRUE read-only: a ro session's Query/Parse
 		// carrying a write is rejected AT THE PROXY (FATAL 28000 + audit), never
 		// forwarded — no checker involvement. Execute is fail-safe-blocked (a
@@ -103,6 +112,17 @@ func (p *PGProxy) gatePGHolding(s *pgSession) bool {
 	s.gateMu.Lock()
 	defer s.gateMu.Unlock()
 	return s.gate.active
+}
+
+// relockPGBlockMsg is the Task 9 re-lock freeze DECISION on the PG plane —
+// the mirror of the MySQL relay's check: a FROZEN session rejects EVERY
+// client message with the gating message (well-formed FATAL 28000 +
+// ReadyForQuery via the gatePGReject machinery), forwarded nowhere.
+func (p *PGProxy) relockPGBlockMsg(s *pgSession) string {
+	if s.relock.isFrozen() {
+		return gatingMessage(s.id)
+	}
+	return ""
 }
 
 // gatePGBlockMsg implements the Task 8.6 maker write-gate DECISION: a

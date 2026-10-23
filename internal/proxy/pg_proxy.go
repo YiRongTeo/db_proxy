@@ -42,6 +42,12 @@ type pgSession struct {
 	// session: the old fabricated {42, 4242} for every session is gone.
 	cancelKey uint32
 
+	// relock (Task 9, node-integration) is the re-lock freeze state; see
+	// mysqlSession.relock for the full semantics. holdAdmitted marks the
+	// hold-admitted rw sessions — the only shape that ever relocks.
+	relock       relockState
+	holdAdmitted bool
+
 	// Task 8.13 grace hold: the client-side Backend (drain replies) and
 	// the backend pgFrontend (flush forwards held messages), plus the
 	// mutex-guarded gate state. writeMu (Task 9.10, MSSQL-style)
@@ -101,6 +107,20 @@ type PGProxy struct {
 	// keeps its rw refusal regardless.
 	rwAdmitWithoutWatch bool
 
+	// rwRelockDisabled (Task 9, node-integration) is the INVERTED re-lock flag
+	// rw_relock_on_watch_loss: false (the Go zero value AND the deployed
+	// default) = the re-lock is ON — when the LAST checker leaves an admitted
+	// rw session the hub's ctl:relock command FREEZES it until a checker
+	// watches again; true = the old one-way admission (HandleRelock is a hard
+	// no-op; the UAT escape hatch). The inversion keeps hand-built proxies
+	// (and the config default TRUE) re-lock-ON, like rwAdmitWithoutWatch.
+	// true (the constructor zero value = the config default) = when the
+	// LAST checker leaves an admitted rw session the hub's ctl:relock
+	// command FREEZES it until a checker watches again; false = the old
+	// one-way admission (HandleRelock is a hard no-op). Wired via
+	// SetRWRelockOnWatchLoss from config rw_relock_on_watch_loss.
+	rwRelockDisabled bool
+
 	mu       sync.Mutex
 	sessions map[string]*pgSession // active sessions — kill registry (Task 6.4)
 
@@ -155,6 +175,43 @@ func (p *PGProxy) SetGateWaitSeconds(seconds int) {
 func (p *PGProxy) SetRWRequireCheckerWatch(require bool) {
 	p.rwAdmitWithoutWatch = !require
 }
+
+// SetRWRelockOnWatchLoss toggles the Task 9 re-lock (node-integration) —
+// the PG mirror of MySQLProxy.SetRWRelockOnWatchLoss. Wired from config
+// rw_relock_on_watch_loss (ZT_RW_RELOCK_ON_WATCH_LOSS).
+func (p *PGProxy) SetRWRelockOnWatchLoss(on bool) { p.rwRelockDisabled = !on }
+
+// HandleRelock applies ONE ctl:relock command to the PG registry — the PG
+// mirror of MySQLProxy.HandleRelock (rw + hold-admitted only; the "started"
+// callback fires again on the live→frozen transition).
+func (p *PGProxy) HandleRelock(msg []byte) bool {
+	if p.rwRelockDisabled {
+		return false
+	}
+	p.mu.Lock()
+	s := p.sessions[relockTargetID(msg)]
+	p.mu.Unlock()
+	if s == nil || s.access != "rw" || !s.holdAdmitted {
+		return false
+	}
+	if !beginRelock(&p.sessionPublisher, s) {
+		return false // already frozen
+	}
+	p.callbacks.NotifySession(nil, s.tok, "started")
+	return true
+}
+
+// sessionFrozen reports whether the PG session is currently re-locked
+// (inspection seam for the freeze/unfreeze tests).
+func (p *PGProxy) sessionFrozen(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	return s != nil && s.relock.isFrozen()
+}
+
+// closeRelockWait ends the re-admission poll at PG session teardown.
+func (p *PGProxy) closeRelockWait(s *pgSession) { endRelockWait(s) }
 
 // SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
 // config metrics.enabled=false) keeps every instrument call a no-op.
@@ -451,6 +508,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// Default true = byte-identical (G3).
 	var front *pgFrontend
 	admitted := false
+	holdAdmitted := false
 	if tok.Access == "rw" && !p.rwAdmitWithoutWatch {
 		sid := tok.SessionID
 		if sid == "" {
@@ -505,6 +563,9 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 		stopHoldClientProbe(client, probeStop, probeExited, clientDied)
 		front = pgFrontendForConn(heldFront)
 		admitted = true
+		// Task 9 (node-integration): the hold-admitted mark — this is the
+		// ONLY session shape that ever re-locks.
+		holdAdmitted = true
 	} else {
 		// 4. backend session with the CLIENT-requested database (PG clients
 		// send it in the STARTUP message — mirror of the MySQL
@@ -544,15 +605,16 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	// idle, no client traffic to interleave). The probe is deadline-bounded
 	// (threadIDCaptureTimeout) and degrades to threadID 0 on any failure.
 	s := &pgSession{
-		id:        sid,
-		be:        be,
-		front:     front,
-		db:        sm.Parameters["database"],
-		startedAt: time.Now().UTC(),
-		lastSeen:  time.Now().UTC(),
-		tok:       tok,
-		access:    tok.Access,
-		closer:    func() { client.Close(); front.Close() },
+		id:           sid,
+		be:           be,
+		front:        front,
+		db:           sm.Parameters["database"],
+		startedAt:    time.Now().UTC(),
+		lastSeen:     time.Now().UTC(),
+		tok:          tok,
+		access:       tok.Access,
+		holdAdmitted: holdAdmitted,
+		closer:       func() { client.Close(); front.Close() },
 	}
 	if tok.Mode == "session" {
 		s.token = token
@@ -609,6 +671,7 @@ func (p *PGProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.Rea
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
 	defer p.closePGGateWait(s)
+	defer p.closeRelockWait(s)   // Task 9: end the re-admission poll (never outlive the session)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,

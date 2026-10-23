@@ -56,6 +56,13 @@ func (p *OracleProxy) SetLogQueryOutput(bool) {}
 // wiring symmetry with the other planes; wired in cmd/data/main.go.
 func (p *OracleProxy) SetRWRequireCheckerWatch(bool) {}
 
+// SetRWRelockOnWatchLoss is the Task 9 parity setter that DELIBERATELY does
+// nothing: with no hold point there is nothing to re-lock — an oracle
+// session can never be hold-admitted, so no ctl:relock command can ever
+// apply to it (the Relocker has no oracle arm). Accepted for wiring
+// symmetry with the other planes; wired in cmd/data/main.go.
+func (p *OracleProxy) SetRWRelockOnWatchLoss(bool) {}
+
 // SetMetrics wires the OTel instruments (Task 9.8); nil keeps no-ops.
 func (p *OracleProxy) SetMetrics(m *metrics.Metrics) { p.metrics = m }
 

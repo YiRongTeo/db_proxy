@@ -43,7 +43,14 @@ type mssqlSession struct {
 	// token (Task 9.13) is the raw token string for SESSION-mode sessions
 	// (the liveness/revocation handle). Empty for single-use sessions —
 	// their key is consumed at login and there is nothing to watch.
-	token   string
+	token string
+
+	// relock (Task 9, node-integration) is the re-lock freeze state; see
+	// mysqlSession.relock for the full semantics. holdAdmitted marks the
+	// hold-admitted rw sessions — the only shape that ever relocks.
+	relock       relockState
+	holdAdmitted bool
+
 	writeMu sync.Mutex     // serializes ALL socket writes: relay forward, gate flush, drain replies, ATTENTION (Task 9.4/9.10)
 	gateMu  sync.Mutex     // Task 9.4 grace-hold state guard (mirrors mysqlSession.gateMu)
 	gate    mssqlGateState // Task 9.4 maker write-gate grace hold (mirrors mysqlGateState)
@@ -93,6 +100,11 @@ type MSSQLProxy struct {
 	// keeps its rw refusal regardless.
 	rwAdmitWithoutWatch bool
 
+	// rwRelockDisabled (Task 9, node-integration) is the INVERTED re-lock flag
+	// (the TDS-plane mirror; see MySQLProxy for the full comment). Wired
+	// via SetRWRelockOnWatchLoss from config rw_relock_on_watch_loss.
+	rwRelockDisabled bool
+
 	mu       sync.Mutex
 	sessions map[string]*mssqlSession // active sessions — kill registry (Task 6.4 parity)
 }
@@ -132,6 +144,43 @@ func (p *MSSQLProxy) SetGateWaitSeconds(seconds int) {
 func (p *MSSQLProxy) SetRWRequireCheckerWatch(require bool) {
 	p.rwAdmitWithoutWatch = !require
 }
+
+// SetRWRelockOnWatchLoss toggles the Task 9 re-lock (node-integration) —
+// the TDS-plane mirror of MySQLProxy.SetRWRelockOnWatchLoss. Wired from
+// config rw_relock_on_watch_loss (ZT_RW_RELOCK_ON_WATCH_LOSS).
+func (p *MSSQLProxy) SetRWRelockOnWatchLoss(on bool) { p.rwRelockDisabled = !on }
+
+// HandleRelock applies ONE ctl:relock command to the MSSQL registry — the
+// TDS-plane mirror of MySQLProxy.HandleRelock (rw + hold-admitted only; the
+// "started" callback fires again on the live→frozen transition).
+func (p *MSSQLProxy) HandleRelock(msg []byte) bool {
+	if p.rwRelockDisabled {
+		return false
+	}
+	p.mu.Lock()
+	s := p.sessions[relockTargetID(msg)]
+	p.mu.Unlock()
+	if s == nil || s.access != "rw" || !s.holdAdmitted {
+		return false
+	}
+	if !beginRelock(&p.sessionPublisher, s) {
+		return false // already frozen
+	}
+	p.callbacks.NotifySession(nil, s.tok, "started")
+	return true
+}
+
+// sessionFrozen reports whether the MSSQL session is currently re-locked
+// (inspection seam for the freeze/unfreeze tests).
+func (p *MSSQLProxy) sessionFrozen(id string) bool {
+	p.mu.Lock()
+	s := p.sessions[id]
+	p.mu.Unlock()
+	return s != nil && s.relock.isFrozen()
+}
+
+// closeRelockWait ends the re-admission poll at TDS session teardown.
+func (p *MSSQLProxy) closeRelockWait(s *mssqlSession) { endRelockWait(s) }
 
 // SetMetrics wires the OTel instruments (Task 9.8). nil (the default —
 // config metrics.enabled=false) keeps every instrument call a no-op.
@@ -479,6 +528,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	var loginResp []byte
 	var loginOK bool
 	envDB := ""
+	holdAdmitted := false
 	if tok.Access == "rw" && !p.rwAdmitWithoutWatch {
 		sid := tok.SessionID
 		if sid == "" {
@@ -517,6 +567,9 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 			_ = client.Close()
 			return
 		}
+		// Task 9 (node-integration): the hold-admitted mark — this is the
+		// ONLY session shape that ever re-locks.
+		holdAdmitted = true
 	} else {
 		// 6. backend session: client-side TDS against the real SQL Server
 		// with a REWRITTEN login7 (real db_user, resolver password under
@@ -570,17 +623,18 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 		db = envDB
 	}
 	s := &mssqlSession{
-		id:        sid,
-		client:    client,
-		backend:   backend,
-		db:        db,
-		startedAt: time.Now().UTC(),
-		lastSeen:  time.Now().UTC(),
-		tok:       tok,
-		access:    tok.Access,
-		spid:      scanLoginSPID(loginResp),
-		shortDone: li.tdsVersion < mssqlLegacyDoneMaxTDSVersion,
-		closer:    func() { client.Close(); backend.Close() },
+		id:           sid,
+		client:       client,
+		backend:      backend,
+		db:           db,
+		startedAt:    time.Now().UTC(),
+		lastSeen:     time.Now().UTC(),
+		tok:          tok,
+		access:       tok.Access,
+		spid:         scanLoginSPID(loginResp),
+		shortDone:    li.tdsVersion < mssqlLegacyDoneMaxTDSVersion,
+		holdAdmitted: holdAdmitted,
+		closer:       func() { client.Close(); backend.Close() },
 	}
 	if tok.Mode == "session" {
 		s.token = token
@@ -597,6 +651,7 @@ func (p *MSSQLProxy) handleConn(ctx context.Context, client net.Conn, br *bufio.
 	defer p.finishSession(s, tok, clientAddr)
 	defer p.flushPendingOnClose(s)
 	defer p.closeMSSQLGateWait(s)
+	defer p.closeRelockWait(s)   // Task 9: end the re-admission poll (never outlive the session)
 	p.refreshSessionLive(s, tok) // first sess:live:<sid> entry (heartbeat TTL)
 	p.publishLifecycle(s, tok, "started", clientAddr)
 	p.log.Info("session established", "username", tok.Username, "db_user", tok.DBUser,

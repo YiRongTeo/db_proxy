@@ -110,6 +110,22 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 			p.gateMSSQLReject(client, s, msg)
 			continue
 		}
+		// Task 9 (node-integration) RE-LOCK freeze (TDS mirror): a frozen
+		// (re-locked) session rejects EVERY client message with the same
+		// gating error (ERROR token 18456 + DONE via gateMSSQLReject; a
+		// client ATTENTION still draws its DONE_ATTN ack so the cancel
+		// protocol stays intact) and forwards NOTHING. The freeze does
+		// NOT queue: the maker re-sends after re-admission.
+		if msg := p.relockMSSQLBlockMsg(s); msg != "" {
+			if typ == tdsAttention {
+				s.writeMu.Lock()
+				_ = writeTDSMessage(client, tdsTabular, buildTDSAttnAck(s.shortDone))
+				s.writeMu.Unlock()
+				continue
+			}
+			p.gateMSSQLReject(client, s, msg)
+			continue
+		}
 		// Task 6 (node-integration) TRUE read-only: a ro session's SQL batch
 		// text is classified — a write is rejected AT THE PROXY (ERROR token
 		// + audit), never forwarded. RPCs are classified by proc name: the
@@ -187,8 +203,8 @@ func (p *MSSQLProxy) forwardMSSQLFrames(s *mssqlSession, frames []mssqlGateFrame
 // TDS plane (Task 9.4): a SQL-executing message (SQL batch 0x01, RPC 0x03 —
 // NOT the prelogin/login7/attention/logout control types) on a write-access
 // session is allowed only while a checker watches the session (EXISTS
-// watch:<sid>). Returns "" when the message may proceed; otherwise the
-// block message. The check runs PER MESSAGE — never cached — and FAILS
+// watch:<sid>). Returns "" when the message may proceed; otherwise the block
+// message. The check runs PER MESSAGE — never cached — and FAILS
 // CLOSED: a store error blocks exactly like an absent watcher (the error is
 // logged). A grace-wait drain does not latch (Task 8.17): a re-attached
 // watcher re-opens the gate.
@@ -206,6 +222,17 @@ func (p *MSSQLProxy) gateMSSQLBlocked(s *mssqlSession, typ byte) string {
 		return gatingMessage(s.id)
 	}
 	if !watched {
+		return gatingMessage(s.id)
+	}
+	return ""
+}
+
+// relockMSSQLBlockMsg is the Task 9 re-lock freeze DECISION on the TDS
+// plane — the mirror of the MySQL/PG checks: a FROZEN session rejects EVERY
+// client message with the gating message (well-formed ERROR token 18456 via
+// gateMSSQLReject), forwarded nowhere.
+func (p *MSSQLProxy) relockMSSQLBlockMsg(s *mssqlSession) string {
+	if s.relock.isFrozen() {
 		return gatingMessage(s.id)
 	}
 	return ""

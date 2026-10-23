@@ -116,6 +116,9 @@ func (s *pgSession) unlockSession() { s.mu.Unlock() }
 func (s *pgSession) sessionMeta() (string, string, int64, time.Time, time.Time) {
 	return s.id, s.db, s.threadID, s.startedAt, s.lastSeen
 }
+
+// relockStatePtr is the shared freeze step's per-plane surface.
+func (s *pgSession) relockStatePtr() *relockState     { return &s.relock }
 func (s *pgSession) setSessionLastSeen(t time.Time)   { s.lastSeen = t }
 func (s *pgSession) pendingEvent() *models.QueryEvent { return s.pending }
 func (s *pgSession) clearPending()                    { s.pending = nil }
@@ -127,6 +130,9 @@ func (s *mssqlSession) unlockSession() { s.mu.Unlock() }
 func (s *mssqlSession) sessionMeta() (string, string, int64, time.Time, time.Time) {
 	return s.id, s.db, s.threadID, s.startedAt, s.lastSeen
 }
+
+// relockStatePtr is the shared freeze step's per-plane surface.
+func (s *mssqlSession) relockStatePtr() *relockState     { return &s.relock }
 func (s *mssqlSession) setSessionLastSeen(t time.Time)   { s.lastSeen = t }
 func (s *mssqlSession) pendingEvent() *models.QueryEvent { return s.pending }
 func (s *mssqlSession) clearPending()                    { s.pending = nil }
