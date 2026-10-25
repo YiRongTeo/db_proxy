@@ -43,8 +43,8 @@ const mssqlAttnTimeout = 10 * time.Second
 type Killer struct {
 	mysql  *MySQLProxy
 	pg     *PGProxy
-	mssql  *MSSQLProxy  // TDS sessions (kill-query N/A — no ATTENTION wiring)
-	oracle *OracleProxy // TNS sessions (kill-query N/A)
+	mssql  *MSSQLProxy  // TDS sessions (KillQuery implemented — ATTENTION wiring, mssql_proxy.go:343)
+	oracle *OracleProxy // TNS sessions (kill-query N/A — no query capture yet)
 
 	// vs is the store used to DELETE the session token's key
 	// when a connection-mode kill lands — revocation converges on "no key

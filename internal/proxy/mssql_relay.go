@@ -131,14 +131,12 @@ func (p *MSSQLProxy) pipeMSSQLClientToBackend(br *bufio.Reader, backend, client 
 		// + audit), never forwarded. RPCs are classified by proc name: the
 		// known read-only system procs flow, everything else (write-shaped
 		// procs, sp_executesql) is a write.
-		p.log.Warn("PROBE2", "access", s.access, "typ", typ)
 		if s.access == "ro" && (typ == tdsSQLBatch || typ == tdsRPC) {
 			write := false
 			if typ == tdsSQLBatch {
 				if text, ok := decodeMSSQLBatch(payload); ok {
 					text = normalizeTDSBatchText(text)
 					write = isWriteSQL(text)
-					p.log.Warn("PROBE4", "text", text, "write", write)
 				} else {
 					// Unparseable batch on a ro session: fail safe — treat as
 					// a write (the text might hide one we couldn't decode).
