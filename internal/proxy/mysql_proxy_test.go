@@ -207,12 +207,30 @@ func TestSniffCommandPublishesQueryEventsOnResponse(t *testing.T) {
 		}
 	}
 
-	// Non-sniffed commands (COM_QUIT, COM_PING) must publish nothing, even
-	// after a response completes.
+	// Task 10 (node-integration): control commands (COM_QUIT, COM_PING) are
+	// logged kind=control FIRE-AND-FORGET — published immediately, and the
+	// pending slot stays empty (the pubsub subscription receives the event).
 	p.sniffCommand(s, 0x01, nil, tok, "127.0.0.1:55555") // COM_QUIT
+	quitEv := recvEvent(t, out)
+	var quit models.QueryEvent
+	if err := json.Unmarshal(quitEv, &quit); err != nil {
+		t.Fatalf("unmarshal QUIT event: %v", err)
+	}
+	if quit.Kind != "control" || quit.SQL != "QUIT" || quit.Status != "ok" || quit.SessionID != s.id {
+		t.Errorf("QUIT event = %+v, want control/QUIT/ok", quit)
+	}
 	p.sniffCommand(s, 0x0e, nil, tok, "127.0.0.1:55555") // COM_PING
-	completePending(p, s)
-	expectNoEvent(t, out)
+	pingEv := recvEvent(t, out)
+	var ping models.QueryEvent
+	if err := json.Unmarshal(pingEv, &ping); err != nil {
+		t.Fatalf("unmarshal PING event: %v", err)
+	}
+	if ping.Kind != "control" || ping.SQL != "PING" || ping.Status != "ok" {
+		t.Errorf("PING event = %+v, want control/PING/ok", ping)
+	}
+	if s.pendingEvent() != nil {
+		t.Errorf("control command left a pending event: %+v", s.pendingEvent())
+	}
 }
 
 // TestSniffCommandPublishesTicketChannel: events are also published to

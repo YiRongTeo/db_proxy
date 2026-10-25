@@ -282,14 +282,31 @@ func TestPGProxySniffQueryAndTicketChannel(t *testing.T) {
 
 	// Terminate ends the session and must NOT be sniffed; the teardown
 	// publishes the ended lifecycle event on the user channel (never on the
-	// ticket channel).
+	// ticket channel). Task 10: the TERMINATE control event is fire-and-
+	// forget — it lands on both channels BEFORE the ended event.
 	if err := front.Send(&pgproto3.Terminate{}); err != nil {
 		t.Fatalf("send Terminate: %v", err)
 	}
 	waitPGDone(t, done)
+	// The TERMINATE control event precedes the ended event on the user channel.
+	var term models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, userCh), &term); err != nil {
+		t.Fatalf("unmarshal terminate control event: %v", err)
+	}
+	if term.Kind != "control" || term.SQL != "TERMINATE" || term.Status != "ok" {
+		t.Errorf("terminate event kind=%q sql=%q status=%q, want control/TERMINATE/ok", term.Kind, term.SQL, term.Status)
+	}
 	ended := recvSessionEvent(t, userCh)
 	if ended.Action != "ended" || !strings.HasPrefix(ended.SessionID, "sid-") {
 		t.Errorf("ended event action/session = %q/%q, want ended/sid-...", ended.Action, ended.SessionID)
+	}
+	// The TERMINATE control event also hit the ticket channel (the token
+	// carries a ticket here); the ended lifecycle event does not.
+	if err := json.Unmarshal(recvEvent(t, ticketCh), &term); err != nil {
+		t.Fatalf("unmarshal ticket-channel terminate control event: %v", err)
+	}
+	if term.Kind != "control" || term.SQL != "TERMINATE" {
+		t.Errorf("ticket-channel terminate event kind=%q sql=%q, want control/TERMINATE", term.Kind, term.SQL)
 	}
 	expectNoEvent(t, ticketCh)
 }
@@ -533,6 +550,20 @@ drained:
 	}
 	waitPGDone(t, done)
 	// Teardown publishes the ended lifecycle event on the user channel only.
+	// Task 10: the TERMINATE control event precedes it on BOTH channels.
+	var term models.QueryEvent
+	if err := json.Unmarshal(recvEvent(t, userCh), &term); err != nil {
+		t.Fatalf("unmarshal terminate control event: %v", err)
+	}
+	if term.Kind != "control" || term.SQL != "TERMINATE" {
+		t.Errorf("terminate event kind=%q sql=%q, want control/TERMINATE", term.Kind, term.SQL)
+	}
+	if err := json.Unmarshal(recvEvent(t, ticketCh), &term); err != nil {
+		t.Fatalf("unmarshal ticket terminate control event: %v", err)
+	}
+	if term.Kind != "control" || term.SQL != "TERMINATE" {
+		t.Errorf("ticket terminate event kind=%q sql=%q, want control/TERMINATE", term.Kind, term.SQL)
+	}
 	ended := recvSessionEvent(t, userCh)
 	if ended.Action != "ended" || ended.SessionID == "" {
 		t.Errorf("ended event action/session = %q/%q, want ended/<sid>", ended.Action, ended.SessionID)

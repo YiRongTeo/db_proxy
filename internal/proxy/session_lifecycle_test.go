@@ -18,10 +18,13 @@ import (
 // --- Task 8.2: session directory + lifecycle events -------------------------
 
 // recvQueryEvent reads the next published event, SKIPPING session lifecycle
-// events (kind=session). Every live-session test that subscribed to a
+// events (kind=session) and fire-and-forget control events (kind=control,
+// Task 10: SYNC/FLUSH/TERMINATE/PING/… interleave freely with query events).
+// Every live-session test that subscribed to a
 // queries:<user> channel sees the started event first (published when the
 // session is established, before any query event) and the ended event last;
-// this helper keeps query-focused assertions order-robust.
+// this helper keeps query-focused assertions order-robust. Tests that
+// ASSERT on control events read them directly instead.
 func recvQueryEvent(t *testing.T, out <-chan []byte) models.QueryEvent {
 	t.Helper()
 	for {
@@ -29,15 +32,16 @@ func recvQueryEvent(t *testing.T, out <-chan []byte) models.QueryEvent {
 		if err := json.Unmarshal(recvEvent(t, out), &ev); err != nil {
 			t.Fatalf("unmarshal event: %v", err)
 		}
-		if ev.Kind == "session" {
+		if ev.Kind == "session" || ev.Kind == "control" {
 			continue
 		}
 		return ev
 	}
 }
 
-// recvSessionEvent is recvQueryEvent's counterpart: it skips query events and
-// returns the next lifecycle event (kind=session) — used where a test that
+// recvSessionEvent is recvQueryEvent's counterpart: it skips query AND
+// control events (kind=control, Task 10) and returns the next lifecycle
+// event (kind=session) — used where a test that
 // only consumed query events must also drain/assert the ended event that
 // follows session teardown.
 func recvSessionEvent(t *testing.T, out <-chan []byte) models.QueryEvent {

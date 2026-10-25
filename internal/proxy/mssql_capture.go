@@ -839,3 +839,98 @@ func decodeMSSQLRPC(payload []byte) (string, bool) {
 	}
 	return name, true
 }
+
+// decodeMSSQLRPCParams (Task 10, node-integration) is the best-effort
+// extension of decodeMSSQLRPC: after the proc name it walks the RPC's
+// parameter stream far enough to extract a STRING parameter value — the
+// sp_executesql shape, whose first parameter (@stmt) carries the SQL text.
+// Each parameter is: Name(B_VARCHAR) + Status(1) + UserType(4) + TYPE_INFO +
+// value. Only the NVARCHAR/NCHAR (0xE7/0xEF) and BIGVARCHAR/BIGCHAR
+// (0xA7/0xAF) string types are decoded (USHORT maxlen + collation(5); value
+// USHORT-length UTF-16LE, or PLP 8-byte-total + chunks when maxlen=0xFFFF);
+// anything else — binary, numeric, odd TYPE_INFO, truncated buffer — stops
+// the walk and returns the name with an empty statement. NEVER raw payload
+// bytes are returned; on ANY decode uncertainty the caller keeps
+// "EXEC <name>".
+func decodeMSSQLRPCParams(payload []byte) (name, stmt string, ok bool) {
+	name, ok = decodeMSSQLRPC(payload)
+	if !ok {
+		return "", "", false
+	}
+	// Re-walk to just past the proc name (mirrors decodeMSSQLRPC's layout).
+	off := 0
+	if len(payload) >= 4 {
+		if total := int(binary.LittleEndian.Uint32(payload)); total >= 8 && total <= len(payload) {
+			off = total
+		}
+	}
+	if off < len(payload) && payload[off] == 0x00 {
+		off++
+	}
+	if off+1 > len(payload) {
+		return name, "", true
+	}
+	nl := int(payload[off])
+	off += 1 + 2*nl
+	if off+2 > len(payload) {
+		return name, "", true
+	}
+	off += 2 // OptionFlags (2)
+	for off < len(payload) {
+		if off+1 > len(payload) {
+			return name, "", true
+		}
+		// Param name (B_VARCHAR).
+		pnl := int(payload[off])
+		off++
+		if off+2*pnl > len(payload) {
+			return name, "", true
+		}
+		off += 2 * pnl
+		// Status(1) + UserType(4) + TYPE_INFO type byte.
+		if off+6 > len(payload) {
+			return name, "", true
+		}
+		off++               // status
+		off += 4            // UserType
+		typ := payload[off] //nolint:gosec // bounded index, off+6 checked above
+		off++
+		switch typ {
+		case 0xE7, 0xEF, 0xA7, 0xAF: // NVARCHAR/NCHAR/BIGVARCHAR/BIGCHAR
+			if off+7 > len(payload) {
+				return name, "", true
+			}
+			maxlen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+			off += 2 + 5 // maxlen + collation(5)
+			if maxlen == 0xFFFF {
+				// PLP value: 8-byte total length + chunk(s).
+				if off+8 > len(payload) {
+					return name, "", true
+				}
+				total := binary.LittleEndian.Uint64(payload[off : off+8])
+				off += 8
+				if total == 0xFFFFFFFFFFFFFFFF || off+4+int(total) > len(payload) {
+					return name, "", true
+				}
+				off += 4 // first (and only) chunk length
+				val := payload[off : off+int(total)]
+				return name, utf16String(val), true
+			}
+			if off+2 > len(payload) {
+				return name, "", true
+			}
+			vlen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+			off += 2
+			// vlen is the value's BYTE length (USHORT; 0xFFFF = NULL).
+			if vlen == 0xFFFF || vlen%2 != 0 || off+vlen > len(payload) {
+				return name, "", true
+			}
+			return name, utf16String(payload[off : off+vlen]), true
+		default:
+			// Non-string first parameter (or an unknown type): best-effort
+			// ends here — name only, never raw bytes.
+			return name, "", true
+		}
+	}
+	return name, "", true
+}

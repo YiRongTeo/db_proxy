@@ -205,8 +205,11 @@ func (pub *sessionPublisher) publishEvent(s sessionCommon, ev *models.QueryEvent
 	attrs := []any{
 		"username", ev.Username, "ticket_id", ev.TicketID,
 		"db_user", ev.DBUser, "db", ev.DB, "db_type", ev.DBType,
-		"stmt_type", ev.StmtType, "status", ev.Status,
+		"kind", ev.Kind, "stmt_type", ev.StmtType, "status", ev.Status,
 		"session_id", ev.SessionID, "sql", ev.SQL,
+	}
+	if ev.Error != "" {
+		attrs = append(attrs, "error", ev.Error)
 	}
 	if pub.logQueryOutput {
 		attrs = append(attrs,
@@ -362,6 +365,36 @@ func (pub *sessionPublisher) publishPendingOnReady(s sessionCommon) {
 		pub.metrics.QueryDuration(ev.DBType, time.Since(ev.Ts))
 		pub.publishEvent(s, ev)
 	}
+}
+
+// publishControl publishes a non-SQL control command (Task 10,
+// node-integration) FIRE-AND-FORGET: kind=control, sql=<fixed command name>
+// (e.g. "PING", "SYNC"), status=ok. No pending event, no capture, no
+// backend-response wait — the command may not even draw a response (COM_QUIT
+// closes the connection). Used by all three planes so the audit trail shows
+// connection-control activity too. sql is a FIXED NAME (never payload
+// bytes), so G2 holds by construction; the relay decision is untouched —
+// the command is forwarded exactly as before (G3).
+func (pub *sessionPublisher) publishControl(s sessionCommon, tok *models.TokenPayload, clientAddr, command string) {
+	id, db, _, _, _ := s.sessionMeta()
+	ev := models.QueryEvent{
+		ID:         newEventID(),
+		Ts:         time.Now().UTC(),
+		Kind:       "control",
+		Username:   tok.Username,
+		TicketID:   tok.TicketID,
+		DBUser:     tok.DBUser,
+		DBIP:       tok.DBIP,
+		DBPort:     tok.DBPort,
+		DBType:     tok.DBType,
+		DB:         db,
+		SQL:        command,
+		ClientAddr: clientAddr,
+		StmtType:   "control",
+		Status:     "ok",
+		SessionID:  id,
+	}
+	pub.publishEvent(s, &ev)
 }
 
 // publishBlocked publishes the session's pending event immediately with

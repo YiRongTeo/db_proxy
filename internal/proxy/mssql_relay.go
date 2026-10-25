@@ -320,8 +320,13 @@ func (p *MSSQLProxy) pipeMSSQLBackendToClient(backendBR *bufio.Reader, client ne
 // (pipeMSSQLBackendToClient → publishPending), carrying the response status
 // and any captured result set. Batches decode their UTF-16LE SQL text
 // (ALL_HEADERS + optional empty client-procname stripped — see
-// decodeMSSQLBatch); RPCs are classified by proc name (decodeMSSQLRPC).
-// All other packet types (ATTENTION, LOGOUT, …) leave pending untouched.
+// decodeMSSQLBatch); RPCs extract the proc name AND — best-effort — the
+// first string parameter (sp_executesql's @stmt, Task 10), falling back to
+// the bare name on ANY decode uncertainty; raw payload bytes are never
+// logged. All other packet types are non-SQL control messages: ATTENTION
+// and TXMGR are logged kind=control FIRE-AND-FORGET (published immediately
+// with status=ok, no pending event); the prelogin/login7/logout handshake
+// types never reach this sniffer (the router handles them).
 func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession, tok *models.TokenPayload, clientAddr string) {
 	var kind, sql string
 	switch typ {
@@ -332,11 +337,21 @@ func (p *MSSQLProxy) sniffMSSQLCommand(typ byte, payload []byte, s *mssqlSession
 		}
 		kind, sql = "query", redactSQL(text)
 	case tdsRPC:
-		name, ok := decodeMSSQLRPC(payload)
+		name, stmt, ok := decodeMSSQLRPCParams(payload)
 		if !ok {
 			return
 		}
-		kind, sql = "execute", "EXEC "+name
+		kind = "execute"
+		sql = "EXEC " + name
+		if stmt != "" {
+			sql += " " + redactSQL(stmt)
+		}
+	case tdsAttention:
+		p.publishControl(s, tok, clientAddr, "ATTENTION")
+		return
+	case 0x0e: // TXMGR — transaction-manager request (begin/commit/rollback)
+		p.publishControl(s, tok, clientAddr, "TXMGR")
+		return
 	default:
 		return
 	}

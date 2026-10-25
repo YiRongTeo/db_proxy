@@ -99,12 +99,17 @@ func (p *MySQLProxy) pipeClientToBackend(br *bufio.Reader, backend, client net.C
 // the write (bytes are only inspected, never modified). When the capture
 // completes — OK/ERR packet or the EOF that ends a result set — the pending
 // event is published with the response status and captured result.
+//
+// Task 10 (node-integration): each payload ALSO feeds notePrepareResponse —
+// a COM_STMT_PREPARE's OK response carries the assigned stmt_id, hooking the
+// sniffed prepare SQL to it so COM_STMT_EXECUTE can log the real statement.
 func (p *MySQLProxy) pipeBackendToClient(backend, client net.Conn, s *mysqlSession) {
 	for {
 		seq, payload, err := readMySQLPacket(backend)
 		if err != nil {
 			return
 		}
+		p.notePrepareResponse(s, payload)
 		s.mu.Lock()
 		c := s.capture
 		c.feed(payload)
@@ -137,8 +142,13 @@ func trimSniffedSQL(body []byte) string {
 // sniffCommand extracts SQL text from command payloads and stashes the event
 // as the session's pending event — publication happens when the backend's
 // response completes (pipeBackendToClient → publishPending), carrying the
-// response status and any captured result set. Non-sniffed commands
-// (COM_PING, COM_QUIT, …) leave pending nil and publish nothing.
+// response status and any captured result set.
+//
+// Task 10 (node-integration): COM_STMT_EXECUTE resolves its SQL through the
+// session's stmt cache (prepared → stmt_id mapping), logging the REAL
+// statement when known. Non-SQL control commands (COM_PING, COM_QUIT,
+// COM_STATISTICS, …) are logged kind=control FIRE-AND-FORGET — published
+// immediately with status=ok, no pending event awaiting the backend.
 func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *models.TokenPayload, clientAddr string) {
 	var kind, sql string
 	switch cmd {
@@ -151,10 +161,32 @@ func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *m
 	case cmdExecute:
 		kind = "execute"
 		if len(body) >= 4 {
-			sql = fmt.Sprintf("EXECUTE stmt_id=%d", binary.LittleEndian.Uint32(body))
+			stmtID := binary.LittleEndian.Uint32(body)
+			if cached, ok := s.stmtCacheLookup(stmtID); ok {
+				sql = "EXECUTE " + cached
+			} else {
+				sql = fmt.Sprintf("EXECUTE stmt_id=%d", stmtID)
+			}
 		} else {
 			sql = "EXECUTE stmt_id=?"
 		}
+	case 0x19: // COM_STMT_CLOSE: drop the cached SQL (no event)
+		if len(body) >= 4 {
+			s.stmtCacheEvict(binary.LittleEndian.Uint32(body))
+		}
+		return
+	case cmdPing, cmdQuit, cmdStatistics, 0x0a, 0x0c, 0x0d, 0x11, 0x12, 0x13, 0x14, 0x15, 0x1a:
+		// COM_PING(0x0e) COM_QUIT(0x01) COM_STATISTICS(0x09) COM_PROCESS_INFO(0x0a)
+		// COM_PROCESS_KILL(0x0c) COM_DEBUG(0x0d) COM_CHANGE_USER(0x11)
+		// COM_BINLOG_DUMP(0x12) COM_TABLE_DUMP(0x13) COM_CONNECT_OUT(0x14)
+		// COM_REGISTER_SLAVE(0x15) COM_STMT_FETCH(0x1a) — fixed names only,
+		// never payload bytes (the map lookup guards unmapped codes).
+		kind, sql = "control", mysqlCommandNames[cmd]
+		if sql == "" {
+			return
+		}
+		p.publishControl(s, tok, clientAddr, sql)
+		return
 	default:
 		return
 	}
@@ -178,6 +210,72 @@ func (p *MySQLProxy) sniffCommand(s *mysqlSession, cmd byte, body []byte, tok *m
 	s.pending = &ev
 	s.capture = &resultCapture{}
 	s.mu.Unlock()
+}
+
+// mysqlCommandNames maps the non-SQL control commands to their fixed log
+// names (Task 10): only fixed strings are logged — never payload bytes.
+// COM_RESET_CONNECTION (0x1f) and COM_STMT_CLOSE (0x19) deliberately publish
+// nothing (0x19 evicts the stmt cache instead).
+var mysqlCommandNames = map[byte]string{
+	0x01: "QUIT", 0x09: "STATISTICS", 0x0a: "PROCESS_INFO",
+	0x0c: "PROCESS_KILL", 0x0d: "DEBUG", 0x0e: "PING",
+	0x11: "CHANGE_USER", 0x12: "BINLOG_DUMP", 0x13: "TABLE_DUMP",
+	0x14: "CONNECT_OUT", 0x15: "REGISTER_SLAVE", 0x1a: "STMT_FETCH",
+}
+
+const (
+	cmdPing       = 0x0e
+	cmdQuit       = 0x01
+	cmdStatistics = 0x09
+)
+
+// stmtCacheLookup returns the redacted SQL prepared under stmt_id (Task 10).
+func (s *mysqlSession) stmtCacheLookup(stmtID uint32) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sql, ok := s.stmtCache[stmtID]
+	return sql, ok
+}
+
+// stmtCacheEvict drops the stmt_id mapping (COM_STMT_CLOSE).
+func (s *mysqlSession) stmtCacheEvict(stmtID uint32) {
+	s.mu.Lock()
+	delete(s.stmtCache, stmtID)
+	s.mu.Unlock()
+}
+
+// notePrepareResponse (Task 10) reads a backend→client packet and, when it
+// is a COM_STMT_PREPARE response (12-byte OK carrying stmt_id/num_columns/
+// num_params), binds the currently-sniffed prepare SQL to that stmt_id — so
+// a later COM_STMT_EXECUTE logs the real statement. A FAILED prepare (ERR
+// packet) clears the pending slot without caching anything. Called from the
+// backend→client relay pipe; never alters the forwarded bytes (G3).
+func (p *MySQLProxy) notePrepareResponse(s *mysqlSession, payload []byte) {
+	if len(payload) < 12 || payload[0] != 0x00 {
+		if len(payload) > 0 && payload[0] == 0xff {
+			// Prepare rejected by the backend: drop the sniffed prepare so a
+			// later stmt_id can never inherit its SQL.
+			s.mu.Lock()
+			if s.pending != nil && s.pending.Kind == "prepare" {
+				s.pending = nil
+				s.capture = nil
+			}
+			s.mu.Unlock()
+		}
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil || s.pending.Kind != "prepare" {
+		return
+	}
+	stmtID := binary.LittleEndian.Uint32(payload[1:5])
+	if s.stmtCache == nil {
+		s.stmtCache = make(map[uint32]string)
+	}
+	// The pending SQL is ALREADY redacted (sniffCommand ran redactSQL) —
+	// G2 holds for the cache too.
+	s.stmtCache[stmtID] = s.pending.SQL
 }
 
 // sqlExecCommands are the MySQL client commands that execute SQL on the

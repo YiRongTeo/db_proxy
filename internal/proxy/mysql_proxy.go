@@ -27,6 +27,13 @@ type mysqlSession struct {
 	capture *resultCapture
 	closer  func()
 
+	// stmtCache (Task 10, node-integration) maps COM_STMT_PREPARE's stmt_id
+	// (from the backend's prepare-OK response, seen on the backend→client
+	// pipe) to the redacted SQL text, so COM_STMT_EXECUTE can log the REAL
+	// statement instead of "EXECUTE stmt_id=N". Guarded by mu; entries are
+	// removed by COM_STMT_CLOSE and a failed prepare.
+	stmtCache map[uint32]string
+
 	db        string               // client-requested database (empty = no default schema)
 	threadID  int64                // backend CONNECTION_ID(); 0 = capture failed
 	startedAt time.Time            // session establishment (UTC)

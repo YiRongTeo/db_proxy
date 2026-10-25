@@ -51,10 +51,19 @@ flowchart TD
 Every query is logged with context regardless of output capture:
 
 ```
-username  ticket_id  db_user  db  db_type  stmt_type  status  session_id  sql
+username  ticket_id  db_user  db  db_type  kind  stmt_type  status  session_id  sql  [error]
 ```
 
+- `kind` — the event family: `query` (SQL batch / COM_QUERY), `prepare`, `execute`, `use` (MySQL COM_INIT_DB), `control` (Task 10: non-SQL commands), `session` (lifecycle, no sql).
 - `log_query_output: false` (default): context only — the SQL itself is included, but not the result rows.
 - `log_query_output: true` (env `ZT_LOG_QUERY_OUTPUT`): adds `columns`, `rows`, `row_count`, `truncated`.
+- `error` appears only on `status=error` lines (rejections and backend errors).
+
+**Prepared statements** (Task 10): the sniffed statement text is cached per plane so an EXECUTE logs the REAL SQL — MySQL maps `COM_STMT_PREPARE` → stmt_id from the backend's prepare response (`COM_STMT_EXECUTE` logs `EXECUTE <sql>`, falling back to `EXECUTE stmt_id=N` for an unknown id; `COM_STMT_CLOSE` evicts); PG caches Parse-name → SQL (`Execute` logs `EXECUTE <sql>` for the unnamed portal `""` and named statements alike, falling back to `EXECUTE portal=<name>` after eviction); MSSQL extracts sp_executesql's `@stmt` best-effort (`EXEC sp_executesql <stmt>`, falling back to the bare `EXEC <name>` on any decode uncertainty — raw payload bytes are never logged).
+
+**Control commands** (Task 10): non-SQL commands are logged fire-and-forget as `kind=control`, `status=ok`, `sql=<fixed command name>` — MySQL `QUIT`/`PING`/`STATISTICS`/`PROCESS_INFO`/…, PG `SYNC`/`FLUSH`/`TERMINATE`, MSSQL `ATTENTION`/`TXMGR`. They create no pending event (no backend-response wait) and the command name is fixed text, never payload bytes.
+
+**Rejections** (uniform on all three planes): a blocked command never reaches the backend, so its event is published immediately with `status=error` and the block message — the maker write-gate, TRUE read-only write rejection, and the re-lock freeze (mysql/pg/mssql alike) all produce the same error line.
+
 - Lifecycle lines (`session started/ended`) carry the same context minus SQL; ticket ids come from the token, never from wire events.
-- Hygiene invariant enforced by tests: no token values, no passwords, anywhere in the logs.
+- Hygiene invariant enforced by tests: every logged SQL passes `redactSQL()` (password literals masked), no token values, no passwords, anywhere in the logs.

@@ -44,7 +44,9 @@ sequenceDiagram
 
 ## Live feed
 
-Every query event carries: `username`, `ticket_id`, `db_user`, `db`, `db_type`, `stmt_type` (`select|insert|update|delete|other`), `status` (`ok|error`), `session_id`, `sql`. When output capture is enabled (`log_query_output: true`), it also carries `columns`, `rows` (capped: 100 rows, 512 chars/cell, 64 KB/event), `row_count`, `truncated`.
+Every query event carries: `username`, `ticket_id`, `db_user`, `db`, `db_type`, `kind` (`query|prepare|execute|use|control|session`), `stmt_type` (`select|insert|update|delete|other|control`), `status` (`ok|error`), `session_id`, `sql`, plus `error` on rejections/backend errors. When output capture is enabled (`log_query_output: true`), it also carries `columns`, `rows` (capped: 100 rows, 512 chars/cell, 64 KB/event), `row_count`, `truncated`.
+
+Task 10 event inventory: prepared EXECUTEs log the real SQL (per-plane stmt cache; MySQL prepare→stmt_id map, PG Parse-name cache incl. the unnamed portal, MSSQL sp_executesql `@stmt` best-effort); non-SQL commands are logged `kind=control` fire-and-forget (MySQL PING/QUIT/STATISTICS/…, PG SYNC/FLUSH/TERMINATE, MSSQL ATTENTION/TXMGR — fixed names, no pending event); and every rejection (write-gate, read-only, re-lock freeze) publishes `status=error` with the block message on all three planes.
 
 Events publish to **three channels**: `queries:<user>`, `queries:ticket:<t>`, `queries:sess:<sid>`.
 

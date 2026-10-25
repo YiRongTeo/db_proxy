@@ -137,7 +137,7 @@ type TokenResponse struct {
 type QueryEvent struct {
 	ID         string    `json:"id"`
 	Ts         time.Time `json:"ts"`
-	Kind       string    `json:"kind"` // query | prepare | execute | use
+	Kind       string    `json:"kind"` // query | prepare | execute | use | control | session
 	Username   string    `json:"username"`
 	TicketID   string    `json:"ticket_id,omitempty"`
 	DBUser     string    `json:"db_user"`

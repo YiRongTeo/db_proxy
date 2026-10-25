@@ -349,14 +349,34 @@ func TestPGSniffClassifiesSQL(t *testing.T) {
 		t.Errorf("execute: kind=%q sql=%q stmt=%q, want execute/EXECUTE SELECT * FROM t/other", ev.Kind, ev.SQL, ev.StmtType)
 	}
 
-	// Terminate and Close are not sniffed — pending stays as-is.
-	p.sniffPGMessage(&pgproto3.Terminate{}, cache, s, tok, "127.0.0.1:1")
+	// Close is not sniffed, and Terminate (Task 10: logged kind=control
+	// fire-and-forget — needs a live store) does not touch the pending —
+	// it still ends the session through normal teardown only.
 	p.sniffPGMessage(&pgproto3.Close{ObjectType: 'S', Name: "s1"}, cache, s, tok, "127.0.0.1:1")
 	s.mu.Lock()
 	ev = s.pending
 	s.mu.Unlock()
 	if ev == nil || ev.Kind != "execute" {
-		t.Errorf("pending changed after Terminate/Close: %+v", ev)
+		t.Errorf("pending changed after Close: %+v", ev)
+	}
+}
+
+// TestPGTerminateControlLogged (Task 10): Terminate publishes a fire-and-
+// forget kind=control event (sql=TERMINATE, status=ok) with NO pending.
+func TestPGTerminateControlLogged(t *testing.T) {
+	vs := proxyTestStore(t)
+	p := NewPGProxy(slog.New(slog.NewTextHandler(io.Discard, nil)), vs, &ConfigCredResolver{}, nil)
+	s := &pgSession{id: "sid-task10-term", db: "appdb", closer: func() {}}
+	cleanupLiveRecord(t, vs, s.id)
+	tok := &models.TokenPayload{Username: "pg-user", DBUser: "ro_user"}
+	cache := newStmtCache()
+
+	p.sniffPGMessage(&pgproto3.Terminate{}, cache, s, tok, "127.0.0.1:1")
+	s.mu.Lock()
+	ev := s.pending
+	s.mu.Unlock()
+	if ev != nil {
+		t.Fatalf("Terminate created a pending event: %+v (control is fire-and-forget)", ev)
 	}
 }
 

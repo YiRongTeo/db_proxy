@@ -227,8 +227,11 @@ func (p *PGProxy) pipePGBackendToClient(front *pgFrontend, be *pgproto3.Backend,
 // carry SQL: SimpleQuery → "query", Parse → "prepare" (cached by statement
 // name for Execute), Execute → "execute" (resolved through the cache,
 // falling back to the portal name). Bind and Close are relayed without
-// events (Close evicts the cached statement). Terminate publishes nothing —
-// it ends the session through the normal relay teardown (the backend
+// events (Close evicts the cached statement). Task 10 (node-integration):
+// the non-SQL extended-protocol control messages — Sync, Flush, Terminate —
+// are logged kind=control FIRE-AND-FORGET (published immediately with
+// status=ok, sql = the fixed message name; never payload bytes). Terminate
+// still ends the session through the normal relay teardown (the backend
 // closes, the backend→client pipe hits EOF and tears both sides down).
 //
 // A later sniffed command REPLACES the pending event and starts a fresh
@@ -253,6 +256,15 @@ func (p *PGProxy) sniffPGMessage(msg pgproto3.FrontendMessage, cache *stmtCache,
 		if m.ObjectType == 'S' {
 			cache.evict(m.Name)
 		}
+		return
+	case *pgproto3.Sync:
+		p.publishControl(s, tok, clientAddr, "SYNC")
+		return
+	case *pgproto3.Flush:
+		p.publishControl(s, tok, clientAddr, "FLUSH")
+		return
+	case *pgproto3.Terminate:
+		p.publishControl(s, tok, clientAddr, "TERMINATE")
 		return
 	default:
 		return
