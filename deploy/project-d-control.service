@@ -1,0 +1,51 @@
+# systemd unit — Project-D Control Plane
+# Install (as root, on the control-plane host):
+#   1. Build + ship: control binary, configs/, .env (git-ignored — NEVER commit), web/ SPA bundle
+#      to /opt/project-d/ (layout below).
+#   2. cp deploy/project-d-control.service /etc/systemd/system/
+#   3. systemctl daemon-reload && systemctl enable --now project-d-control
+# Logs: journald — journalctl -u project-d-control -f   (rotation via journald defaults;
+#       tighten with /etc/systemd/journald.conf SystemMaxUse if needed).
+# The binary resolves configs/control.yaml and .env relative to its WORKING DIRECTORY,
+# so WorkingDirectory=/opt/project-d is required.
+
+[Unit]
+Description=Project-D Zero-Trust DB Gateway — Control Plane
+Documentation=file:///opt/project-d/RUN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=projectd
+Group=projectd
+# The planes resolve configs/*.yaml and .env relative to CWD — /opt/project-d is the
+# deployment root holding: bin/control.exe|control (rename per OS), configs/, .env, web/.
+WorkingDirectory=/opt/project-d
+ExecStart=/opt/project-d/bin/control
+Restart=on-failure
+RestartSec=3s
+# Hard kill falls back after 10s; the planes exit clean on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# Journald is the log sink: the binaries write JSON logs to stdout/stderr ONLY
+# (no own file handles — journald owns rotation/volume limits).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=project-d-control
+
+# Environment: .env in WorkingDirectory is loaded by the binary itself (git-ignored;
+# holds ZT_AUTH_PASSWORD / ZT_AUTH_CHECKER_PASSWORD / Valkey + audit MySQL credentials /
+# ZT_SESSION_CALLBACK_* etc). Keep this unit free of secrets.
+# Environment=ZT_LOG_LEVEL=info
+
+# Hardening (the planes need no privileges: plain TCP listeners + outbound dials)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/project-d
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

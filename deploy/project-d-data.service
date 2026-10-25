@@ -1,0 +1,49 @@
+# systemd unit — Project-D Data Plane
+# Install (as root, on each data-plane host — 4 hosts in the 8+4 topology):
+#   1. Build + ship: data binary, configs/, .env (git-ignored) to /opt/project-d/.
+#   2. cp deploy/project-d-data.service /etc/systemd/system/
+#   3. systemctl daemon-reload && systemctl enable --now project-d-data
+# Logs: journald — journalctl -u project-d-data -f
+# Ports (configs/data.yaml): :3306 dispatcher, :1522 oracle listener, :9464 metrics.
+# NOTE: only ONE data-plane instance per host — the oracle listener binds :1522 and a
+# second instance os.Exit(1)s on the bind failure (also why `go test ./cmd/data` must
+# run with the service stopped).
+
+[Unit]
+Description=Project-D Zero-Trust DB Gateway — Data Plane
+Documentation=file:///opt/project-d/RUN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=projectd
+Group=projectd
+# The binary resolves configs/data.yaml and .env relative to CWD.
+WorkingDirectory=/opt/project-d
+ExecStart=/opt/project-d/bin/data
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# Grace: in-flight rw sessions drain on freeze/close; SIGKILL after TimeoutStopSec.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=project-d-data
+
+# Environment comes from /opt/project-d/.env (loaded by the binary). Plane-specific
+# knobs commonly set there or in the unit environment (uncomment as needed):
+# Environment=ZT_RW_REQUIRE_CHECKER_WATCH=true      # false = UAT: rw admits unwatched
+# Environment=ZT_RW_RELOCK_ON_WATCH_LOSS=true       # false = UAT: no re-lock on watch loss
+# Environment=ZT_SESSION_CALLBACK_URL=              # main-app status callbacks (disabled default)
+# Environment=ZT_LOG_LEVEL=info
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/project-d
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
