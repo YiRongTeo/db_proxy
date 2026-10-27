@@ -120,6 +120,21 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err := a.vs.SetWatchConn(ctx, watchSid, connID, a.watchTTLOrDefault()); err != nil {
 			a.log.Warn("watch set failed", "session_id", watchSid, "err", err)
 		}
+		// Task 12 (node-integration) observation line: successful checker
+		// attach (fires ONLY after the lease was armed — the rejected-watch
+		// path returned above, so a rejected watch logs no attach line).
+		// leases = remaining watch-lease count AFTER this attach (1+; "unknown"
+		// on probe error — logging must never fail the attach). Usernames only,
+		// no secrets.
+		if sess := sessionFrom(r); sess != nil {
+			n, err := a.vs.WatchCount(r.Context(), watchSid)
+			switch {
+			case err != nil:
+				a.log.Info("checker attached", "session_id", watchSid, "checker", sess.Username, "leases", "unknown")
+			default:
+				a.log.Info("checker attached", "session_id", watchSid, "checker", sess.Username, "leases", n)
+			}
+		}
 		// Heartbeat: refresh THIS connection's presence lease while the
 		// checker stays connected. The connection's channel is fixed at
 		// subscribe time, so the refresh target never changes — a channel
@@ -163,6 +178,21 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				a.log.Warn("watch clear failed", "session_id", watchSid, "err", err)
 			}
+			// Task 12 (node-integration) observation line: the checker left —
+			// fires on EVERY path (clean close, crash/TCP drop, ctx-cancel all
+			// run this defer), after the removal so the count is post-removal.
+			// leases = remaining watch-lease count AFTER removal (0 = the
+			// session is now unwatched); on probe error the attr is OMITTED —
+			// the line itself always fires. Bounded store call; teardown never
+			// fails because of logging.
+			attrs := []any{"session_id", watchSid}
+			if sess := sessionFrom(r); sess != nil {
+				attrs = append(attrs, "checker", sess.Username)
+			}
+			if n, err := a.vs.WatchCount(context.Background(), watchSid); err == nil {
+				attrs = append(attrs, "leases", n)
+			}
+			a.log.Info("checker left", attrs...)
 			// Task 9 (node-integration) RE-LOCK trigger: this connection's
 			// lease is gone — when it was the LAST one (WatchCount == 0)
 			// and the session is ADMITTED (sess:live status "active" — a
