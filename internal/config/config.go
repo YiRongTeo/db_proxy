@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -245,6 +246,24 @@ type ControlConfig struct {
 	MaxSessionSeconds int
 	DataPlaneHost     string
 	DataPlanePort     string
+	// DataPlaneHosts (Task 11, node-integration append; yaml
+	// api.data_plane_hosts as "host:port" strings, env
+	// ZT_API_DATA_PLANE_HOSTS comma-separated) is the mint FALLBACK POOL:
+	// when DB routing is unavailable, mints round-robin over these entries
+	// instead of the single host/port pair. LoadControl promotes the legacy
+	// single pair (data_plane_host + data_plane_port) to a one-element pool
+	// when the new key is absent/empty (G3: RR over one = always that plane
+	// — byte-identical); when BOTH are set, the new key's pool wins; when
+	// NEITHER is set the pool is empty (routing must be enabled or every
+	// mint warns with the empty fallback). Resolved ONCE at load — never
+	// per mint.
+	DataPlaneHosts []string
+	// DataPlaneHostsRejected (Task 11) carries the malformed
+	// api.data_plane_hosts / ZT_API_DATA_PLANE_HOSTS entries verbatim (no
+	// port, empty, whitespace, port out of range) that were DROPPED at load
+	// — cmd/control boots a named WARN listing them (the DB routing path is
+	// the primary; a malformed pool entry must never fail the boot).
+	DataPlaneHostsRejected []string
 	// Routing (Task 5, node-integration append) is the DB-driven
 	// data-plane routing block: when Enabled, /api/token looks up the
 	// data plane from data_plane_routes on the routing MySQL (color +
@@ -746,6 +765,49 @@ func readRouting(v *viper.Viper) (RoutingConfig, error) {
 	return RoutingConfig{}, fmt.Errorf("routing.enabled=true requires a MySQL lookup DSN: set audit.mysql.enabled=true (reuse the audit database) or provide a routing.mysql block")
 }
 
+// parseDataPlaneHosts (Task 11) resolves the fallback pool from ONE source:
+// the env override wins when set (AutomaticEnv hands a LIST key through as a
+// single string → split on commas), else the yaml list ([]interface{} under
+// GetStringSlice-compatible access). Entries are trimmed; blanks and
+// malformed entries (no host, no port, non-numeric port, port outside
+// 1-65535) are DROPPED into the returned rejected list — never a load
+// error (the DB routing path is the primary; the boot WARN surfaces the
+// rejects). Order is preserved for round-robin determinism.
+func parseDataPlaneHosts(v *viper.Viper) (pool []string, rejected []string) {
+	var raw []string
+	if s := v.GetString("api.data_plane_hosts"); s != "" {
+		// Env path (AutomaticEnv): one string, comma-separated. A yaml list
+		// never resolves through GetString to a scalar, so this branch
+		// means "the operator set the env var".
+		for _, part := range strings.Split(s, ",") {
+			raw = append(raw, part)
+		}
+	} else if v.IsSet("api.data_plane_hosts") {
+		// Yaml list path: GetStringSlice on an explicit key (defensive:
+		// GetString on a real list returns "").
+		raw = v.GetStringSlice("api.data_plane_hosts")
+	}
+	for _, e := range raw {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			rejected = append(rejected, e)
+			continue
+		}
+		host, port, err := net.SplitHostPort(e)
+		if err != nil || strings.TrimSpace(host) == "" {
+			rejected = append(rejected, e)
+			continue
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			rejected = append(rejected, e)
+			continue
+		}
+		pool = append(pool, e)
+	}
+	return pool, rejected
+}
+
 // LoadControl reads the Control Plane config (configs/control.yaml).
 // Secrets come from the environment (.env via LoadDotEnv or exported
 // variables), never from the committed file — see dotenv.go.
@@ -834,6 +896,17 @@ func LoadControl(path string) (*ControlConfig, error) {
 		Audit:      auditCfg,
 		Routing:    routingCfg,
 	}
+	// Task 11 fallback pool: resolve api.data_plane_hosts ONCE at load
+	// (env comma-list beats the yaml list; viper precedence). With the new
+	// key absent/empty, the LEGACY single pair is promoted to a one-element
+	// pool (G3: RR over one = always that plane — byte-identical); NEITHER
+	// set → an empty pool (routing must be enabled or every mint warns).
+	pool, rejected := parseDataPlaneHosts(v)
+	if len(pool) == 0 && cfg.DataPlaneHost != "" && cfg.DataPlanePort != "" {
+		pool = []string{cfg.DataPlaneHost + ":" + cfg.DataPlanePort}
+	}
+	cfg.DataPlaneHosts = pool
+	cfg.DataPlaneHostsRejected = rejected
 	// --- Auth validation (JWT conversion Task 2) ---
 	// Review round 3 fail-fast retained: AutomaticEnv is set, so an empty
 	// env override (e.g. ZT_AUTH_PASSWORD="") silently overrides the
