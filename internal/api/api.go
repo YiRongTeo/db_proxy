@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"zerotrust-proxy/internal/audit"
@@ -50,6 +51,15 @@ type api struct {
 	// SETTER only: the api type stays internal, but cmd/control must wire
 	// the production source after NewAPI.
 	routeSource RouteSource
+
+	// Task 11 fallback pool: the per-process round-robin counter over
+	// cfg.DataPlaneHosts — Next = Add(1)-1 mod len(pool), so the first mint
+	// (counter 0) lands on the pool's FIRST entry. Per-process state is the
+	// locked owner decision: good enough for a fallback path (no
+	// cross-instance sharing, zero init cost — the zero value is ready).
+	// Declared here (api struct) but consumed only by chooseRoute in
+	// dataplane_routing.go.
+	rrCounter atomic.Uint64
 }
 
 // SetRouteSource wires the production RouteSource (nil = routing

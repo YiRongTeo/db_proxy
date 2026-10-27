@@ -309,11 +309,13 @@ authenticated route — see RUN.md §2.1.4 for server-side diagnosis.
 
 ## 11.9 Config knobs
 
-### Control Plane — `configs/control.yaml` `api.max_session_seconds`
+### Control Plane — `configs/control.yaml` mint knobs
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `api.max_session_seconds` | `ZT_API_MAX_SESSION_SECONDS` | `0` | Ceiling on a mint's `end_time` — `end_time − now` beyond it → `422`; **exactly at the ceiling is accepted**. `0` = uncapped. Negative = uncapped. Bounds **only** `end_time` mints — mints without `end_time` are unaffected |
+| `api.data_plane_hosts` | `ZT_API_DATA_PLANE_HOSTS` | *(absent)* | Task 11 — the mint **fallback pool**: `"host:port"` entries (yaml list; the env var is one **comma-separated** string). When DB routing is disabled or fails, mints **round-robin** over the pool (per-process atomic counter, `pool[counter % len]`). Malformed entries (no host, no/bad port) are **dropped at load with a boot WARN** — never a boot failure. Absent/empty → the legacy `data_plane_host`+`data_plane_port` pair becomes a one-element pool; **both set → this key wins**; **neither** → no config fallback (enable routing, or every mint WARNs). One entry = the old single-host behavior exactly |
+| `api.data_plane_host` / `api.data_plane_port` | — | `"127.0.0.1"` / `"3306"` | **LEGACY single-host fallback** (Task 11 back-compat, G3): still honored — promoted to a one-element pool when `data_plane_hosts` is absent/empty |
 
 ### Data Plane — `configs/data.yaml` `session_callback`
 
@@ -472,14 +474,21 @@ as for the existing plaintext data-plane hops.
 
 ## 11.13 DB-driven data-plane routing (blue/green at token mint)
 
-By default every mint hands the client the single `api.data_plane_host` / `api.data_plane_port`
-pair from `configs/control.yaml`. With the `routing` block **enabled**, each `POST /api/token`
+By default every mint hands the client a plane from the **`api.data_plane_hosts` fallback
+pool** (Task 11) — round-robin over the configured `host:port` entries; the legacy single
+`api.data_plane_host` / `api.data_plane_port` pair still works as a one-element pool. With the
+`routing` block **enabled**, each `POST /api/token`
 instead asks a MySQL table **which data server to point at** and returns that plane in the mint
 response (`host` / `port`) — selection by **deployment color + least-loaded**, evaluated at
 mint time. Disabled (the default) the behavior is byte-identical to before.
 
 ### Selection semantics
 
+- **Fallback pool (Task 11)**: when routing is disabled, the lookup DB fails, or zero eligible
+  rows remain, the mint falls back to the `api.data_plane_hosts` pool — **round-robin**
+  (per-process counter; no shared state, good enough for a fallback path). Selection order is
+  unchanged: routing table → pool → empty-fallback WARN (`no data plane fallback configured`
+  when neither the pool nor the legacy pair resolves).
 - **One row wins**: the eligible row with the LOWEST `activesessions` (ties broken randomly)
   for the configured `routing.color`.
 - **Eligibility guards**: `proxytype='DB'`, `environment='PROD'`, the row's

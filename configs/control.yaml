@@ -31,6 +31,18 @@ api:
   # ceiling is accepted. 0 (default) = UNCAPPED. Bounds ONLY the end_time
   # mechanism — mints without end_time are unaffected.
   max_session_seconds: 0
+  # data_plane_hosts (node-integration Task 11; env ZT_API_DATA_PLANE_HOSTS,
+  # comma-separated): the mint FALLBACK POOL — when DB routing is off or
+  # unreachable the control round-robins (per-process) over these "host:port"
+  # entries instead of handing out one fixed plane. Malformed entries (no
+  # host, no/bad port) are dropped at load with a boot WARN — never a boot
+  # failure; one valid entry behaves exactly like the old single-host config.
+  # When this key is absent/empty the LEGACY pair below becomes a
+  # one-element pool; if BOTH are set, this key wins. Selection order is
+  # unchanged: routing table (when enabled) → pool → empty-fallback WARN.
+  # data_plane_hosts:        # e.g. ["10.0.0.1:3306", "10.0.0.2:3306"]
+  # LEGACY single-host fallback (still honored: promoted to a one-element
+  # pool when data_plane_hosts above is absent/empty).
   data_plane_host: "127.0.0.1"
   data_plane_port: "3306"      # shared Data Plane listener (MySQL + PostgreSQL + MSSQL)
 auth:
@@ -297,7 +309,8 @@ audit:
 # --- DB-driven data-plane routing (node-integration Task 5) ---------------
 # When enabled, POST /api/token looks up WHICH data server to hand the
 # client from the data_plane_routes table (color + least-loaded) instead of
-# the single api.data_plane_host/port above. The lookup DSN is the audit
+# the api.data_plane_hosts fallback pool above (the legacy single
+# api.data_plane_host/port pair is a one-element pool). The lookup DSN is the audit
 # block above when audit.mysql.enabled — no separate connection — or a
 # routing.mysql block with the same five fields. Enabled with NO resolvable
 # DSN is a LOAD ERROR (fail fast, never boot into silent fallback).

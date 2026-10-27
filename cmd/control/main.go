@@ -148,6 +148,9 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Task 11: announce the data-plane fallback pool (and WARN on the
+	// malformed entries LoadControl dropped) — log-only, never boot-fatal.
+	logDataPlanePool(log, cfg)
 	opts, err := storeOptions(cfg.Valkey)
 	if err != nil {
 		log.Error("valkey tls", "err", err)

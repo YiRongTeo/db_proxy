@@ -33,6 +33,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -258,14 +259,36 @@ func validateRouteRow(r routeRow) error {
 
 // chooseRoute resolves the data plane for ONE mint. Order: the fresh cached
 // selection for the color → the live lookup (bounded context) → the config
-// fallback. EVERY failure mode (DB unreachable, zero valid rows, slow query)
-// lands on the config data_plane_host/port with a reason-only WARN — the
-// lookup DB can NEVER fail a mint.
+// fallback POOL (Task 11: round-robin over cfg.DataPlaneHosts via a
+// per-process atomic counter; an empty pool = the legacy empty fallback).
+// EVERY failure mode (DB unreachable, zero valid rows, slow query) lands on
+// the config pool with a reason-only WARN — the lookup DB can NEVER fail a
+// mint.
 func (a *api) chooseRoute(ctx context.Context, src RouteSource, color string) routeSelection {
+	// Task 11 fallback pool: round-robin over the config pool (one entry =
+	// always that plane, byte-identical to the pre-pool single fallback).
+	// EMPTY pool → the legacy shape (empty Host/Port/DataPlane, Fallback
+	// still true — the mint proceeds, response fields blank) plus a named
+	// WARN so the misconfiguration is visible per mint, never silent.
+	pool := a.cfg.DataPlaneHosts
+	if len(pool) == 0 {
+		a.log.Warn("no data plane fallback configured — set api.data_plane_hosts (or the legacy api.data_plane_host/api.data_plane_port pair) or enable routing",
+			"color", color)
+		return routeSelection{Fallback: true}
+	}
+	entry := pool[(a.rrCounter.Add(1)-1)%uint64(len(pool))]
+	host, port, err := net.SplitHostPort(entry)
+	if err != nil {
+		// Unreachable through LoadControl (malformed entries are dropped at
+		// load) — guarded anyway so a programmatically-built cfg can never
+		// mint an unvalidated host/port.
+		a.log.Warn("data plane fallback pool entry invalid; skipped", "entry", entry, "reason", err.Error())
+		return routeSelection{Fallback: true}
+	}
 	fallback := routeSelection{
-		Host:      a.cfg.DataPlaneHost,
-		Port:      a.cfg.DataPlanePort,
-		DataPlane: a.cfg.DataPlaneHost + ":" + a.cfg.DataPlanePort,
+		Host:      host,
+		Port:      port,
+		DataPlane: entry,
 		Fallback:  true,
 	}
 	if src == nil || !a.cfg.Routing.Enabled {

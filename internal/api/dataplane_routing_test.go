@@ -85,9 +85,14 @@ func newRoutingTestServer(t *testing.T, src RouteSource, color string) (*httptes
 		TokenTTL:     60,
 		StaticDir:    t.TempDir(),
 		// The fallback plane: anything the response shows from here came
-		// from config, not routing.
+		// from config, not routing. The single pair mirrors LoadControl's
+		// legacy promotion (Task 11): the pool field is what chooseRoute
+		// consumes, the old fields stay populated for completeness.
 		DataPlaneHost: "10.255.0.1",
 		DataPlanePort: "9999",
+		DataPlaneHosts: []string{
+			cfgLegacyFallbackHost + ":" + cfgLegacyFallbackPort,
+		},
 		Routing: config.RoutingConfig{
 			Enabled: src != nil,
 			Color:   color,
@@ -127,6 +132,14 @@ func mintRouting(t *testing.T, client *http.Client, base, bearer, body string) (
 var (
 	routeRowBlue  = routeRow{Hostname: "db-blue1", URL: "https://db-blue1.internal:3307", ActiveSessions: 2, MaxSessions: 100}
 	routeRowGreen = routeRow{Hostname: "db-green1", URL: "https://db-green1.internal:3307", ActiveSessions: 9, MaxSessions: 100}
+)
+
+// cfgLegacyFallbackHost/Port: the legacy single fallback plane every
+// routing-suite fixture promotes to a one-element pool (the Task 11
+// LoadControl rule: old keys → pool[field:field]).
+const (
+	cfgLegacyFallbackHost = "10.255.0.1"
+	cfgLegacyFallbackPort = "9999"
 )
 
 // TestRoutingDisabledByteIdentical (G3): routing disabled → the response
