@@ -56,6 +56,23 @@ Volume/retention is journald config (`/etc/systemd/journald.conf`: `SystemMaxUse
 SQL (`sql=`), status, session id, ticket, username — with `log_query_output: true` they also
 carry captured rows (volume grows fast; keep it off unless needed).
 
+> **⚠ journald rate limiting will silently drop query lines.** The distro default
+> `RateLimitIntervalSec=30s / RateLimitBurst=100` means a busy data plane (easily >100 log
+> lines in 30 s) loses every message past the burst — lifecycle lines survive, queries vanish.
+> For query logging to be trustworthy, relax it in `/etc/systemd/journald.conf`:
+>
+> ```ini
+> [Journal]
+> RateLimitIntervalSec=1s
+> RateLimitBurst=10000
+> Store=persistent
+> ```
+>
+> then `systemctl restart systemd-journald`. (`Store=persistent` also makes logs survive
+> reboots on hosts without `/var/log/journal`.) Verify with a quick burst test: run 200 queries
+> through a session and confirm `journalctl -u project-d-data --since -1min | grep -c 'msg:query'`
+> counts them all.
+
 ## Environment / flags
 
 All tuning is via `/opt/project-d/.env` (`ZT_*` variables — see docs/11 env tables) or the yaml
