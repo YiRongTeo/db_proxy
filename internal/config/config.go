@@ -147,6 +147,22 @@ func rwRelockOnWatchLossEnv() (override *bool, rejected bool, raw string) {
 // ONLY (no env, no defaults): (*bool)(nil) when absent. Used where a strict
 // env allowlist needs the yaml fallback to stay uncontaminated by the very
 // env value it just rejected (readYAMLSessionIPLock pattern).
+// readYAMLStringList reads one string-list key from the config FILE ONLY
+// (no env, no defaults): nil when the key is absent. The list cousin of
+// readYAMLDataFlag — used where a set-but-empty env var must not wipe a
+// yaml-configured pool.
+func readYAMLStringList(path, key string) ([]string, error) {
+	yv := viper.New()
+	yv.SetConfigFile(path)
+	if err := yv.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	if !yv.IsSet(key) {
+		return nil, nil
+	}
+	return yv.GetStringSlice(key), nil
+}
+
 func readYAMLDataFlag(path, key string) (*bool, error) {
 	yv := viper.New()
 	yv.SetConfigFile(path)
@@ -773,7 +789,7 @@ func readRouting(v *viper.Viper) (RoutingConfig, error) {
 // 1-65535) are DROPPED into the returned rejected list — never a load
 // error (the DB routing path is the primary; the boot WARN surfaces the
 // rejects). Order is preserved for round-robin determinism.
-func parseDataPlaneHosts(v *viper.Viper) (pool []string, rejected []string) {
+func parseDataPlaneHosts(v *viper.Viper, path string) (pool []string, rejected []string) {
 	var raw []string
 	if s := v.GetString("api.data_plane_hosts"); s != "" {
 		// Env path (AutomaticEnv): one string, comma-separated. A yaml list
@@ -782,10 +798,14 @@ func parseDataPlaneHosts(v *viper.Viper) (pool []string, rejected []string) {
 		for _, part := range strings.Split(s, ",") {
 			raw = append(raw, part)
 		}
-	} else if v.IsSet("api.data_plane_hosts") {
-		// Yaml list path: GetStringSlice on an explicit key (defensive:
-		// GetString on a real list returns "").
-		raw = v.GetStringSlice("api.data_plane_hosts")
+	} else if rawList, listErr := readYAMLStringList(path, "api.data_plane_hosts"); listErr == nil && len(rawList) > 0 {
+		// Yaml list path: read the config FILE ONLY. An env var that is
+		// SET-BUT-EMPTY ("ZT_API_DATA_PLANE_HOSTS=" with no value) makes
+		// v.IsSet true while every env-aware accessor yields zero entries —
+		// the yaml pool would be silently wiped (the empty-env bug Ryan
+		// hit). The file-only read cannot see the env at all. A file read
+		// error yields a nil list (legacy single-host still applies).
+		raw = rawList
 	}
 	for _, e := range raw {
 		e = strings.TrimSpace(e)
@@ -901,7 +921,7 @@ func LoadControl(path string) (*ControlConfig, error) {
 	// key absent/empty, the LEGACY single pair is promoted to a one-element
 	// pool (G3: RR over one = always that plane — byte-identical); NEITHER
 	// set → an empty pool (routing must be enabled or every mint warns).
-	pool, rejected := parseDataPlaneHosts(v)
+	pool, rejected := parseDataPlaneHosts(v, path)
 	if len(pool) == 0 && cfg.DataPlaneHost != "" && cfg.DataPlanePort != "" {
 		pool = []string{cfg.DataPlaneHost + ":" + cfg.DataPlanePort}
 	}
