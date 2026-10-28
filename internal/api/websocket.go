@@ -220,6 +220,20 @@ func (a *api) handleWS(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		for {
 			if _, _, err := c.Read(ctx); err != nil {
+				// Task 12 follow-up: name WHY the socket ended — a peer
+				// close (rxjs complete()/ws.close()) arrives as a
+				// *websocket.CloseError with its code; anything else is a
+				// TCP-level drop. This makes "did the close reach the
+				// control?" provable from the log alone.
+				if code := websocket.CloseStatus(err); code != websocket.StatusAbnormalClosure {
+					// A close frame reached us (code 1000 = clean
+					// ws.close(); 1005/NoStatusRcvd = rxjs complete(),
+					// which closes without a status payload — the
+					// "did the complete arrive?" proof).
+					a.log.Info("checker websocket closed by peer", "session_id", watchSid, "code", int(code))
+				} else if ctx.Err() == nil {
+					a.log.Info("checker websocket dropped (no close frame)", "session_id", watchSid, "err", err.Error())
+				}
 				return
 			}
 		}
