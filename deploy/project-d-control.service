@@ -4,8 +4,11 @@
 #      to /opt/project-d/ (layout below).
 #   2. cp deploy/project-d-control.service /etc/systemd/system/
 #   3. systemctl daemon-reload && systemctl enable --now project-d-control
-# Logs: journald — journalctl -u project-d-control -f   (rotation via journald defaults;
-#       tighten with /etc/systemd/journald.conf SystemMaxUse if needed).
+# Logs: pick ONE sink.
+#   A) journal (default): journalctl -u project-d-control -f  (journald owns rotation).
+#   B) file: comment the two journal lines below, un-comment the append: pair,
+#      run the one-time setup at the bottom, and rotate with logrotate — journald
+#      no longer sees these lines in file mode.
 # The binary resolves configs/control.yaml and .env relative to its WORKING DIRECTORY,
 # so WorkingDirectory=/opt/project-d is required.
 
@@ -28,10 +31,15 @@ RestartSec=3s
 # Hard kill falls back after 10s; the planes exit clean on SIGTERM.
 KillSignal=SIGTERM
 TimeoutStopSec=10
-# Journald is the log sink: the binaries write JSON logs to stdout/stderr ONLY
-# (no own file handles — journald owns rotation/volume limits).
+# Journald is the log sink A (default): the binaries write JSON logs to stdout/stderr
+# ONLY (no own file handles — journald owns rotation/volume limits).
 StandardOutput=journal
 StandardError=journal
+# Log sink B (FILE): comment the two journal lines above, un-comment this pair,
+# and run the one-time setup at the bottom of this file (dir + files + logrotate).
+# systemd ≥ 240 required for append:.
+# StandardOutput=append:/var/log/project-d/control.log
+# StandardError=append:/var/log/project-d/control-error.log
 SyslogIdentifier=project-d-control
 
 # Environment: .env in WorkingDirectory is loaded by the binary itself (git-ignored;
@@ -42,10 +50,27 @@ SyslogIdentifier=project-d-control
 # Hardening (the planes need no privileges: plain TCP listeners + outbound dials)
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/project-d
+# /var/log/project-d is only needed in FILE mode (sink B) — harmless in journal mode.
+ReadWritePaths=/opt/project-d /var/log/project-d
 ProtectHome=true
 PrivateTmp=true
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
+
+# --- FILE MODE (sink B) one-time setup -------------------------------------
+#   mkdir -p /var/log/project-d
+#   touch /var/log/project-d/control.log /var/log/project-d/control-error.log
+#   chown -R projectd:projectd /var/log/project-d
+#   # rotation (systemd append: NEVER rotates/truncates on its own) — write
+#   # /etc/logrotate.d/project-d:
+#   /var/log/project-d/*.log {
+#       daily
+#       rotate 30
+#       compress
+#       delaycompress
+#       missingok
+#       notifempty
+#       copytruncate
+#   }

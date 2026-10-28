@@ -70,8 +70,25 @@ carry captured rows (volume grows fast; keep it off unless needed).
 >
 > then `systemctl restart systemd-journald`. (`Store=persistent` also makes logs survive
 > reboots on hosts without `/var/log/journal`.) Verify with a quick burst test: run 200 queries
-> through a session and confirm `journalctl -u project-d-data --since -1min | grep -c 'msg:query'`
+> through a session and confirm `journalctl -u project-d-data --since -1min | grep -c '"msg":"query"'`
 > counts them all.
+
+## File-mode logging (alternative to journald)
+
+If you'd rather have plain files than journald, both units ship a ready **sink B**: comment the
+two `StandardOutput/StandardError=journal` lines and un-comment the `append:/var/log/project-d/…`
+pair (systemd ≥ 240), create `/var/log/project-d/` + the log files owned by `projectd`, add the
+logrotate config from the unit's footer (`copytruncate` — required, since systemd keeps the
+file descriptor open), and restart. Trade-offs vs journald:
+
+| | journal (default) | file (append:) |
+|---|---|---|
+| Rotation | journald owns it | **you** must run logrotate (`copytruncate`) |
+| Rate limits | journald drops bursts (see warning above) | no dropping — every line lands |
+| Querying | `journalctl -u project-d-data -f` | `tail -f /var/log/project-d/data.log \| grep '"msg":"query"'` |
+| Boot persistence | needs `Store=persistent` | files just persist |
+
+Query lines are identical in both modes — same JSON, same fields.
 
 ## Environment / flags
 

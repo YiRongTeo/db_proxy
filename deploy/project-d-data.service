@@ -3,7 +3,10 @@
 #   1. Build + ship: data binary, configs/, .env (git-ignored) to /opt/project-d/.
 #   2. cp deploy/project-d-data.service /etc/systemd/system/
 #   3. systemctl daemon-reload && systemctl enable --now project-d-data
-# Logs: journald — journalctl -u project-d-data -f
+# Logs: pick ONE sink.
+#   A) journal (default): journalctl -u project-d-data -f
+#   B) file: comment the two journal lines below, un-comment the append: pair,
+#      run the one-time setup at the bottom, and rotate with logrotate.
 # Ports (configs/data.yaml): :3306 dispatcher, :1522 oracle listener, :9464 metrics.
 # NOTE: only ONE data-plane instance per host — the oracle listener binds :1522 and a
 # second instance os.Exit(1)s on the bind failure (also why `go test ./cmd/data` must
@@ -27,8 +30,12 @@ RestartSec=3s
 KillSignal=SIGTERM
 TimeoutStopSec=10
 # Grace: in-flight rw sessions drain on freeze/close; SIGKILL after TimeoutStopSec.
+# Log sink A (journal, default). Sink B (file): comment these two, un-comment the
+# append: pair, run the one-time setup at the bottom of this file.
 StandardOutput=journal
 StandardError=journal
+# StandardOutput=append:/var/log/project-d/data.log
+# StandardError=append:/var/log/project-d/data-error.log
 SyslogIdentifier=project-d-data
 
 # Environment comes from /opt/project-d/.env (loaded by the binary). Plane-specific
@@ -40,10 +47,31 @@ SyslogIdentifier=project-d-data
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/project-d
+# /var/log/project-d is only needed in FILE mode (sink B) — harmless in journal mode.
+ReadWritePaths=/opt/project-d /var/log/project-d
 ProtectHome=true
 PrivateTmp=true
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
+
+# --- FILE MODE (sink B) one-time setup -------------------------------------
+#   mkdir -p /var/log/project-d
+#   touch /var/log/project-d/data.log /var/log/project-d/data-error.log
+#   chown -R projectd:projectd /var/log/project-d
+#   # rotation (systemd append: NEVER rotates/truncates on its own) — write
+#   # /etc/logrotate.d/project-d:
+#   /var/log/project-d/*.log {
+#       daily
+#       rotate 30
+#       compress
+#       delaycompress
+#       missingok
+#       notifempty
+#       copytruncate
+#   }
+# QUERY LINES IN FILE MODE: the same '"msg":"query"' JSON lines land in
+# data.log — filter with grep '"msg":"query"'. NOTE the journald rate-limit
+# warning in docs/12 does not apply in file mode, but disk volume does: a busy
+# plane writes MBs per hour — keep logrotate aggressive (hourly if needed).
